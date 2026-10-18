@@ -1,16 +1,19 @@
 @echo off
 rem MechAssault 2: Lone Wolf -- native PC build (xboxrecomp).
 rem
-rem Controls (keyboard; an Xbox/XInput controller also works):
-rem   Enter = START      Backspace = BACK
-rem   Z = A   X = B   C = X   V = Y     Q = White   E = Black
-rem   1 = Left trigger   3 = Right trigger
-rem   W A S D = left stick (move)      I J K L = right stick (aim)
-rem   Arrow keys = D-pad   Shift / Ctrl = left / right stick click
-rem   F11 = fullscreen on/off          close the window to quit
+rem Controls: mouse + keyboard (layout in mkb.ini -- edit it to rebind), or
+rem an Xbox/XInput controller, or both at once.
+rem   Mouse = look / aim            W A S D = move       Space / Shift = jump
+rem   Left click = fire weapon      Right click / C = defense
+rem   Wheel / Q = cycle weapons     Middle click / Z = zoom (tank)
+rem   E = action    F = enter/exit vehicle    G / R = drop cargo (VTOL)
+rem   1-4 = cycle cargo (VTOL)      Tab = scoreboard / tutorial text
+rem   Menus: arrows move, Enter selects, Backspace goes back, Esc pauses
+rem   F9 = release / recapture the mouse   F11 = fullscreen on/off
+rem   close the window to quit
 rem
-rem Drawing runs on your graphics card (Direct3D 11); the rest of the Xbox
-rem GPU (vertex shaders, command processing) is still emulated on the CPU.
+rem Drawing and vertex shaders run on your graphics card (Direct3D 11); the
+rem Xbox GPU's command processing is emulated on the CPU.
 
 cd /d "%~dp0"
 if not exist "build\Release\ma2.exe" (
@@ -36,7 +39,10 @@ set RECOMP_ASYNC_IO=1
 set RECOMP_VBLANK=1
 set RECOMP_USB=1
 set RECOMP_USB_PADS=1
-set RECOMP_KEYBOARD=1
+rem Mouse + keyboard as a virtual controller (RECOMP_MKB=0 turns it off;
+rem the older keys-only map is RECOMP_KEYBOARD=1, not both at once).
+if "%RECOMP_MKB%"=="" set RECOMP_MKB=1
+if "%RECOMP_MKB_INI%"=="" set RECOMP_MKB_INI=%~dp0mkb.ini
 rem Render on the graphics card (set RECOMP_D3D11=0 for the CPU rasteriser).
 if "%RECOMP_D3D11%"=="" set RECOMP_D3D11=1
 

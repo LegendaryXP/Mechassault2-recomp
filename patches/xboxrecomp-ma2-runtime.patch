@@ -16,8 +16,609 @@ index e725646..ef7947b 100644
  
      wfx.wFormatTag      = WAVE_FORMAT_PCM;
      wfx.nChannels       = XA2_CHANNELS;
+diff --git a/src/input/mkb_input.c b/src/input/mkb_input.c
+index d6f0042..83d45c5 100644
+--- a/src/input/mkb_input.c
++++ b/src/input/mkb_input.c
+@@ -36,6 +36,127 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include <math.h>
++#include <ctype.h>
++
++/* F9 is read on the input thread, so the toggle works even while the
++ * game is stalled on the poll side. It cannot be bound. */
++#define MKB_TOGGLE_VK  VK_F9
++
++/* ---- bindings ----------------------------------------------------------- *
++ *
++ * Every key, mouse button and wheel direction maps to one pad control.
++ * The built-in table is the layout this layer started with; a title's own
++ * layout comes from mkb.ini ("bind.SPACE = A", one per line) or
++ * RECOMP_MKB_BIND ("SPACE=A,MOUSE1=RT,..."), and as soon as one binding is
++ * given the built-in table is dropped, so a layout file says everything it
++ * means. Mouse movement always drives the aim stick (swap_sticks moves it).
++ */
++enum { ACT_NONE, ACT_BTN, ACT_ANALOG, ACT_AXIS };
++typedef struct { unsigned char kind, idx; } MkbAction;
++
++#define IN_MOUSE(n)    (256 + (n))      /* 0 left 1 right 2 middle 3 X1 4 X2 */
++#define IN_WHEEL_UP    261
++#define IN_WHEEL_DOWN  262
++#define IN_MAX         263
++
++/* Axis actions: left stick up/down/left/right, then the right stick. */
++enum { AX_LUP, AX_LDOWN, AX_LLEFT, AX_LRIGHT, AX_RUP, AX_RDOWN, AX_RLEFT, AX_RRIGHT };
++
++static MkbAction s_bind[IN_MAX];
++static int s_bind_custom;               /* a layout replaced the built-in one */
++
++static const struct { const char *name; MkbAction act; } k_actions[] = {
++    {"A", {ACT_ANALOG, XBOX_BUTTON_A}},      {"B", {ACT_ANALOG, XBOX_BUTTON_B}},
++    {"X", {ACT_ANALOG, XBOX_BUTTON_X}},      {"Y", {ACT_ANALOG, XBOX_BUTTON_Y}},
++    {"BLACK", {ACT_ANALOG, XBOX_BUTTON_BLACK}}, {"WHITE", {ACT_ANALOG, XBOX_BUTTON_WHITE}},
++    {"LT", {ACT_ANALOG, XBOX_BUTTON_LTRIGGER}}, {"RT", {ACT_ANALOG, XBOX_BUTTON_RTRIGGER}},
++    {"START", {ACT_BTN, 4}},  {"BACK", {ACT_BTN, 5}},
++    {"LTHUMB", {ACT_BTN, 6}}, {"RTHUMB", {ACT_BTN, 7}},
++    {"DPAD_UP", {ACT_BTN, 0}}, {"DPAD_DOWN", {ACT_BTN, 1}},
++    {"DPAD_LEFT", {ACT_BTN, 2}}, {"DPAD_RIGHT", {ACT_BTN, 3}},
++    {"MOVE_FORWARD", {ACT_AXIS, AX_LUP}}, {"MOVE_BACK", {ACT_AXIS, AX_LDOWN}},
++    {"MOVE_LEFT", {ACT_AXIS, AX_LLEFT}},  {"MOVE_RIGHT", {ACT_AXIS, AX_LRIGHT}},
++    {"LOOK_UP", {ACT_AXIS, AX_RUP}},      {"LOOK_DOWN", {ACT_AXIS, AX_RDOWN}},
++    {"LOOK_LEFT", {ACT_AXIS, AX_RLEFT}},  {"LOOK_RIGHT", {ACT_AXIS, AX_RRIGHT}},
++    {"NONE", {ACT_NONE, 0}},
++};
++
++static const struct { const char *name; int in; } k_inputs[] = {
++    {"SPACE", VK_SPACE}, {"ENTER", VK_RETURN}, {"ESC", VK_ESCAPE}, {"TAB", VK_TAB},
++    {"BACKSPACE", VK_BACK}, {"CAPSLOCK", VK_CAPITAL},
++    {"LSHIFT", VK_LSHIFT}, {"RSHIFT", VK_RSHIFT}, {"LCTRL", VK_LCONTROL},
++    {"RCTRL", VK_RCONTROL}, {"LALT", VK_LMENU}, {"RALT", VK_RMENU},
++    {"UP", VK_UP}, {"DOWN", VK_DOWN}, {"LEFT", VK_LEFT}, {"RIGHT", VK_RIGHT},
++    {"INSERT", VK_INSERT}, {"DELETE", VK_DELETE}, {"HOME", VK_HOME}, {"END", VK_END},
++    {"PGUP", VK_PRIOR}, {"PGDN", VK_NEXT},
++    {"COMMA", VK_OEM_COMMA}, {"PERIOD", VK_OEM_PERIOD}, {"SLASH", VK_OEM_2},
++    {"SEMICOLON", VK_OEM_1}, {"QUOTE", VK_OEM_7}, {"LBRACKET", VK_OEM_4},
++    {"RBRACKET", VK_OEM_6}, {"BACKSLASH", VK_OEM_5}, {"MINUS", VK_OEM_MINUS},
++    {"EQUALS", VK_OEM_PLUS}, {"GRAVE", VK_OEM_3},
++    {"NUM0", VK_NUMPAD0}, {"NUM1", VK_NUMPAD1}, {"NUM2", VK_NUMPAD2}, {"NUM3", VK_NUMPAD3},
++    {"NUM4", VK_NUMPAD4}, {"NUM5", VK_NUMPAD5}, {"NUM6", VK_NUMPAD6}, {"NUM7", VK_NUMPAD7},
++    {"NUM8", VK_NUMPAD8}, {"NUM9", VK_NUMPAD9},
++    {"MOUSE1", IN_MOUSE(0)}, {"MOUSE2", IN_MOUSE(1)}, {"MOUSE3", IN_MOUSE(2)},
++    {"MOUSE4", IN_MOUSE(3)}, {"MOUSE5", IN_MOUSE(4)},
++    {"MOUSELEFT", IN_MOUSE(0)}, {"MOUSERIGHT", IN_MOUSE(1)}, {"MOUSEMIDDLE", IN_MOUSE(2)},
++    {"WHEELUP", IN_WHEEL_UP}, {"WHEELDOWN", IN_WHEEL_DOWN},
++};
++
++static int mkb_parse_input(const char *s)
++{
++    size_t i;
++    if (s[0] && !s[1]) {
++        char c = (char)toupper((unsigned char)s[0]);
++        if ((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'))
++            return c;
++    }
++    if ((s[0] == 'F' || s[0] == 'f') && s[1] >= '1' && s[1] <= '9') {
++        int n = atoi(s + 1);
++        if (n >= 1 && n <= 12)
++            return VK_F1 + n - 1;
++    }
++    for (i = 0; i < sizeof k_inputs / sizeof k_inputs[0]; i++)
++        if (!_stricmp(s, k_inputs[i].name))
++            return k_inputs[i].in;
++    return -1;
++}
++
++/* "INPUT=ACTION". Returns 1 when both names were understood. */
++static int mkb_bind(const char *input, const char *action)
++{
++    int in = mkb_parse_input(input);
++    size_t i;
++    if (in < 0 || in == MKB_TOGGLE_VK)
++        return 0;
++    for (i = 0; i < sizeof k_actions / sizeof k_actions[0]; i++)
++        if (!_stricmp(action, k_actions[i].name)) {
++            if (!s_bind_custom) {           /* the first binding replaces them all */
++                memset(s_bind, 0, sizeof s_bind);
++                s_bind_custom = 1;
++            }
++            s_bind[in] = k_actions[i].act;
++            return 1;
++        }
++    return 0;
++}
++
++static void mkb_default_bindings(void)
++{
++    static const char *def[] = {
++        "W", "MOVE_FORWARD", "S", "MOVE_BACK", "A", "MOVE_LEFT", "D", "MOVE_RIGHT",
++        "MOUSE1", "RT", "MOUSE2", "LT", "MOUSE3", "Y", "MOUSE4", "WHITE", "MOUSE5", "BLACK",
++        "WHEELUP", "Y", "WHEELDOWN", "Y",
++        "SPACE", "A", "R", "X", "E", "B", "Q", "WHITE", "F", "BLACK",
++        "ENTER", "START", "ESC", "START", "TAB", "BACK",
++        "LSHIFT", "LTHUMB", "LCTRL", "RTHUMB",
++        "UP", "DPAD_UP", "DOWN", "DPAD_DOWN", "LEFT", "DPAD_LEFT", "RIGHT", "DPAD_RIGHT",
++        NULL
++    };
++    int i;
++    for (i = 0; def[i]; i += 2)
++        mkb_bind(def[i], def[i + 1]);
++    s_bind_custom = 0;                  /* a layout file still replaces these */
++}
+ 
+ /* ---- configuration ----------------------------------------------------- */
+ 
+@@ -68,6 +189,9 @@ static int mkb_apply_kv(const char *key, const char *val)
+         s_cfg.invert_y = atoi(val) != 0;
+     } else if (!strcmp(key, "swap_sticks")) {
+         s_cfg.swap_sticks = atoi(val) != 0;
++    } else if (!_strnicmp(key, "bind.", 5)) {
++        if (!mkb_bind(key + 5, val))
++            fprintf(stderr, "  [MKB] unknown binding %s = %s\n", key + 5, val);
+     } else {
+         return 0;
+     }
+@@ -91,6 +215,7 @@ static void mkb_load_config(void)
+     FILE *f;
+     int i;
+ 
++    mkb_default_bindings();
+     for (i = 0; kv[i]; i += 2) {
+         const char *v = getenv(kv[i]);
+         if (v && *v)
+@@ -114,6 +239,9 @@ static void mkb_load_config(void)
+         while (fgets(line, sizeof line, f)) {
+             char *eq = strchr(line, '=');
+             char *k, *v;
++            k = line;
++            while (*k == ' ' || *k == '\t') k++;
++            if (*k == '#' || *k == ';') continue;   /* comment */
+             if (!eq) continue;
+             *eq = 0;
+             k = line; v = eq + 1;
+@@ -128,6 +256,25 @@ static void mkb_load_config(void)
+     fclose(f);
+ }
+ 
++/* RECOMP_MKB_BIND="SPACE=A,MOUSE1=RT": bindings without a file, applied
++ * after it. */
++static void mkb_env_bindings(void)
++{
++    const char *e = getenv("RECOMP_MKB_BIND");
++    char buf[1024], *tok, *ctx = NULL;
++    if (!e || !*e)
++        return;
++    snprintf(buf, sizeof buf, "%s", e);
++    for (tok = strtok_s(buf, ",;", &ctx); tok; tok = strtok_s(NULL, ",;", &ctx)) {
++        char *eq = strchr(tok, '=');
++        if (!eq)
++            continue;
++        *eq = 0;
++        if (!mkb_bind(tok, eq + 1))
++            fprintf(stderr, "  [MKB] unknown binding %s = %s\n", tok, eq + 1);
++    }
++}
++
+ /* ---- raw input thread -------------------------------------------------- */
+ 
+ /* Accumulators, written by the input thread and drained by the poll.
+@@ -135,16 +282,18 @@ static void mkb_load_config(void)
+  * with InterlockedAdd, the poll takes everything with Exchange(0). */
+ static volatile LONG s_dx, s_dy;
+ static volatile LONG s_wheel;        /* wheel steps since last poll   */
+-static volatile LONG s_mouse_btn;    /* 1 L, 2 R, 4 M, 8 X1, 16 X2    */
++static volatile LONG s_mouse_btn;    /* 1 L, 2 R, 4 M, 8 X1, 16 X2: held */
++static volatile LONG s_mouse_tap;    /* pressed since the last poll         */
+ static volatile unsigned char s_vk_down[256];
++static volatile unsigned char s_vk_tap[256];   /* pressed since the last poll */
++/* RECOMP_MKB_SCRIPT drives the layer instead of the real devices, for
++ * unattended tests on a machine someone is using: real input is ignored,
++ * the cursor is left alone and the foreground check is skipped. */
++static int s_scripted;
+ 
+ static volatile LONG s_active = 1;   /* F9 toggles this               */
+ static volatile LONG s_thread_up;
+ 
+-/* F9 is read on the input thread, so the toggle works even while the
+- * game is stalled on the poll side. */
+-#define MKB_TOGGLE_VK  VK_F9
+-
+ static void mkb_handle_raw(HRAWINPUT h)
+ {
+     BYTE buf[sizeof(RAWINPUT) + 64];
+@@ -155,6 +304,8 @@ static void mkb_handle_raw(HRAWINPUT h)
+             == (UINT)-1)
+         return;
+ 
++    if (s_scripted)
++        return;
+     if (ri->header.dwType == RIM_TYPEMOUSE) {
+         const RAWMOUSE *m = &ri->data.mouse;
+ 
+@@ -162,6 +313,16 @@ static void mkb_handle_raw(HRAWINPUT h)
+             if (m->lLastX) InterlockedAdd(&s_dx, m->lLastX);
+             if (m->lLastY) InterlockedAdd(&s_dy, m->lLastY);
+         }
++        {   /* a click that starts and ends between two polls still counts */
++            LONG down = 0;
++            if (m->usButtonFlags & RI_MOUSE_LEFT_BUTTON_DOWN)   down |= 1;
++            if (m->usButtonFlags & RI_MOUSE_RIGHT_BUTTON_DOWN)  down |= 2;
++            if (m->usButtonFlags & RI_MOUSE_MIDDLE_BUTTON_DOWN) down |= 4;
++            if (m->usButtonFlags & RI_MOUSE_BUTTON_4_DOWN)      down |= 8;
++            if (m->usButtonFlags & RI_MOUSE_BUTTON_5_DOWN)      down |= 16;
++            if (down)
++                InterlockedOr(&s_mouse_tap, down);
++        }
+         if (m->usButtonFlags & RI_MOUSE_LEFT_BUTTON_DOWN)
+             InterlockedOr(&s_mouse_btn, 1);
+         if (m->usButtonFlags & RI_MOUSE_LEFT_BUTTON_UP)
+@@ -190,6 +351,15 @@ static void mkb_handle_raw(HRAWINPUT h)
+         const RAWKEYBOARD *k = &ri->data.keyboard;
+         UINT vk = k->VKey;
+ 
++        /* Raw input names Shift, Ctrl and Alt without saying which side;
++         * the scan code and the E0 prefix do. */
++        if (vk == VK_SHIFT)
++            vk = k->MakeCode == 0x36 ? VK_RSHIFT : VK_LSHIFT;
++        else if (vk == VK_CONTROL)
++            vk = (k->Flags & RI_KEY_E0) ? VK_RCONTROL : VK_LCONTROL;
++        else if (vk == VK_MENU)
++            vk = (k->Flags & RI_KEY_E0) ? VK_RMENU : VK_LMENU;
++
+         if (vk == MKB_TOGGLE_VK) {
+             if (k->Message == WM_KEYDOWN && !s_vk_down[vk & 0xFF]) {
+                 LONG now = !s_active;
+@@ -200,10 +370,12 @@ static void mkb_handle_raw(HRAWINPUT h)
+             }
+         }
+         if (vk && vk < 256) {
+-            if (k->Message == WM_KEYDOWN || k->Message == WM_SYSKEYDOWN)
++            if (k->Message == WM_KEYDOWN || k->Message == WM_SYSKEYDOWN) {
+                 s_vk_down[vk] = 1;
+-            else
++                s_vk_tap[vk] = 1;
++            } else {
+                 s_vk_down[vk] = 0;
++            }
+         }
+     }
+ }
+@@ -256,9 +428,16 @@ static DWORD WINAPI mkb_thread(LPVOID unused)
+     }
+ 
+     InterlockedExchange(&s_thread_up, 1);
+-    fprintf(stderr, "  [MKB] mouse+keyboard captured (F9 releases; "
+-            "sens=%.2f dz=%.2f full=%ld)\n",
+-            s_cfg.sens, s_cfg.dz, s_cfg.full);
++    {
++        int n = 0, i;
++        for (i = 0; i < IN_MAX; i++)
++            n += s_bind[i].kind != ACT_NONE;
++        fprintf(stderr, "  [MKB] mouse+keyboard %s (F9 releases; sens=%.2f dz=%.2f"
++                " full=%ld; %d bindings, %s)\n",
++                s_scripted ? "scripted (real devices ignored)" : "captured",
++                s_cfg.sens, s_cfg.dz, s_cfg.full, n,
++                s_bind_custom ? "from the layout file" : "built-in layout");
++    }
+     fflush(stderr);
+ 
+     while (GetMessageA(&msg, NULL, 0, 0) > 0) {
+@@ -281,7 +460,9 @@ int mkb_enabled(void)
+         const char *v = getenv("RECOMP_MKB");
+         on = v && *v && *v != '0';
+         if (on) {
++            s_scripted = getenv("RECOMP_MKB_SCRIPT") != NULL;
+             mkb_load_config();
++            mkb_env_bindings();
+             if (InterlockedCompareExchange(&s_thread_up, 0, 0) == 0) {
+                 static LONG started = 0;
+                 if (InterlockedCompareExchange(&started, 1, 0) == 0)
+@@ -323,8 +504,15 @@ static void mkb_manage_cursor(int capture)
+     if (capture) {
+         RECT r;
+         HWND fg = GetForegroundWindow();
+-        if (fg && GetWindowRect(fg, &r))
++        /* The client area: the title bar stays out of reach of a stray
++         * click, and F9 gives the pointer back to move the window. */
++        if (fg && GetClientRect(fg, &r)) {
++            POINT a = { r.left, r.top }, b = { r.right, r.bottom };
++            ClientToScreen(fg, &a);
++            ClientToScreen(fg, &b);
++            r.left = a.x; r.top = a.y; r.right = b.x; r.bottom = b.y;
+             ClipCursor(&r);
++        }
+         if (hidden < 5) { ShowCursor(FALSE); hidden++; }
+     } else {
+         if (hidden > 0) { ShowCursor(TRUE); hidden--; }
+@@ -356,87 +544,207 @@ static void mkb_aim_vector(double ax, double ay, SHORT *out_x, SHORT *out_y)
+ 
+ #define MK_VK(k)  ((unsigned)(k) < 256 && s_vk_down[(k)])
+ 
++/* ---- scripted input (RECOMP_MKB_SCRIPT) --------------------------------- *
++ *
++ *   <ms>:<INPUT>[:<hold ms>]          a key or mouse button, held (default 150)
++ *   <ms>:mouse:<dx>:<dy>[:<ms>]       mouse travel, spread over the time given
++ *
++ * Times count from the first poll, as RECOMP_PAD_SCRIPT's do. Each step is
++ * printed as it starts, so a run log says what was pressed when. */
++typedef struct { unsigned long at, len; int in; long dx, dy; int shown; } MkbStep;
++#define MKB_SCRIPT_MAX 256
++static MkbStep s_steps[MKB_SCRIPT_MAX];
++static int s_nsteps = -1;
++
++static void mkb_script_load(void)
++{
++    const char *e = getenv("RECOMP_MKB_SCRIPT");
++    char buf[4096], *tok, *ctx = NULL;
++    s_nsteps = 0;
++    if (!e || !*e)
++        return;
++    snprintf(buf, sizeof buf, "%s", e);
++    for (tok = strtok_s(buf, ",", &ctx); tok && s_nsteps < MKB_SCRIPT_MAX;
++         tok = strtok_s(NULL, ",", &ctx)) {
++        MkbStep st;
++        char *f[5];
++        int n = 0;
++        char *c = tok, *p;
++        memset(&st, 0, sizeof st);
++        while (n < 5 && (p = strchr(c, ':')) != NULL) { *p = 0; f[n++] = c; c = p + 1; }
++        if (n < 5) f[n++] = c;
++        if (n < 2)
++            continue;
++        st.at = strtoul(f[0], NULL, 10);
++        if (!_stricmp(f[1], "mouse")) {
++            if (n < 4) continue;
++            st.in = -1;
++            st.dx = strtol(f[2], NULL, 10);
++            st.dy = strtol(f[3], NULL, 10);
++            st.len = n > 4 ? strtoul(f[4], NULL, 10) : 100;
++        } else {
++            st.in = mkb_parse_input(f[1]);
++            if (st.in < 0) {
++                fprintf(stderr, "  [MKB] script: unknown input %s\n", f[1]);
++                continue;
++            }
++            st.len = n > 2 ? strtoul(f[2], NULL, 10) : 150;
++        }
++        if (!st.len) st.len = 1;
++        s_steps[s_nsteps++] = st;
++    }
++}
++
++/* Apply the script at time t: held inputs into down[], mouse travel into
++ * *dx/*dy for the slice (last, t]. */
++static void mkb_script_apply(unsigned long last, unsigned long t,
++                             unsigned char *down, LONG *dx, LONG *dy)
++{
++    int i;
++    for (i = 0; i < s_nsteps; i++) {
++        MkbStep *st = &s_steps[i];
++        unsigned long end = st->at + st->len;
++        if (t < st->at || (st->in >= 0 && t >= end) || (st->in < 0 && last >= end))
++            continue;
++        if (!st->shown) {
++            st->shown = 1;
++            fprintf(stderr, "  [MKB] script t=%lu ms: step %d\n", t, i);
++            fflush(stderr);
++        }
++        if (st->in >= 0) {
++            down[st->in] = 1;
++        } else {
++            unsigned long a = last > st->at ? last : st->at, b = t < end ? t : end;
++            if (b > a) {
++                *dx += (LONG)(st->dx * (double)(b - a) / st->len);
++                *dy += (LONG)(st->dy * (double)(b - a) / st->len);
++            }
++        }
++    }
++}
++
++/* A wheel notch is a button press: down for two polls' worth, up for one,
++ * then the next queued notch. */
++typedef struct { LONG queued; unsigned long until; int down; } MkbPulse;
++
++static int mkb_pulse(MkbPulse *p, LONG add, unsigned long now)
++{
++    p->queued += add;
++    if (p->queued > 8) p->queued = 8;
++    if (now < p->until)
++        return p->down;
++    if (p->down) {                       /* release before the next press */
++        p->down = 0;
++        p->until = now + 60;
++    } else if (p->queued > 0) {
++        p->queued--;
++        p->down = 1;
++        p->until = now + 90;
++    }
++    return p->down;
++}
++
+ int mkb_merge(DWORD dwPort, XBOX_INPUT_STATE *pState)
+ {
+-    SHORT aim_x = 0, aim_y = 0, mov_x = 0, mov_y = 0;
++    SHORT aim_x = 0, aim_y = 0, mov_x = 0, mov_y = 0, look_x = 0, look_y = 0;
+     WORD b = 0;
+     BYTE analog[8];
+     LONG dx, dy, wheel, btn;
+-    int any = 0, i;
++    int any = 0, i, ax[8];
++    unsigned char down[IN_MAX];
+     static DWORD packet;
++    static unsigned long t0, last_t;
++    static MkbPulse wheel_up, wheel_dn;
++    unsigned long now, t;
+ 
+     if (!pState || dwPort != 0 || !mkb_enabled())
+         return 0;
+     if (!s_thread_up)
+         return 0;
+-
+-    if (!s_active) {
+-        mkb_manage_cursor(0);
+-        return 0;
+-    }
+-
+-    /* Foreground gate: while the user is elsewhere the mouse belongs to
+-     * whoever has it, and the game should read a pad at rest. */
+-    if (!game_is_foreground()) {
+-        mkb_manage_cursor(0);
+-        InterlockedExchange(&s_dx, 0);
+-        InterlockedExchange(&s_dy, 0);
+-        return 0;
++    now = GetTickCount();
++    if (!t0)
++        t0 = now;
++    t = now - t0;
++
++    if (!s_scripted) {
++        if (!s_active) {
++            mkb_manage_cursor(0);
++            return 0;
++        }
++        /* Foreground gate: while the user is elsewhere the mouse belongs
++         * to whoever has it, and the game should read a pad at rest. */
++        if (!game_is_foreground()) {
++            mkb_manage_cursor(0);
++            InterlockedExchange(&s_dx, 0);
++            InterlockedExchange(&s_dy, 0);
++            InterlockedExchange(&s_wheel, 0);
++            InterlockedExchange(&s_mouse_tap, 0);
++            memset((void *)s_vk_tap, 0, sizeof s_vk_tap);
++            return 0;
++        }
++        mkb_manage_cursor(1);
+     }
+-    mkb_manage_cursor(1);
+ 
+     dx    = InterlockedExchange(&s_dx, 0);
+     dy    = InterlockedExchange(&s_dy, 0);
+     wheel = InterlockedExchange(&s_wheel, 0);
+-    btn   = InterlockedExchange(&s_mouse_btn, 0);
++    /* Held buttons stay held; a click shorter than the poll still lands. */
++    btn   = InterlockedCompareExchange(&s_mouse_btn, 0, 0)
++          | InterlockedExchange(&s_mouse_tap, 0);
++
++    /* Everything held this poll, as one table indexed like s_bind. */
++    for (i = 0; i < 256; i++) {
++        down[i] = (unsigned char)(s_vk_down[i] | s_vk_tap[i]);
++        s_vk_tap[i] = 0;
++    }
++    for (i = 0; i < 5; i++)
++        down[IN_MOUSE(i)] = (btn >> i) & 1;
++    if (s_scripted) {
++        if (s_nsteps < 0)
++            mkb_script_load();
++        mkb_script_apply(last_t, t, down, &dx, &dy);
++    }
++    last_t = t;
++    down[IN_WHEEL_UP]   = (unsigned char)mkb_pulse(&wheel_up, wheel > 0 ? wheel : 0, now);
++    down[IN_WHEEL_DOWN] = (unsigned char)mkb_pulse(&wheel_dn, wheel < 0 ? -wheel : 0, now);
+ 
+     memset(analog, 0, sizeof analog);
++    memset(ax, 0, sizeof ax);
++    for (i = 0; i < IN_MAX; i++) {
++        const MkbAction *a = &s_bind[i];
++        if (!down[i] || a->kind == ACT_NONE)
++            continue;
++        if (a->kind == ACT_BTN)
++            b |= (WORD)(1u << a->idx);
++        else if (a->kind == ACT_ANALOG)
++            analog[a->idx] = 255;
++        else if (a->kind == ACT_AXIS)
++            ax[a->idx] = 1;
++    }
+ 
+-    /* ---- mouse buttons, as the Xbox pad sees them ---- */
+-    if (btn & 0x01) analog[XBOX_BUTTON_RTRIGGER] = 255;  /* fire      */
+-    if (btn & 0x02) analog[XBOX_BUTTON_LTRIGGER] = 255;  /* ADS/aim   */
+-    if (btn & 0x04) b |= 0;                              /* M: below  */
+-
+-    /* ---- keyboard: WASD movement ---- */
++    /* ---- keys on the sticks: movement, and keyboard look ---- */
+     {
+-        int mx = 0, my = 0;
+-        if (MK_VK('W')) my += 1;
+-        if (MK_VK('S')) my -= 1;
+-        if (MK_VK('A')) mx -= 1;
+-        if (MK_VK('D')) mx += 1;
+-        if (mx && my) { mx = (int)(mx * 70.71); my = (int)(my * 70.71); }
+-        if (mx || my) mkb_aim_vector(mx / 100.0, my / 100.0, &mov_x, &mov_y);
++        int mx = ax[AX_LRIGHT] - ax[AX_LLEFT], my = ax[AX_LUP] - ax[AX_LDOWN];
++        int lx = ax[AX_RRIGHT] - ax[AX_RLEFT], ly = ax[AX_RUP] - ax[AX_RDOWN];
++        if (mx || my)
++            mkb_aim_vector(mx * (my ? 0.7071 : 1.0), my * (mx ? 0.7071 : 1.0),
++                           &mov_x, &mov_y);
++        if (lx || ly)
++            mkb_aim_vector(lx * (ly ? 0.7071 : 1.0), ly * (lx ? 0.7071 : 1.0),
++                           &look_x, &look_y);
+     }
+ 
+     /* ---- mouse: aim ---- */
+     if (dx || dy) {
+-        double ax =  (double)dx / (double)s_cfg.full;
+-        double ay = -(double)dy / (double)s_cfg.full;
+-        if (s_cfg.invert_y) ay = -ay;
+-        mkb_aim_vector(ax, ay, &aim_x, &aim_y);
++        double fx =  (double)dx / (double)s_cfg.full;
++        double fy = -(double)dy / (double)s_cfg.full;
++        if (s_cfg.invert_y) fy = -fy;
++        mkb_aim_vector(fx, fy, &aim_x, &aim_y);
++    } else if (look_x || look_y) {
++        aim_x = look_x;
++        aim_y = look_y;
+     }
+ 
+-    /* ---- keyboard: buttons (Black's layout) ---- */
+-    if (MK_VK(VK_SPACE))  analog[XBOX_BUTTON_A]     = 255; /* use/jump */
+-    if (MK_VK('R'))       analog[XBOX_BUTTON_X]     = 255; /* reload    */
+-    if (MK_VK('E'))       analog[XBOX_BUTTON_B]     = 255; /* alt use   */
+-    if (MK_VK('Q'))       analog[XBOX_BUTTON_WHITE] = 255; /* grenade   */
+-    if (MK_VK('F'))       analog[XBOX_BUTTON_BLACK] = 255; /* alt gren. */
+-    if (btn & 0x08)       analog[XBOX_BUTTON_WHITE] = 255; /* X1        */
+-    if (btn & 0x10)       analog[XBOX_BUTTON_BLACK] = 255; /* X2        */
+-    if (MK_VK(VK_RETURN) || MK_VK(VK_ESCAPE)) b |= XBOX_GAMEPAD_START;
+-    if (MK_VK(VK_TAB))                         b |= XBOX_GAMEPAD_BACK;
+-    if (MK_VK(VK_LSHIFT))                      b |= XBOX_GAMEPAD_LEFT_THUMB;
+-    if (MK_VK(VK_LCONTROL))                    b |= XBOX_GAMEPAD_RIGHT_THUMB;
+-    if (MK_VK(VK_UP))    b |= XBOX_GAMEPAD_DPAD_UP;
+-    if (MK_VK(VK_DOWN))  b |= XBOX_GAMEPAD_DPAD_DOWN;
+-    if (MK_VK(VK_LEFT))  b |= XBOX_GAMEPAD_DPAD_LEFT;
+-    if (MK_VK(VK_RIGHT)) b |= XBOX_GAMEPAD_DPAD_RIGHT;
+-
+-    /* ---- wheel / middle button: cycle weapon ---- */
+-    if (wheel || (btn & 0x04))
+-        analog[XBOX_BUTTON_Y] = 255;
+-
+     /* ---- merge on top of whatever the host pad produced ---- */
+     if (b)        { pState->Gamepad.wButtons |= b; any = 1; }
+     for (i = 0; i < 8; i++) {
+diff --git a/src/input/mkb_input.h b/src/input/mkb_input.h
+index 664efad..657d465 100644
+--- a/src/input/mkb_input.h
++++ b/src/input/mkb_input.h
+@@ -18,7 +18,18 @@
+  *   RECOMP_MKB_DZ=f       assumed game deadzone    (default 0.18)
+  *   RECOMP_MKB_ACC=f      aim acceleration         (default 1.0 = off)
+  *   RECOMP_MKB_INVERT_Y=1 invert vertical aim      (default off)
+- *   RECOMP_MKB_INI=path   config file (same keys, one per line)
++ *   RECOMP_MKB_INI=path   config file (same keys, one per line; '#' comments)
++ *   RECOMP_MKB_BIND=...   bindings, "SPACE=A,MOUSE1=RT" (after the file)
++ *   RECOMP_MKB_SCRIPT=... scripted input for unattended tests, instead of
++ *                         the real devices: "<ms>:<KEY>[:<hold>]" and
++ *                         "<ms>:mouse:<dx>:<dy>[:<ms>]", comma separated
++ *
++ * Bindings: "bind.<KEY> = <CONTROL>" in the file. KEY is a letter, digit,
++ * F1-F12, a named key (SPACE ENTER ESC TAB LSHIFT RCTRL UP ... see
++ * k_inputs), MOUSE1-MOUSE5 or WHEELUP/WHEELDOWN; CONTROL is a pad button
++ * (A B X Y BLACK WHITE LT RT START BACK LTHUMB RTHUMB DPAD_*), a stick
++ * direction (MOVE_FORWARD/BACK/LEFT/RIGHT, LOOK_UP/DOWN/LEFT/RIGHT) or
++ * NONE. The first binding replaces the built-in layout.
+  *
+  * F9 toggles mouse/keyboard capture at runtime. Capture is only
+  * applied while the recompiled game's process has the foreground
 diff --git a/src/kernel/kernel_bridge.c b/src/kernel/kernel_bridge.c
-index 965dd08..3e32712 100644
+index 965dd08..16a0ec1 100644
 --- a/src/kernel/kernel_bridge.c
 +++ b/src/kernel/kernel_bridge.c
 @@ -44,6 +44,9 @@
@@ -166,7 +767,172 @@ index 965dd08..3e32712 100644
      xbox_HalReturnToFirmware(routine);
  }
  
-@@ -4036,6 +4149,20 @@ static void bridge_NtWriteFile(void)
+@@ -2698,6 +2811,30 @@ static int kernel_raise_interrupt(uint32_t vector)
+ 
+ static volatile LONG g_vblank_total;
+ 
++/* Milliseconds from the performance counter, as a double. GetTickCount64
++ * moves in 15.6 ms steps, which made "every 16 ms" fire after 16 or 31 ms
++ * at random: vblank (and with it D3D's flips, done in the vblank ISR) ran
++ * at 40-60 Hz instead of 60, and kernel timers fired up to a step late. */
++static int kernel_timer_coarse(void)
++{
++    static int c = -1;
++    if (c < 0)
++        c = getenv("RECOMP_TIMER_COARSE") != NULL;   /* the old clock, for A/B */
++    return c;
++}
++
++static double kernel_now_ms(void)
++{
++    static LARGE_INTEGER f;
++    LARGE_INTEGER c;
++    if (kernel_timer_coarse())
++        return (double)GetTickCount64();
++    if (!f.QuadPart)
++        QueryPerformanceFrequency(&f);
++    QueryPerformanceCounter(&c);
++    return (double)c.QuadPart * 1000.0 / (double)f.QuadPart;
++}
++
+ uint32_t xbox_VblankCount(void)
+ {
+     return (uint32_t)g_vblank_total;
+@@ -2706,18 +2843,26 @@ uint32_t xbox_VblankCount(void)
+ static void kernel_vblank_tick(void)
+ {
+     static int enabled = -1;
+-    static long long next_ms;
+-    long long now;
++    static double next_ms;
++    double now;
+ 
+     if (enabled < 0)
+         enabled = getenv("RECOMP_VBLANK") != NULL;
+     if (!enabled)
+         return;
+ 
+-    now = (long long)GetTickCount64();
++    now = kernel_now_ms();
+     if (now < next_ms)
+         return;
+-    next_ms = now + 16;                       /* ~60 Hz */
++    /* 59.94 Hz (NTSC), on a fixed schedule: the next vblank is due one
++     * period after the last one was due, not after it was noticed, so a
++     * late wake-up does not stretch the frame. Fallen far behind (a stall,
++     * a debugger): start over from now rather than fire a burst. */
++    if (kernel_timer_coarse())
++        next_ms = now + 16;
++    else
++        next_ms = (now - next_ms > 100.0 || next_ms == 0.0) ? now + 16.6833
++                                                            : next_ms + 16.6833;
+     InterlockedIncrement(&g_vblank_total);
+ 
+     if (!xbox_GetConnectedInterrupt(NV2A_VECTOR))
+@@ -3023,10 +3168,14 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
+         long long now;
+         int i;
+ 
+-        Sleep(10);
++        /* 1 ms (main() raises the timer resolution): vblank, DPCs and
++         * kernel timers are due on millisecond boundaries, and this loop is
++         * all that runs them. It used to sleep 10 ms a turn (RECOMP_TIMER_COARSE=1
++         * still does, with the old clock, for comparison). */
++        Sleep(kernel_timer_coarse() ? 10 : 1);
+         kernel_vblank_tick();  /* the GPU's frame clock */
+         kernel_drain_dpcs();   /* deferred work, before due timers */
+-        now = (long long)GetTickCount64();
++        now = (long long)kernel_now_ms();
+ 
+         for (i = 0; i < XBOX_MAX_TIMERS; i++) {
+             uint32_t dpc, fired_va;
+@@ -3083,7 +3232,7 @@ static void kernel_set_timer(uint32_t timer_va, long long due_100ns,
+     if (free_slot >= 0) {
+         g_timers[free_slot].timer_va  = timer_va;
+         g_timers[free_slot].dpc_va    = dpc_va;
+-        g_timers[free_slot].due_ms    = (long long)GetTickCount64() + delay_ms;
++        g_timers[free_slot].due_ms    = (long long)kernel_now_ms() + delay_ms;
+         g_timers[free_slot].period_ms = period_ms;
+     }
+     LeaveCriticalSection(&g_timer_lock);
+@@ -3923,6 +4072,9 @@ static int bridge_handle_is_async(uint32_t token)
+     return 0;
+ }
+ 
++static int wait_prof_on(void);          /* RECOMP_WAIT_PROF, below */
++static LARGE_INTEGER s_wait_freq;
++
+ /* Off unless RECOMP_ASYNC_IO is set, so the two behaviours stay comparable
+  * rather than one being swapped in blind. */
+ static int bridge_async_io_enabled(void)
+@@ -3951,6 +4103,8 @@ static void bridge_NtReadFile(void)
+         g_eax = 0xC0000005u;                 /* STATUS_ACCESS_VIOLATION */
+         return;
+     }
++    LARGE_INTEGER rp0, rp1, rp2, rp3;
++    QueryPerformanceCounter(&rp0);
+     if (offset_va) {
+         off.LowPart  = BRIDGE_MEM32(offset_va);
+         off.HighPart = (LONG)BRIDGE_MEM32(offset_va + 4);
+@@ -3958,11 +4112,19 @@ static void bridge_NtReadFile(void)
+     }
+     g_eax = (uint32_t)xbox_NtReadFile(handle, NULL, NULL, NULL, &ios,
+                 XBOX_TO_NATIVE(buffer_va), length, poff);
++    QueryPerformanceCounter(&rp1);
+ 
+     /* What a read actually delivered. A decoder that rejects its input cannot
+      * say whether the bytes were wrong or the read was, and the two look
+-     * identical from inside the title -- the first bytes settle it. */
+-    {
++     * identical from inside the title -- the first bytes settle it.
++     *
++     * RECOMP_READ_TRACE=1 only: a loading screen reads a few thousand
++     * chunks, and a flushed line per chunk cost more than the reads
++     * themselves (through a slow pipe, ~7 ms each -- loading ran at 2 MB/s). */
++    static int read_trace = -1;
++    if (read_trace < 0)
++        read_trace = getenv("RECOMP_READ_TRACE") != NULL;
++    if (read_trace) {
+         const uint8_t *p = (const uint8_t *)XBOX_TO_NATIVE(buffer_va);
+         uint32_t got = (uint32_t)ios.Information;
+         /* The offset matters as much as the length. A title streaming a pack
+@@ -3985,9 +4147,35 @@ static void bridge_NtReadFile(void)
+                     got > 2 ? p[2] : 0, got > 3 ? p[3] : 0);
+         fflush(stderr);
+     }
++    QueryPerformanceCounter(&rp2);
+     bridge_write_iostatus(iostatus, ios.Status, (uint32_t)ios.Information);
+     bridge_complete_file_io(STACK_ARG(1), STACK_ARG(2), STACK_ARG(3),
+                             iostatus);
++    QueryPerformanceCounter(&rp3);
++    if (wait_prof_on()) {
++        static LONGLONG acc[3], bytes;
++        static uint32_t n;
++        static DWORD t0;
++        DWORD now = GetTickCount();
++        acc[0] += rp1.QuadPart - rp0.QuadPart;
++        acc[1] += rp2.QuadPart - rp1.QuadPart;
++        acc[2] += rp3.QuadPart - rp2.QuadPart;
++        bytes += ios.Information;
++        n++;
++        if (!t0)
++            t0 = now;
++        if (now - t0 >= 2000) {
++            double f = (double)s_wait_freq.QuadPart / 1000.0;
++            fprintf(stderr, "  [READS] %u reads, %.1f MB in %.1f s: host read %.1f ms,"
++                    " log %.1f ms, completion (event/APC) %.1f ms\n", n, bytes / 1048576.0,
++                    (now - t0) / 1000.0, acc[0] / f, acc[1] / f, acc[2] / f);
++            fflush(stderr);
++            acc[0] = acc[1] = acc[2] = 0;
++            bytes = 0;
++            n = 0;
++            t0 = now;
++        }
++    }
+ 
+     /* An asynchronous request returns STATUS_PENDING, even when the data was
+      * already there.
+@@ -4036,6 +4224,20 @@ static void bridge_NtWriteFile(void)
      bridge_write_iostatus(iostatus, ios.Status, (uint32_t)ios.Information);
      bridge_complete_file_io(STACK_ARG(1), STACK_ARG(2), STACK_ARG(3),
                              iostatus);
@@ -187,6 +953,119 @@ index 965dd08..3e32712 100644
  }
  
  /* ── NtQueryInformationFile (ordinal 211, 5 args = 20 bytes) */
+@@ -10041,6 +10243,91 @@ static void kernel_thunk_dispatch(void)
+     (void)held;
+ }
+ 
++/* RECOMP_WAIT_PROF=1: where guest threads spend their time inside the
++ * kernel. Every call is timed; each one that took long is charged to
++ * (host thread, ordinal, guest call site, two guest return addresses
++ * further up), and every two seconds the costliest are printed with how
++ * many timed out (STATUS_TIMEOUT). A title that runs slowly with nothing
++ * busy is waiting for something -- this says what, and from where. */
++typedef struct {
++    DWORD tid;
++    uint32_t ord, caller, via[2];
++    uint32_t n, timeouts;
++    double ms;
++} WaitStat;
++
++#define WAIT_STATS 512
++static WaitStat s_wait[WAIT_STATS];
++static SRWLOCK s_wait_lock = SRWLOCK_INIT;
++static LARGE_INTEGER s_wait_freq;
++static DWORD s_wait_t0;
++
++static int wait_prof_on(void)
++{
++    static int on = -1;
++    if (on < 0) {
++        on = getenv("RECOMP_WAIT_PROF") != NULL;
++        QueryPerformanceFrequency(&s_wait_freq);
++    }
++    return on;
++}
++
++static int wait_cmp(const void *a, const void *b)
++{
++    double d = ((const WaitStat *)b)->ms - ((const WaitStat *)a)->ms;
++    return d > 0 ? 1 : (d < 0 ? -1 : 0);
++}
++
++static void wait_note(uint32_t ord, uint32_t caller, uint32_t args_esp, double ms, uint32_t status)
++{
++    DWORD tid = GetCurrentThreadId(), now = GetTickCount();
++    uint32_t via[2] = {0, 0}, a;
++    int i, k = 0;
++
++    /* Two plausible return addresses above the call's arguments. */
++    for (a = args_esp; a < args_esp + 512 && k < 2; a += 4) {
++        uint32_t v = BRIDGE_MEM32(a);
++        if (v >= 0x00011000u && v < 0x00430000u && v != caller)
++            via[k++] = v;
++    }
++    AcquireSRWLockExclusive(&s_wait_lock);
++    if (!s_wait_t0)
++        s_wait_t0 = now;
++    for (i = 0; i < WAIT_STATS; i++) {
++        WaitStat *w = &s_wait[i];
++        if (!w->n) {
++            w->tid = tid; w->ord = ord; w->caller = caller;
++            w->via[0] = via[0]; w->via[1] = via[1];
++        } else if (w->tid != tid || w->ord != ord || w->caller != caller
++                   || w->via[0] != via[0] || w->via[1] != via[1]) {
++            continue;
++        }
++        w->n++;
++        w->ms += ms;
++        if (status == 0x102)
++            w->timeouts++;
++        break;
++    }
++    if (now - s_wait_t0 >= 2000) {
++        static WaitStat sorted[WAIT_STATS];
++        double span = (now - s_wait_t0) / 1000.0;
++        memcpy(sorted, s_wait, sizeof sorted);
++        memset(s_wait, 0, sizeof s_wait);
++        s_wait_t0 = now;
++        ReleaseSRWLockExclusive(&s_wait_lock);
++        qsort(sorted, WAIT_STATS, sizeof sorted[0], wait_cmp);
++        fprintf(stderr, "  [WAITS] last %.1f s, kernel time by thread / call site:\n", span);
++        for (i = 0; i < 14 && sorted[i].n && sorted[i].ms >= 10.0; i++)
++            fprintf(stderr, "  [WAITS]   tid %5lu ord %3u from %08X (via %08X %08X): %6u calls %8.1f ms"
++                    " %u timed out\n", (unsigned long)sorted[i].tid, sorted[i].ord,
++                    sorted[i].caller, sorted[i].via[0], sorted[i].via[1], sorted[i].n,
++                    sorted[i].ms, sorted[i].timeouts);
++        fflush(stderr);
++        return;
++    }
++    ReleaseSRWLockExclusive(&s_wait_lock);
++}
++
+ static void kernel_thunk_dispatch_body(void)
+ {
+     int slot = g_kernel_dispatch_slot;
+@@ -10147,7 +10434,19 @@ static void kernel_thunk_dispatch_body(void)
+         }
+     }
+ 
+-    if (bridge) {
++    if (bridge && wait_prof_on()) {
++        LARGE_INTEGER t0, t1;
++        QueryPerformanceCounter(&t0);
++        bridge();
++        QueryPerformanceCounter(&t1);
++        {
++            double ms = (double)(t1.QuadPart - t0.QuadPart) * 1000.0
++                      / (double)s_wait_freq.QuadPart;
++            if (ms >= 0.05)
++                wait_note(ordinal, g_xbox_kernel_caller,
++                          g_esp + g_slot_arg_bytes[slot], ms, g_eax);
++        }
++    } else if (bridge) {
+         bridge();
+     } else {
+         /* No specific bridge - return 0. Warn once per ordinal rather than
 diff --git a/src/kernel/kernel_hal.c b/src/kernel/kernel_hal.c
 index 3a09ca8..028893b 100644
 --- a/src/kernel/kernel_hal.c
@@ -322,7 +1201,7 @@ index e66e3de..df01bde 100644
      return STATUS_SUCCESS;
  }
 diff --git a/src/kernel/nv2a_backend.h b/src/kernel/nv2a_backend.h
-index 327f01d..54c7e3c 100644
+index 327f01d..b509c37 100644
 --- a/src/kernel/nv2a_backend.h
 +++ b/src/kernel/nv2a_backend.h
 @@ -20,6 +20,12 @@
@@ -346,17 +1225,22 @@ index 327f01d..54c7e3c 100644
  
  /* The colour surface being drawn into, in real (anti-aliased) pixels.
   * aa_sx/aa_sy give the anti-aliasing factor, so width/aa_sx is the logical
-@@ -38,6 +45,9 @@ typedef struct {
+@@ -38,6 +45,14 @@ typedef struct {
      uint32_t pitch;             /* bytes per row */
      uint32_t bytes_per_pixel;   /* 2 or 4 */
      uint32_t aa_sx, aa_sy;      /* 1 or 2 each */
 +    /* Extended: the clip rectangle's origin (SET_SURFACE_CLIP); width and
 +     * height above are its size. Pixels outside it are not drawn. */
 +    uint32_t clip_x, clip_y;
++    /* Extended: SET_SURFACE_FORMAT's colour code, which says how the pixels
++     * are laid out: 0x3 R5G6B5, 0x1/0x2 X1R5G5B5, 0xA G8B8 (blue in the low
++     * byte, green in the high byte; red and alpha are not stored), 0x9 B8,
++     * 0x4-0x8 32-bit (X/A)8R8G8B8. */
++    uint32_t color_format;
  } Nv2aSurface;
  
  /* A texture as the title programmed it. uv in Nv2aVertex are in texels. */
-@@ -51,6 +61,10 @@ typedef struct {
+@@ -51,6 +66,10 @@ typedef struct {
       * a linear texture) and the raw SET_TEXTURE_FILTER word (MIN in bits
       * 16-23). A back end that ignores them samples level 0. */
      uint32_t levels, filter;
@@ -367,7 +1251,7 @@ index 327f01d..54c7e3c 100644
  } Nv2aTexture;
  
  typedef struct {
-@@ -58,6 +72,12 @@ typedef struct {
+@@ -58,6 +77,12 @@ typedef struct {
      float    rhw;               /* 1/w, 1 for pre-transformed batches */
      uint32_t diffuse;           /* 0xAARRGGBB */
      float    u, v;              /* texels */
@@ -380,7 +1264,7 @@ index 327f01d..54c7e3c 100644
  } Nv2aVertex;
  
  /* Render state as the title set it, in NV2A's own (OpenGL) enum values:
-@@ -80,6 +100,8 @@ typedef struct {
+@@ -80,6 +105,8 @@ typedef struct {
       * that ignores these draws that pass over the whole surface. */
      uint32_t stencil_enable, stencil_func, stencil_ref, stencil_func_mask;
      uint32_t stencil_write_mask, stencil_fail, stencil_zfail, stencil_zpass;
@@ -389,7 +1273,7 @@ index 327f01d..54c7e3c 100644
  } Nv2aRenderState;
  
  typedef struct {
-@@ -87,15 +109,63 @@ typedef struct {
+@@ -87,15 +114,63 @@ typedef struct {
      uint32_t           count;
      const Nv2aTexture *texture;     /* NULL: untextured */
      const Nv2aRenderState *state;
@@ -453,7 +1337,7 @@ index 327f01d..54c7e3c 100644
  } Nv2aBackend;
  
  /* Register (or, with NULL, remove) the back end. Call before the title starts
-@@ -107,6 +177,12 @@ void nv2a_backend_register(const Nv2aBackend *backend);
+@@ -107,6 +182,12 @@ void nv2a_backend_register(const Nv2aBackend *backend);
   * Returns 0 if the format is not supported. */
  int nv2a_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out);
  
@@ -467,7 +1351,7 @@ index 327f01d..54c7e3c 100644
   * of the semaphore the title reads GPU progress from (for XDK D3D, the
   * pointer at device+0x30). The executor writes each release there once it
 diff --git a/src/kernel/nv2a_pb_exec.c b/src/kernel/nv2a_pb_exec.c
-index 1280565..ef7d61c 100644
+index 1280565..45469e0 100644
 --- a/src/kernel/nv2a_pb_exec.c
 +++ b/src/kernel/nv2a_pb_exec.c
 @@ -767,6 +767,11 @@ void nv2a_backend_register(const Nv2aBackend *backend)
@@ -482,17 +1366,15 @@ index 1280565..ef7d61c 100644
  static int backend_draws(void)
  {
      return s_backend && s_backend->draw;
-@@ -781,6 +786,38 @@ static void current_surface(Nv2aSurface *out)
+@@ -781,6 +786,36 @@ static void current_surface(Nv2aSurface *out)
      out->bytes_per_pixel = surface_bpp();
      out->aa_sx           = s_gpu.aa_sx > 1.5f ? 2 : 1;
      out->aa_sy           = s_gpu.aa_sy > 1.5f ? 2 : 1;
 +    out->clip_x          = s_gpu.clip_x;
 +    out->clip_y          = s_gpu.clip_y;
-+    /* Which 16-bit layout each 2-byte surface really is, once per address.
-+     * A back end only gets bytes_per_pixel and treats every such surface as
-+     * R5G6B5, which is wrong for X1R5G5B5 (0x1/0x2) and G8B8 (0xA). MA2
-+     * samples two 256x256 2-byte targets as LIN_G8B8; this says whether they
-+     * were drawn as G8B8 or as R5G6B5 reinterpreted. */
++    out->color_format    = s_gpu.format & 0xF;
++    /* Which 16-bit layout each 2-byte surface is, once per address: MA2
++     * draws two 256x256 targets as G8B8 and samples them as LIN_G8B8. */
 +    if (out->bytes_per_pixel == 2) {
 +        static uint32_t seen[8];
 +        static int n;
@@ -521,7 +1403,7 @@ index 1280565..ef7d61c 100644
  }
  
  /* Render state in the NV2A's own values, gathered from what the executor
-@@ -814,6 +851,8 @@ static void current_render_state(Nv2aRenderState *r)
+@@ -814,6 +849,8 @@ static void current_render_state(Nv2aRenderState *r)
      r->stencil_fail      = s_reg[0x0370 / 4];        /* SET_STENCIL_OP_FAIL */
      r->stencil_zfail     = s_reg[0x0374 / 4];        /* SET_STENCIL_OP_ZFAIL */
      r->stencil_zpass     = s_reg[0x0378 / 4];        /* SET_STENCIL_OP_ZPASS */
@@ -530,7 +1412,7 @@ index 1280565..ef7d61c 100644
  }
  
  static int sample_texture(uint32_t u, uint32_t v, uint32_t *argb);
-@@ -831,7 +870,7 @@ int nv2a_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out)
+@@ -831,7 +868,7 @@ int nv2a_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out)
      s_gpu.texs[0].color  = tex->color;
      s_gpu.texs[0].addr_u = 3;
      s_gpu.texs[0].addr_v = 3;
@@ -539,7 +1421,7 @@ index 1280565..ef7d61c 100644
      s_gpu.texs[0].levels = 1;
      s_gpu.texs[0].filter = 0;
      s_gpu.texs[0].cube   = 0;
-@@ -846,6 +885,18 @@ int nv2a_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out)
+@@ -846,6 +883,18 @@ int nv2a_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out)
      return ok;
  }
  
@@ -558,7 +1440,7 @@ index 1280565..ef7d61c 100644
  static void clear_surface(uint32_t param)
  {
      uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
-@@ -1064,6 +1115,8 @@ static uint32_t linear_twin(uint32_t fmt)
+@@ -1064,6 +1113,8 @@ static uint32_t linear_twin(uint32_t fmt)
      case 0x06: return 0x12;                /* A8R8G8B8  -> LIN_A8R8G8B8  */
      case 0x07: return 0x1E;                /* X8R8G8B8  -> LIN_X8R8G8B8  */
      case 0x19: return 0x1F;                /* A8        -> LIN_A8        */
@@ -567,7 +1449,7 @@ index 1280565..ef7d61c 100644
      default:   return fmt;                 /* already linear, or unhandled */
      }
  }
-@@ -1200,6 +1253,25 @@ static int sample_tex(const Texture *t, uint32_t face_offset,
+@@ -1200,6 +1251,25 @@ static int sample_tex(const Texture *t, uint32_t face_offset,
          return 1;
      }
  
@@ -593,7 +1475,7 @@ index 1280565..ef7d61c 100644
      /* 8-bit. */
      case 0x13: {                                    /* LIN_L8 */
          uint32_t t = p[u];
-@@ -1920,37 +1992,80 @@ static void backend_from_xf(const Nv2aVshOutput *v, Nv2aVertex *o)
+@@ -1920,37 +1990,80 @@ static void backend_from_xf(const Nv2aVshOutput *v, Nv2aVertex *o)
      o->diffuse = pack_color(v->d0);
      o->u = v->tex[0][0] * su;
      o->v = v->tex[0][1] * sv;
@@ -692,7 +1574,7 @@ index 1280565..ef7d61c 100644
      s_backend->draw(&surf, &batch);
      s_gpu.tris_drawn += s_bcount / 3;
      s_bcount = 0;
-@@ -1995,7 +2110,12 @@ static void raster_indexed(uint32_t i0, uint32_t i1, uint32_t i2, uint32_t argb)
+@@ -1995,7 +2108,12 @@ static void raster_indexed(uint32_t i0, uint32_t i1, uint32_t i2, uint32_t argb)
              o[k].diffuse = vertex_color(ix[k]);
              o[k].u = textured ? uv[k][0] : 0.0f;
              o[k].v = textured ? uv[k][1] : 0.0f;
@@ -705,7 +1587,7 @@ index 1280565..ef7d61c 100644
          s_bcount += 3;
          return;
      }
-@@ -2106,7 +2226,7 @@ static uint32_t tex_texel_bytes(uint32_t fmt)
+@@ -2106,7 +2224,7 @@ static uint32_t tex_texel_bytes(uint32_t fmt)
      case 0x00: case 0x01: case 0x0B: case 0x13: case 0x19: case 0x1F:
          return 1;
      case 0x02: case 0x03: case 0x04: case 0x05: case 0x10: case 0x11:
@@ -714,7 +1596,7 @@ index 1280565..ef7d61c 100644
          return 2;
      default:
          return 4;
-@@ -2388,12 +2508,65 @@ static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
+@@ -2388,12 +2506,65 @@ static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
  #define NV_RASTER_MAX_THREADS 16
  #define NV_RASTER_MT_MIN_PIXELS 8192
  
@@ -780,7 +1662,7 @@ index 1280565..ef7d61c 100644
      XfCount cnt[NV_RASTER_MAX_THREADS];
  } s_pool;
  
-@@ -2403,7 +2576,12 @@ static DWORD WINAPI raster_worker(LPVOID arg)
+@@ -2403,7 +2574,12 @@ static DWORD WINAPI raster_worker(LPVOID arg)
      for (;;) {
          WaitForSingleObject(s_pool.start[k], INFINITE);
          memset(&s_pool.cnt[k], 0, sizeof s_pool.cnt[k]);
@@ -794,7 +1676,7 @@ index 1280565..ef7d61c 100644
          if (InterlockedDecrement(&s_pool.pending) == 0)
              SetEvent(s_pool.done);
      }
-@@ -2462,11 +2640,83 @@ static void xf_rows_parallel(const XfTri *T, XfCount *total)
+@@ -2462,11 +2638,83 @@ static void xf_rows_parallel(const XfTri *T, XfCount *total)
          total->zpass += s_pool.cnt[k].zpass;
      }
  }
@@ -878,7 +1760,7 @@ index 1280565..ef7d61c 100644
  #endif
  
  static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
-@@ -2564,6 +2814,20 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
+@@ -2564,6 +2812,20 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
      s_gpu.xf_drawn++;
      T.inv_area = 1.0f / area;
  
@@ -899,7 +1781,7 @@ index 1280565..ef7d61c 100644
      xf_rows_parallel(&T, &cnt);
      s_gpu.xf_depth_fail += cnt.depth_fail;
      s_gpu.xf_pixels += cnt.pixels;
-@@ -2664,8 +2928,6 @@ static void raster_xf_clipped(const Nv2aVshOutput *a, const Nv2aVshOutput *b,
+@@ -2664,8 +2926,6 @@ static void raster_xf_clipped(const Nv2aVshOutput *a, const Nv2aVshOutput *b,
  
  /* About 7 MB, so allocated by the first batch that transforms rather than
   * carried in every build that never turns the executor on. */
@@ -908,7 +1790,7 @@ index 1280565..ef7d61c 100644
  /* Does this batch run the title's vertex program? RECOMP_NO_VSH turns the
   * interpreter off (the batch then falls to the screen-space heuristics). */
  static int batch_uses_program(void)
-@@ -2721,15 +2983,172 @@ static void xf_set_viewport(void)
+@@ -2721,15 +2981,172 @@ static void xf_set_viewport(void)
      s_xf_o[2] = of[2];
  }
  
@@ -1084,7 +1966,7 @@ index 1280565..ef7d61c 100644
      xf_set_viewport();
      {
          const VertexAttr *tc = texcoord_attr();
-@@ -2828,6 +3247,19 @@ static void raster_batch_program(void)
+@@ -2828,6 +3245,19 @@ static void raster_batch_program(void)
      if (s_gpu.texs[0].valid)
          note_texture_use();
  
@@ -1104,7 +1986,7 @@ index 1280565..ef7d61c 100644
      switch (s_gpu.prim) {
      case NV_PRIM_TRIANGLES:
          for (i = 0; i + 2 < n; i += 3)
-@@ -2857,6 +3289,10 @@ static void raster_batch_program(void)
+@@ -2857,6 +3287,10 @@ static void raster_batch_program(void)
      default:
          break;
      }
@@ -1115,7 +1997,7 @@ index 1280565..ef7d61c 100644
      if (backend_draws())
          backend_flush(!s_xf_no_tex);
  }
-@@ -3747,6 +4183,10 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -3747,6 +4181,10 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
          /* The stall ends when the buffer being read is the one just finished.
           * There is no scanout here to wait for, so that is now. */
          s_gpu.flip_read = s_gpu.flip_write;
@@ -1126,7 +2008,7 @@ index 1280565..ef7d61c 100644
          /* And this is a completed swap, which is what a title's own swap
           * counter counts -- see xbox_Nv2aFrameCounterFlip. */
          xbox_Nv2aFrameCounterFlip();
-@@ -3762,6 +4202,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -3762,6 +4200,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
              extern void xbox_FramebufferWindowFrameStats(uint32_t);
              static uint32_t draws_at_flip;
              xbox_FramebufferWindowFrameStats(s_gpu.draws - draws_at_flip);
@@ -1134,7 +2016,7 @@ index 1280565..ef7d61c 100644
              draws_at_flip = s_gpu.draws;
          }
          if (s_gpu.pitch) {
-@@ -3798,8 +4239,6 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -3798,8 +4237,6 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
              }
          }
          s_gpu.drawn_stale = 1;
@@ -1260,6 +2142,70 @@ index 362cefe..903a466 100644
  void xbox_HeapFree(uint32_t xbox_va)
  {
      static int frees = 0, matched = 0;
+diff --git a/src/usb/ohci.c b/src/usb/ohci.c
+index d45d8bb..5ebf8df 100644
+--- a/src/usb/ohci.c
++++ b/src/usb/ohci.c
+@@ -1017,7 +1017,9 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
+      * dereferences null before it executes a line of its own body. That is
+      * what killed the process here, two interrupts in, with no fault report
+      * because the fault was in the runtime rather than in the title. */
+-    unsigned waited = 0;
++    ULONGLONG started = GetTickCount64();
++    unsigned passes = 0;
++    int waited_warned = 0;
+     int plugged = 0;
+     uint32_t last_status = 0;
+     unsigned repeats = 0;
+@@ -1044,14 +1046,33 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
+         uint32_t pass_done = 0;     /* this pass's done queue, newest first */
+ 
+         Sleep(OHCI_TICK_MS);
++        passes++;
+         control = hc->reg[HcControl / 4];
+         enable  = hc->reg[HcInterruptEnable / 4];
+ 
+         /* Operational is HCFS == 10b in bits 7:6. Interrupting a controller
+-         * the driver has not started yet is not a test of anything. */
++         * the driver has not started yet is not a test of anything.
++         *
++         * Wait for it as long as it takes. This used to give up after 1500
++         * passes, which was the thirty seconds its comment said while a pass
++         * was 20 ms and became six once the tick dropped to 4 -- and six is
++         * inside the spread of how long a title takes to reach its USB init.
++         * MechAssault 2 starts the controller two to three seconds in on a
++         * quick boot and seven or more on a slow one, and on a slow one the
++         * thread had already returned: the driver came up, unmasked the root
++         * hub interrupt and waited for a device that nothing was left to
++         * plug in. No line said so, because leaving was silent. A sleeping
++         * thread costs nothing, and a title that brings USB up late (after a
++         * movie, say) is owed a controller just the same, so this only says
++         * once that it is still waiting. */
+         if ((control & 0xC0u) != 0x80u) {
+-            if (++waited > 1500)              /* 30 s and it never started */
+-                break;
++            if (!waited_warned && GetTickCount64() - started > 30000) {
++                waited_warned = 1;
++                fprintf(stderr, "  [OHCI%d] not started after 30 s "
++                        "(HcControl=%08X); still waiting\n",
++                        hc->index, control);
++                fflush(stderr);
++            }
+             continue;
+         }
+         if (!(enable & INTR_MIE))
+@@ -1075,8 +1096,9 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
+             plugged = 1;
+             s_plugged_pads = 1;
+             first_port = port;
+-            fprintf(stderr, "  [OHCI0] operational after %u ms; device "
+-                            "arriving on port 1\n", waited * 20);
++            fprintf(stderr, "  [OHCI0] operational after %u ms (%u passes); "
++                            "device arriving on port 1\n",
++                    (unsigned)(GetTickCount64() - started), passes);
+             fflush(stderr);
+         }
+ 
 diff --git a/src/usb/usb_gamepad.c b/src/usb/usb_gamepad.c
 index bd00f3f..bde1eb7 100644
 --- a/src/usb/usb_gamepad.c
@@ -1485,10 +2431,10 @@ index b26edfe..dea7f9e 100644
              /* One dump a few seconds in, so the title has had time to render
 diff --git a/src/video/nv2a_d3d11.c b/src/video/nv2a_d3d11.c
 new file mode 100644
-index 0000000..ded45dc
+index 0000000..e33c617
 --- /dev/null
 +++ b/src/video/nv2a_d3d11.c
-@@ -0,0 +1,2364 @@
+@@ -0,0 +1,2411 @@
 +/*
 + * nv2a_d3d11.c -- a Direct3D 11 render back end for the pushbuffer executor.
 + *
@@ -1571,7 +2517,7 @@ index 0000000..ded45dc
 +"  float4 g_fc0; float4 g_fc1; float4 g_fogc;\n"
 +"  uint4  g_misc;\n"           /* alpha test enable, func, ref, clip plane mode */
 +"  float4 g_tsz[4];\n"         /* w, h, normalized, cube */
-+"  uint4  g_misc2;\n"          /* textured (modulate mode) */
++"  uint4  g_misc2;\n"          /* textured (modulate mode), G8B8 stages */
 +"};\n"
 +"Texture2D T0 : register(t0); Texture2D T1 : register(t1);\n"
 +"Texture2D T2 : register(t2); Texture2D T3 : register(t3);\n"
@@ -1745,6 +2691,7 @@ index 0000000..ded45dc
 +"static const uint4 K_TF = SPEC_TF;\n"
 +"#define K_TFN(st) ((K_TF[st] & 1u) != 0)\n"
 +"#define K_TFC(st) ((K_TF[st] & 2u) != 0)\n"
++"#define K_TFG(st) ((K_TF[st] & 4u) != 0)\n"
 +"#define K_TEXTURED SPEC_TEXTURED\n"
 +"#define STAGE_LOOP [unroll]\n"
 +"#else\n"
@@ -1756,6 +2703,7 @@ index 0000000..ded45dc
 +"#define K_MISC uint4(g_misc.x, g_misc.y, (uint)g_surf.w, g_misc.w)\n"
 +"#define K_TFN(st) (g_tsz[st].z != 0.0)\n"
 +"#define K_TFC(st) (g_tsz[st].w != 0.0)\n"
++"#define K_TFG(st) (((g_misc2.y >> (st)) & 1u) != 0)\n"
 +"#define K_TEXTURED g_misc2.x\n"
 +"#define STAGE_LOOP [loop]\n"
 +"#endif\n"
@@ -1788,10 +2736,12 @@ index 0000000..ded45dc
 +"  return map_in((b & 0x10) ? r.a : r.b, (b >> 5) & 7);\n"
 +"}\n"
 +"float4 tex2d(uint st, float2 uv) {\n"
-+"  if (st == 0) return T0.SampleLevel(S0, uv, 0);\n"
-+"  if (st == 1) return T1.SampleLevel(S1, uv, 0);\n"
-+"  if (st == 2) return T2.SampleLevel(S2, uv, 0);\n"
-+"  return T3.SampleLevel(S3, uv, 0);\n"
++"  float4 v;\n"
++"  if (st == 0) v = T0.SampleLevel(S0, uv, 0);\n"
++"  else if (st == 1) v = T1.SampleLevel(S1, uv, 0);\n"
++"  else if (st == 2) v = T2.SampleLevel(S2, uv, 0);\n"
++"  else v = T3.SampleLevel(S3, uv, 0);\n"
++"  return K_TFG(st) ? v.bgbg : v;\n"            /* LIN_G8B8 over a G8B8 target */
 +"}\n"
 +"float4 texcube(uint st, float3 d) {\n"
 +"  if (st == 0) return C0.SampleLevel(S0, d, 0);\n"
@@ -1841,7 +2791,7 @@ index 0000000..ded45dc
 +"  float4 col = i.d0;\n"
 +"  if (K_MISC.z == 0) {\n"                         /* texel * diffuse */
 +"    float4 o = col;\n"
-+"    if (K_TEXTURED != 0) o = T0.SampleLevel(S0, i.uv / max(g_tsz[0].xy, 1.0), 0) * col;\n"
++"    if (K_TEXTURED != 0) o = tex2d(0, i.uv / max(g_tsz[0].xy, 1.0)) * col;\n"
 +"    o = saturate(o);\n"
 +"    if (!alpha_pass(o.a)) discard;\n"
 +"    return o;\n"
@@ -2344,36 +3294,30 @@ index 0000000..ded45dc
 +    return v;
 +}
 +
-+static ID3D11ShaderResourceView *rt_alias(const Nv2aTexture *t, float *w, float *h);
++static ID3D11ShaderResourceView *rt_alias(const Nv2aTexture *t, float *w, float *h,
++                                          int *g8b8);
 +static void rt_sync_overlap(uint32_t va, uint32_t n);
 +static ID3D11ShaderResourceView *tex_get_decoded(const Nv2aTexture *t);
-+int d3d_rt_overlaps(uint32_t va, uint32_t n);
 +
 +/* The view a stage samples, and the size its texel coordinates divide by:
 + * a render target the title draws into and then samples is used where it
-+ * is, on the GPU; anything else comes from guest memory, decoded. */
++ * is, on the GPU (*g8b8 set when the stage must read it as (B,G,B,G), the
++ * shader's K_TFG remap); anything else comes from guest memory, decoded. */
 +/* Colour formats the executor's decoder cannot read. The CPU rasteriser
 + * samples white for them; so does this, without hashing or writing anything
 + * back first. */
-+static ID3D11ShaderResourceView *tex_get(const Nv2aTexture *t, float *w, float *h)
++static ID3D11ShaderResourceView *tex_get(const Nv2aTexture *t, float *w, float *h,
++                                         int *g8b8)
 +{
 +    ID3D11ShaderResourceView *a;
++    *g8b8 = 0;
 +    if (s_fmt_bad[t->color & 0xFF])
 +        return NULL;
 +    *w = (float)t->width;
 +    *h = (float)t->height;
-+    a = rt_alias(t, w, h);
++    a = rt_alias(t, w, h, g8b8);
 +    if (a)
 +        return a;
-+    /* LIN_G8B8 over a render target the GPU holds newer pixels for stays
-+     * white, as it did before 0x17 had a decoder. MA2 samples two 16-bit
-+     * targets this way every frame; writing them back cost more than the
-+     * rest of the frame, and the write-back packs every 16-bit target as
-+     * R5G6B5, which is right only if the title drew it as R5G6B5 and not
-+     * as a G8B8 surface. Doing it properly means sampling the target on the
-+     * GPU with a channel remap. */
-+    if (t->color == 0x17 && d3d_rt_overlaps(t->offset, tex_span(t)))
-+        return NULL;
 +    /* Memory a render target has drawn newer pixels into must be written
 +     * back before it can be read as an ordinary texture. */
 +    s_sync_tex = t;
@@ -2460,6 +3404,11 @@ index 0000000..ded45dc
 +    int dirty;              /* the GPU holds pixels guest memory does not */
 +    int gpu_valid;          /* the render target holds the surface at all */
 +    uint64_t guest_hash;    /* guest bytes when the two last agreed */
++    /* A 16-bit surface drawn as G8B8 (surface colour format 0xA) rather
++     * than R5G6B5: its low byte is the blue channel and its high byte green,
++     * so the BGRA target holds them in blue and green and a pixel's low
++     * 16 bits are the guest's. */
++    int g8b8;
 +} Target;
 +
 +typedef struct {
@@ -2485,7 +3434,8 @@ index 0000000..ded45dc
 +    return s_conv;
 +}
 +
-+/* Guest pixels -> render target. 32-bit surfaces are B8G8R8A8 already. */
++/* Guest pixels -> render target. 32-bit surfaces are B8G8R8A8 already;
++ * 16-bit ones are widened as R5G6B5, or as G8B8 into blue and green. */
 +static void rt_upload(Target *t)
 +{
 +    uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset() + t->va;
@@ -2500,12 +3450,18 @@ index 0000000..ded45dc
 +        if (!c) return;
 +        for (y = 0; y < t->height; y++) {
 +            const uint16_t *s = (const uint16_t *)(mem + (size_t)y * t->pitch);
++            uint32_t *d = c + (size_t)y * t->width;
++            if (t->g8b8) {
++                for (x = 0; x < t->width; x++)
++                    d[x] = 0xFF000000u | s[x];
++                continue;
++            }
 +            for (x = 0; x < t->width; x++) {
 +                uint16_t v = s[x];
 +                uint32_t r = ((v >> 11) & 0x1F) * 255u / 31u;
 +                uint32_t g = ((v >> 5) & 0x3F) * 255u / 63u;
 +                uint32_t b = (v & 0x1F) * 255u / 31u;
-+                c[(size_t)y * t->width + x] = 0xFF000000u | (r << 16) | (g << 8) | b;
++                d[x] = 0xFF000000u | (r << 16) | (g << 8) | b;
 +            }
 +        }
 +        ID3D11DeviceContext_UpdateSubresource(s_ctx, (ID3D11Resource *)t->tex, 0,
@@ -2546,11 +3502,15 @@ index 0000000..ded45dc
 +        } else {
 +            const uint32_t *s = (const uint32_t *)src;
 +            uint16_t *d = (uint16_t *)dst;
-+            for (x = 0; x < t->width; x++) {
-+                uint32_t c = s[x];
-+                d[x] = (uint16_t)(((c >> 8) & 0xF800) | ((c >> 5) & 0x07E0)
-+                                | ((c >> 3) & 0x001F));
-+            }
++            if (t->g8b8)
++                for (x = 0; x < t->width; x++)
++                    d[x] = (uint16_t)s[x];          /* green high, blue low */
++            else
++                for (x = 0; x < t->width; x++) {
++                    uint32_t c = s[x];
++                    d[x] = (uint16_t)(((c >> 8) & 0xF800) | ((c >> 5) & 0x07E0)
++                                    | ((c >> 3) & 0x001F));
++                }
 +        }
 +    }
 +    ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)t->staging, 0);
@@ -2619,6 +3579,7 @@ index 0000000..ded45dc
 +    t->bpp = bpp;
 +    t->width = w;
 +    t->height = h;
++    t->g8b8 = bpp == 2 && s->color_format == 0xA;
 +    return t;
 +}
 +
@@ -2667,6 +3628,20 @@ index 0000000..ded45dc
 +
 +    if (!t)
 +        return NULL;
++    /* The same 16-bit memory drawn in the other layout (G8B8 / R5G6B5):
++     * guest memory catches up in the old one, the target reloads in the new. */
++    if (t->g8b8 != (t->bpp == 2 && s->color_format == 0xA)) {
++        static int shown;
++        if (shown < 4) {
++            shown++;
++            fprintf(stderr, "  [D3D11] target %08X pitch %u: 16-bit layout now %s\n",
++                    t->va, t->pitch, t->g8b8 ? "R5G6B5" : "G8B8");
++        }
++        rt_writeback(t);
++        t->g8b8 = !t->g8b8;
++        if (t->gpu_valid)
++            rt_upload(t);
++    }
 +    if (t != s_cur) {
 +        s_st.switches++;
 +        /* Render targets stay on the GPU across switches. Upload guest
@@ -2697,17 +3672,26 @@ index 0000000..ded45dc
 + * Reading it back and decoding the rows as swizzled instead cost
 + * MechAssault 2 a GPU stall every frame (a 512x512 target at 0x81EFA000),
 + * and scrambled the texture besides. */
-+static ID3D11ShaderResourceView *rt_alias(const Nv2aTexture *t, float *w, float *h)
++/* And LIN_G8B8 (0x17) over a 16-bit target drawn as G8B8: the target holds
++ * the surface's blue and green bytes in its blue and green channels, and
++ * the texture reads (R,G,B,A) = (B,G,B,G), so *g8b8 tells the stage to
++ * swizzle. MechAssault 2 draws two 256x256 targets this way and samples
++ * them every frame. */
++static ID3D11ShaderResourceView *rt_alias(const Nv2aTexture *t, float *w, float *h,
++                                          int *g8b8)
 +{
-+    int i, swz;
++    int i, swz, g8;
 +    if (t->cube)
 +        return NULL;
 +    swz = t->normalized && t->color == 0x06;
-+    if (!swz && (t->normalized || (t->color != 0x12 && t->color != 0x1E)))
++    g8 = !t->normalized && t->color == 0x17;
++    if (!swz && !g8 && (t->normalized || (t->color != 0x12 && t->color != 0x1E)))
 +        return NULL;
 +    for (i = 0; i < RT_MAX; i++) {
 +        Target *r = &s_rt[i];
-+        if (!r->tex || !r->gpu_valid || r->va != t->offset || r->bpp != 4 || !r->srv)
++        if (!r->tex || !r->gpu_valid || r->va != t->offset || !r->srv)
++            continue;
++        if (g8 ? (r->bpp != 2 || !r->g8b8) : r->bpp != 4)
 +            continue;
 +        if (swz ? (r->width != t->width || r->height != t->height
 +                   || r->pitch != t->width * 4)
@@ -2730,10 +3714,12 @@ index 0000000..ded45dc
 +                                             (ID3D11Resource *)r->tex);
 +            *w = (float)r->width;
 +            *h = (float)r->height;
++            *g8b8 = g8;
 +            return r->copy_srv;
 +        }
 +        *w = (float)r->width;
 +        *h = (float)r->height;
++        *g8b8 = g8;
 +        return r->srv;
 +    }
 +    return NULL;
@@ -3007,7 +3993,7 @@ index 0000000..ded45dc
 +typedef struct {
 +    uint32_t cicw[8], aicw[8], cocw[8], aocw[8], fin[4];
 +    uint32_t misc[4];           /* alpha test enable, func, mode, clip-plane mode */
-+    uint32_t tf[4];             /* per stage: 1 normalised, 2 cube */
++    uint32_t tf[4];             /* per stage: 1 normalised, 2 cube, 4 G8B8 target */
 +    uint32_t textured;
 +} PsKey;
 +
@@ -3193,6 +4179,9 @@ index 0000000..ded45dc
 +        for (st = 0; st < 4; st++)
 +            k.tf[st] = (cb->tsz[st][2] != 0.0f ? 1u : 0u) | (cb->tsz[st][3] != 0.0f ? 2u : 0u);
 +    }
++    for (st = 0; st < 4; st++)
++        if ((cb->misc2[1] >> st) & 1)
++            k.tf[st] |= 4u;
 +    h = fnv64(&k, sizeof k, 0xCBF29CE484222325ull);
 +    if (!h)
 +        h = 1;
@@ -3280,8 +4269,10 @@ index 0000000..ded45dc
 +            cb.tsz[st][2] = tx->normalized ? 1.0f : 0.0f;
 +            cb.tsz[st][3] = tx->cube ? 1.0f : 0.0f;
 +            {
-+                ID3D11ShaderResourceView *v = tex_get(tx, &cb.tsz[st][0], &cb.tsz[st][1]);
++                int g8;
++                ID3D11ShaderResourceView *v = tex_get(tx, &cb.tsz[st][0], &cb.tsz[st][1], &g8);
 +                if (v) srv[tx->cube ? 4 + st : st] = v;
++                if (g8) cb.misc2[1] |= 1u << st;
 +            }
 +            smp[st] = sampler(tx);
 +        }
@@ -3289,8 +4280,10 @@ index 0000000..ded45dc
 +        cb.misc2[0] = 1;
 +        cb.tsz[0][2] = b->texture->normalized ? 1.0f : 0.0f;
 +        {
-+            ID3D11ShaderResourceView *v = tex_get(b->texture, &cb.tsz[0][0], &cb.tsz[0][1]);
++            int g8;
++            ID3D11ShaderResourceView *v = tex_get(b->texture, &cb.tsz[0][0], &cb.tsz[0][1], &g8);
 +            if (v) srv[0] = v;
++            if (g8) cb.misc2[1] = 1;
 +        }
 +        /* The CPU's screen-space path samples the nearest texel. */
 +        {
