@@ -47,3 +47,8 @@ game/
 # OS
 Thumbs.db
 .DS_Store
+
+# Run logs, frame dumps and the runtime kernel log
+analysis/
+xbox_kernel.log
+*.bmp

@@ -1,0 +1,277 @@
+diff --git a/src/kernel/kernel_bridge.c b/src/kernel/kernel_bridge.c
+index 965dd08..3e32712 100644
+--- a/src/kernel/kernel_bridge.c
++++ b/src/kernel/kernel_bridge.c
+@@ -44,6 +44,9 @@
+ #include <string.h>
+ #include <ctype.h>
+ #include <wctype.h>
++#ifdef _WIN32
++#include <tlhelp32.h>   /* relaunch: freeze this instance's threads */
++#endif
+ 
+ /* Access to recompiled code registers. Per-thread: RECOMP_TLS comes from
+  * xbox_memory_layout.h and must match the definitions there -- a plain extern
+@@ -239,8 +242,33 @@ static void kernel_data_init(void)
+      */
+     {
+         const char *cmdline = getenv("RECOMP_CMDLINE");
++        const char *relaunch = getenv("RECOMP_LAUNCH_PAGE");
++
++        if (relaunch && *relaunch) {
++            /* A relaunch (see bridge_HalReturnToFirmware): the previous
++             * instance saved the launch data page the title filled in before
++             * its quick reboot, and this one hands it back exactly as the
++             * console's kernel would -- type, title id, path and the 3 KB of
++             * title data at +0x400. */
++            FILE *f = fopen(relaunch, "rb");
++            uint32_t page = f ? xbox_HeapAlloc(0x1000, 4096) : 0;
+ 
+-        if (cmdline && *cmdline) {
++            if (page) {
++                size_t got = fread((uint8_t *)g_xbox_mem_offset + page, 1,
++                                   0x1000, f);
++                BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_LAUNCH_DATA_PAGE) =
++                    page;
++                fprintf(stderr, "  Launch data: relaunch page at 0x%08X from %s"
++                                " (%u bytes, type %u, title 0x%08X)\n",
++                        page, relaunch, (unsigned)got, BRIDGE_MEM32(page),
++                        BRIDGE_MEM32(page + 4));
++            } else {
++                BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_LAUNCH_DATA_PAGE) = 0;
++                fprintf(stderr, "  Launch data: cannot read %s\n", relaunch);
++            }
++            if (f)
++                fclose(f);
++        } else if (cmdline && *cmdline) {
+             uint32_t page = xbox_HeapAlloc(0x1000 + 0x0C00, 4096);
+             if (page) {
+                 size_t n = strlen(cmdline);
+@@ -1762,7 +1790,7 @@ static void bridge_HalReturnToFirmware(void)
+         uint32_t i;
+ 
+         fprintf(stderr, "  [KERNEL] exit requested, guest esp=0x%08X:\n", g_esp);
+-        for (i = 0; i < 200; i++) {
++        for (i = 0; i < 2048; i++) {
+             uint32_t a = g_esp + i * 4;
+             if (a < 0x00010000u || a >= 0x04000000u) break;
+             fprintf(stderr, "    GS %08X %08X\n", a,
+@@ -1807,6 +1835,91 @@ static void bridge_HalReturnToFirmware(void)
+                     waited);
+     }
+ 
++#ifdef _WIN32
++    /* A quick reboot into this same title: relaunch it.
++     *
++     * XLaunchNewImage(NULL, &data) -- "start me again with this data" -- is how
++     * a title frees everything an earlier phase allocated. MechAssault 2 does
++     * it straight after its intro movie, with LDT_TITLE launch data telling the
++     * next boot to go to the front end; exiting here instead ends the game
++     * after the intro. The console keeps the launch page across the reboot, so
++     * the next instance gets it back through RECOMP_LAUNCH_PAGE.
++     *
++     * Only an empty path (the running image) can be honoured -- there is no
++     * other image to run -- and the depth is capped so a title that reboots
++     * unconditionally cannot loop forever. */
++    {
++        uint32_t page = BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_LAUNCH_DATA_PAGE);
++        const char *depth_s = getenv("RECOMP_RELAUNCH_DEPTH");
++        int depth = depth_s ? atoi(depth_s) : 0;
++
++        if (routine == 2 && page && BRIDGE_MEM32(page) == 1 &&
++            BRIDGE_MEM8(page + 8) == 0 && depth < 8 &&
++            !getenv("RECOMP_NO_RELAUNCH")) {
++            char file[MAX_PATH], tmp[MAX_PATH], exe[MAX_PATH], buf[16];
++            FILE *f;
++
++            GetTempPathA(sizeof tmp, tmp);
++            snprintf(file, sizeof file, "%sxboxrecomp_launch_%lu.bin", tmp,
++                     (unsigned long)GetCurrentProcessId());
++            f = fopen(file, "wb");
++            if (f) {
++                STARTUPINFOA si;
++                PROCESS_INFORMATION pi;
++                HANDLE snap;
++
++                fwrite((uint8_t *)g_xbox_mem_offset + page, 1, 0x1000, f);
++                fclose(f);
++                SetEnvironmentVariableA("RECOMP_LAUNCH_PAGE", file);
++                snprintf(buf, sizeof buf, "%d", depth + 1);
++                SetEnvironmentVariableA("RECOMP_RELAUNCH_DEPTH", buf);
++                GetModuleFileNameA(NULL, exe, sizeof exe);
++
++                /* Freeze the rest of this instance first: its audio and
++                 * streaming threads would otherwise keep running beside the
++                 * new one, against the same cache files. */
++                snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
++                if (snap != INVALID_HANDLE_VALUE) {
++                    THREADENTRY32 te;
++                    te.dwSize = sizeof te;
++                    if (Thread32First(snap, &te)) {
++                        do {
++                            if (te.th32OwnerProcessID == GetCurrentProcessId() &&
++                                te.th32ThreadID != GetCurrentThreadId()) {
++                                HANDLE th = OpenThread(THREAD_SUSPEND_RESUME, FALSE,
++                                                       te.th32ThreadID);
++                                if (th) { SuspendThread(th); CloseHandle(th); }
++                            }
++                            te.dwSize = sizeof te;
++                        } while (Thread32Next(snap, &te));
++                    }
++                    CloseHandle(snap);
++                }
++
++                memset(&si, 0, sizeof si);
++                si.cb = sizeof si;
++                si.dwFlags = STARTF_USESTDHANDLES;
++                si.hStdInput  = GetStdHandle(STD_INPUT_HANDLE);
++                si.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE);
++                si.hStdError  = GetStdHandle(STD_ERROR_HANDLE);
++                fprintf(stderr, "  [KERNEL] quick reboot into this title: "
++                                "relaunching (depth %d, launch page %s)\n",
++                        depth + 1, file);
++                fflush(stderr);
++                if (CreateProcessA(exe, GetCommandLineA(), NULL, NULL, TRUE, 0,
++                                   NULL, NULL, &si, &pi)) {
++                    DWORD code = 0;
++                    WaitForSingleObject(pi.hProcess, INFINITE);
++                    GetExitCodeProcess(pi.hProcess, &code);
++                    ExitProcess(code);
++                }
++                fprintf(stderr, "  [KERNEL] relaunch failed (error %lu)\n",
++                        (unsigned long)GetLastError());
++            }
++        }
++    }
++#endif
++
+     xbox_HalReturnToFirmware(routine);
+ }
+ 
+@@ -4036,6 +4149,20 @@ static void bridge_NtWriteFile(void)
+     bridge_write_iostatus(iostatus, ios.Status, (uint32_t)ios.Information);
+     bridge_complete_file_io(STACK_ARG(1), STACK_ARG(2), STACK_ARG(3),
+                             iostatus);
++
++    /* Same contract as NtReadFile: an asynchronous request answers
++     * STATUS_PENDING even though the write already happened and the status
++     * block and event are already final.
++     *
++     * MechAssault 2's HDD cache copier (sub_0002C580) depends on it. It
++     * issues an overlapped WriteFile for each 128 KB chunk and only clears
++     * its "read in flight" flag when the write reports ERROR_IO_PENDING. An
++     * immediate success returns without clearing it, so the next event
++     * re-validates the same read and writes chunk 0 again, forever: the copy
++     * never advances and the front end waits on Common.mgf indefinitely. */
++    if (NT_SUCCESS((NTSTATUS)g_eax) &&
++        bridge_async_io_enabled() && bridge_handle_is_async(STACK_ARG(0)))
++        g_eax = STATUS_PENDING;
+ }
+ 
+ /* ── NtQueryInformationFile (ordinal 211, 5 args = 20 bytes) */
+diff --git a/src/kernel/kernel_hal.c b/src/kernel/kernel_hal.c
+index 3a09ca8..028893b 100644
+--- a/src/kernel/kernel_hal.c
++++ b/src/kernel/kernel_hal.c
+@@ -1060,6 +1060,70 @@ uint64_t xbox_ReadTimeStampCounter(void)
+     }
+ }
+ 
++/* =========================================================================
++ * CPUID and the EFLAGS bits a title can observe
++ *
++ * Lifted as no-ops, the classic "is CPUID there?" test (flip EFLAGS.ID with
++ * pushfd/popfd and see if it sticks) read garbage, cpuid left its registers
++ * unchanged, and feature detection came out "no MMX". An Xbox always has MMX
++ * and SSE, so titles link only those code paths: RAD's Bink in MechAssault 2
++ * (sub_0031C900) then left its MMX routine pointers at 0x004D36B8.. null,
++ * called them, leaked their stack arguments, and the intro's caller read its
++ * own object from the wrong slot and quit to the dashboard.
++ *
++ * The answers are the console's: a 733 MHz Pentium III (Coppermine, family 6
++ * model 8), GenuineIntel, with FPU/TSC/CX8/CMOV/MMX/FXSR/SSE and no SSE2.
++ *
++ * EFLAGS: the arithmetic flags live in the lifter's own model, so pushfd
++ * pushes only the system bits a title can set and read back (ID, AC, DF, IF,
++ * plus the always-one bit 1), kept per thread like the real register.
++ * ========================================================================= */
++void xbox_Cpuid(uint32_t *a, uint32_t *b, uint32_t *c, uint32_t *d)
++{
++    uint32_t leaf = *a;
++
++    switch (leaf) {
++    case 0:
++        *a = 2;
++        *b = 0x756E6547u;   /* "Genu" */
++        *d = 0x49656E69u;   /* "ineI" */
++        *c = 0x6C65746Eu;   /* "ntel" */
++        break;
++    case 1:
++        *a = 0x0000068Au;   /* family 6, model 8, stepping 10 */
++        *b = 0;
++        *c = 0;
++        *d = 0x0383F9FFu;   /* FPU..CMOV, MMX (23), FXSR (24), SSE (25) */
++        break;
++    case 2:
++        *a = 0x03020101u;   /* PIII cache/TLB descriptors */
++        *b = 0;
++        *c = 0;
++        *d = 0x0C040843u;
++        break;
++    default:
++        *a = *b = *c = *d = 0;
++        break;
++    }
++}
++
++#if defined(_MSC_VER)
++static __declspec(thread) uint32_t t_eflags_sys = 0x00000202u;   /* IF + bit 1 */
++#else
++static _Thread_local uint32_t t_eflags_sys = 0x00000202u;
++#endif
++
++uint32_t xbox_PushfdValue(void)
++{
++    return t_eflags_sys | 0x2u;
++}
++
++void xbox_PopfdValue(uint32_t v)
++{
++    /* ID (21), AC (18), DF (10), IF (9) -- the bits user code can change. */
++    t_eflags_sys = (v & 0x00240600u) | 0x2u;
++}
++
+ /* =========================================================================
+  * x86 port I/O
+  *
+diff --git a/tools/recomp/lifter.py b/tools/recomp/lifter.py
+index baf1834..f96489a 100644
+--- a/tools/recomp/lifter.py
++++ b/tools/recomp/lifter.py
+@@ -1724,6 +1724,26 @@ class Lifter:
+                 "  /* rdtsc */",
+             ]
+ 
++        # ── CPU identification ──
++        #
++        # Lifted as no-ops these broke feature detection: the EFLAGS.ID
++        # round-trip that asks "is cpuid there?" read whatever was on the
++        # stack (pushfd pushed nothing, so the pop took someone else's
++        # value), and cpuid left its registers as they were. Titles only
++        # link the code paths the console's Pentium III can run, so "no
++        # MMX" leaves those routines unset -- MechAssault 2's Bink called
++        # its null MMX pointers and unbalanced the stack under the intro.
++        # The runtime answers as that CPU; see kernel_hal.c.
++        if m == "cpuid":
++            return ["{ extern void xbox_Cpuid(uint32_t *, uint32_t *, uint32_t *,"
++                    " uint32_t *); xbox_Cpuid(&eax, &ebx, &ecx, &edx); } /* cpuid */"]
++        if m == "pushfd":
++            return ["{ extern uint32_t xbox_PushfdValue(void);"
++                    " PUSH32(esp, xbox_PushfdValue()); } /* pushfd */"]
++        if m == "popfd":
++            return ["{ extern void xbox_PopfdValue(uint32_t); uint32_t _fl;"
++                    " POP32(esp, _fl); xbox_PopfdValue(_fl); } /* popfd */"]
++
+         # ── Port I/O ──
+         #
+         # `in`/`out` reach the MCPX's I/O space: the ACPI block at 0x8000,

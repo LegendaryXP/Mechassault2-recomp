@@ -1,5 +1,5 @@
 /**
- * YOUR_GAME_NAME - Recompiled Game Entry Point
+ * MechAssault 2: Lone Wolf - Recompiled Game Entry Point
  *
  * This is the Windows executable that hosts the recompiled game code.
  * It performs the following initialization sequence:
@@ -21,13 +21,14 @@
  *   - Customize the VEH handler for game-specific crash diagnosis
  *
  * XBE Details (fill in from xbe_parser output):
- *   Title:       YOUR_GAME_NAME
- *   Title ID:    0x00000000
+ *   Title:       MechAssault 2: Lone Wolf (ma2.xbe, disc version 6, XDK 5849)
+ *   Title ID:    0x4D53006B
  *   Base addr:   0x00010000
- *   Entry point: 0x00000000
- *   Code size:   ~??? KB (.text)
- *   Sections:    ?? (list them)
- *   Kernel imports: ??
+ *   Entry point: 0x002B94F2
+ *   Code size:   ~3158 KB (.text)
+ *   Sections:    45 (.text, D3DX, NAL, XNET, XONLINE, mgCore, BINK*, DSOUND,
+ *                WMADEC, XACTENG, XGRPH, D3D (LTCG), XPP, .rdata, .data, ...)
+ *   Kernel imports: 154
  */
 
 #include <windows.h>
@@ -82,9 +83,10 @@ extern ptrdiff_t g_xbox_mem_offset;
  * TODO: Set these from your xbe_parser output.
  * Run: py -3 -m tools.xbe_parser game/default.xbe
  */
-#define YOUR_GAME_ENTRY_POINT   0x00000000  /* XBE entry point VA */
-#define YOUR_GAME_XBE_PATH      "game\\Your Game Title\\default.xbe"
-#define YOUR_GAME_DIR            "game\\Your Game Title"
+#define YOUR_GAME_ENTRY_POINT   0x002B94F2  /* XBE entry point VA (ma2.xbe) */
+/* default.xbe on the disc is only a launcher that starts D:\MA2.xbe */
+#define YOUR_GAME_XBE_PATH      "game\\ma2.xbe"
+#define YOUR_GAME_DIR            "game"
 
 /* ── Forward declarations ──────────────────────────────────── */
 
@@ -303,7 +305,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
 
-    printf("=== YOUR_GAME_NAME - Static Recompilation ===\n");
+    printf("=== MechAssault 2: Lone Wolf - Static Recompilation ===\n");
     printf("Loading XBE...\n");
 
     /* Install VEH handler (first handler in chain) */
@@ -316,7 +318,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
 
     /* Step 1: Load XBE */
     if (!load_xbe(YOUR_GAME_XBE_PATH, &xbe_data, &xbe_size)) {
-        MessageBoxA(NULL, "Failed to load default.xbe.\n"
+        MessageBoxA(NULL, "Failed to load game\\ma2.xbe.\n"
                     "Place the game files in the 'game' subdirectory.",
                     "Recomp", MB_ICONERROR);
         return 1;
@@ -347,6 +349,16 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
         g_apu_state = mcpx_apu_init_standalone((uint8_t *)xbox_GetMemoryBase());
         fprintf(stderr, "[BOOT] emulated APU %s\n",
                 g_apu_state ? "up" : "FAILED to initialise");
+    }
+
+    /* Bring up the emulated USB host controllers (no-op unless RECOMP_USB is
+     * set). MA2 statically links XAPI, which drives the MCPX OHCI registers
+     * itself, so without these it never finds a controller and its front end
+     * waits forever for a pad event (sub_00012DB0's poll loop). The template
+     * does not call this. */
+    {
+        extern void xbox_OhciInit(void);
+        xbox_OhciInit();
     }
 
     /* Step 3: Initialize Xbox kernel */

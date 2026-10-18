@@ -3,8 +3,8 @@
 ## Setup
 - Toolkit: sp00nznet/xboxrecomp v0.14.0 (commit eb0aa1d, 2026-10-16), cloned at ../xboxrecomp
 - Project: this folder, from xboxrecomp/templates/new-game; .exe target named `ma2`
-- Host: Windows 11 Home 10.0.26200, Python 3.13 (git yes; CMake, MSVC missing as of 2026-10-17)
-- Game: MechAssault 2: Lone Wolf, title ID 4D53006B (MS-107). Disc not dumped yet; PC has no optical drive.
+- Host: Windows 11 Home 10.0.26200, Python 3.13 + capstone 5.0.9, CMake 4.4.4, VS2022 Build Tools (MSVC, C++ workload), x64 target
+- Game: MechAssault 2: Lone Wolf, title ID 0x4D53006B, disc version 6, XDK 5849. Source: user-owned XISO in C:Mechassault2 (2.2 GB), extracted with `python -m tools.xiso unpack` to game/ (883 files).
 
 ## Prior work
 - No universal-modder field note for MechAssault (checked 2026-10-17).
@@ -12,3 +12,92 @@
 
 ## Log
 - 2026-10-17: project scaffolded. Blocked on default.xbe (needs disc rip) and on CMake + VS2022 Build Tools.
+- 2026-10-17: toolchain installed. Toolkit pytest: 711 passed, 101 skipped. Toolkit build (VS 17 2022, -A x64, Release): exit 0, 9 libs (xbox_kernel, xbox_d3d8, xbox_dsound, xbox_apu, xbox_nv2a, xbox_input, xbox_usb, xbox_video, recomp_exit_hook), 87 warnings, 0 errors.
+  - Gotcha: toolkit targets x64; don't pass -A Win32.
+  - Still blocked on default.xbe (disc rip).
+- 2026-10-17: XBE facts
+  - default.xbe (68 KB) = launcher (launcher_xr.exe), only launches `D:\MA2.xbe`. Not the game.
+  - ma2.xbe (5.2 MB) = game (mechassault_xf.exe, built 2004-11-21). Entry 0x002B94F2, base 0x00010000, image 0x005595C0, .text 0x00012000 size 0x003159C8, 45 sections, 154 kernel imports (uses LaunchDataPage).
+  - Linked XDK libs (all 5849): XAPILIB, D3DX8, XONLINES, XVOICE, LIBCMT, LIBCPMT, DSOUND, VOICMAIL, D3D8LTCG, XGRAPHCL, XACTENLT. Middleware sections: BINK*, WMADEC, XACTENG, XPP, mgCore, NAL.
+  - Risk: D3D8LTCG = link-time-optimized D3D; XDK function signatures may not match (Cxbx-R choked on this "LTCG title").
+  - Other XBEs on disc: dashupdate.xbe, update.xbe, downloader.xbe (ignore).
+- 2026-10-17: pipeline run (all on ma2.xbe)
+  - disasm --text-only: 21,008 funcs, 10.5 min. Wrong choice: docs say XDK library sections must be lifted too. Re-ran without --text-only.
+  - disasm full: 24,708 funcs (.text 20,282; XONLINE 892, XGRPH 652, DSOUND 481, XNET 450, NAL 420, D3DX 402, XACTENG 298, XPP 259, D3D 234, WMADEC 138, BINK* ~150, mgCore 48).
+  - func_id: 13k vtable-related, 10.8k unknown. abi_analysis: 24,708 entries, 5,340 thiscall.
+  - Ghidra naming skipped (no Ghidra installed).
+  - recomp --all --split 250: 24,845 funcs translated, 0 failed, 2,780,782 lines C in 100 files (107 MB), 15 unresolved call targets stubbed. 4.6 min.
+  - main.c: entry 0x002B94F2, XBE game\ma2.xbe, dir game.
+- 2026-10-17: FIRST BUILD + RUN
+  - Build: VS 17 2022 x64 Release, 13.4 min, 0 errors, ma2.exe 41 MB.
+  - Run 1 (RECOMP_WATCHDOG_SECS=10, cwd C:\Mechassault2\ma2-recomp): boots through memory layout, 154/154 kernel thunks bridged, CRT, PsCreateSystemThreadEx main thread (routine 0x002B8F54, ctx 0x002B947E), creates TDATA/UDATA\4d53006b save dirs, ~200 kernel calls, still running at 10 s (watchdog = hard timeout, not crash).
+  - Failures: ICALL unresolved 0x0038FC30 (mgCore section, 143x) and 0x00066C10 (alias inside sub_00066C00, 4x). cpuid/wbinvd hit as no-ops. t:\$u\contentmeta.xbx not found (content download metadata, probably harmless).
+  - Fix: `tools.seed_from_log` -> config/seed_functions.json (3 seeds incl. 0x002B947E), re-disasm with --seed-functions, re-lift, rebuild.
+  - Gotcha: RECOMP_WATCHDOG_SECS kills the process after N s and dumps state; its "[WATCHDOG] no exit" line means still running, not hung.
+- 2026-10-17: iteration 2 (seeds 0x00066C10, 0x002B947E, 0x0038FC30): 24,713 funcs, 12 unresolved stubs, rebuild OK.
+  - Run 2 (watchdog 30 s): icalls 3k -> 1.02M. Loads Text.mgf, Movies.mgf, Movie\60\MAIntro.bik, Audio\SFXStream.HDxwb, TDATA GlobalSettings.dat. 3 guest threads (wrapper 0x002B8F54; ctx 0x002B947E main, 0x0002C210 worker, 0x00394790 Bink I/O). One new unresolved ICALL 0x0041D74C (XPP section) - not yet seeded.
+  - Hot loop on thread 2 (stack ~0x0120CEE8): RtlEnter/LeaveCriticalSection, KfRaise/LowerIrql, NtWaitForSingleObjectEx, NtReleaseMutant (~86k kernel calls/s).
+  - Main thread stack (from watchdog GS dump): xbe_entry -> 0x002B947E -> 0x00309568 -> sub_000B5F70 -> sub_00012400 -> sub_000121C0 -> sub_00014B02 -> sub_00015610 -> sub_001F40B3 -> sub_000B06F0 -> BINK 0x392E00 -> 0x391ED0 -> 0x3A5080 -> 0x0039A1E0. = stuck playing intro Bink movie.
+  - Run 3 (+RECOMP_AC97_READY, RECOMP_PB_EXEC): APU up, title starts APU and gets its interrupts. 0 flips, 0 pushbuffer calls.
+  - Run 4 (+RECOMP_ASYNC_IO, RECOMP_VBLANK): vblank ISR claimed, GPU sees methods (110 unhandled, 93 distinct), still 0 draws, 0 flips. Main thread still in Bink.
+  - Next ideas: seed 0x0041D74C; try skipping intro movie (override sub_000B06F0 / Bink open to fail) to see if menus come up; find what thread 2 polls (RECOMP_KERNEL_WATCH / RECOMP_CS_WATCH).
+- 2026-10-17: intro movie skip test
+  - Renamed game/Movie/{50,60}/MAIntro.bik -> MAIntro.bik.off (reversible). Run 5/6: game no longer opens MAIntro; main thread advances past movie state.
+  - New stall (identical stack at 15 s and 45 s): sub_00014B02 -> sub_00016880 -> sub_00012DB0. Loop: guard byte [0x524A90], 2500 ms timer (sub_002B8754 + 0x9C4), sleeps via sub_002B85C5(50, 1), polls singleton sub_00023A30 (0x1010-byte manager at [0x50BAB8]) with sub_000243D0 for an event; exits only on event. = waiting for an input/device event.
+  - Gotcha: guest_stack.py scan shows stale stack values (e.g. 0x00016BF0 is mid-instruction, DSOUND/XACT frames are leftovers). Verify each "return address" follows a call.
+  - Thread 2 (sub_0002C210) = event-driven worker: WaitForMultipleObjects(3, 0x4A1944) + critical section 0x4E4D84. Probably not the blocker.
+  - Root cause candidate: template main.c never calls xbox_OhciInit(), so RECOMP_USB=1 did nothing (no OHCI log lines in run 7). Added the call after APU init. Also seeded XPP ICALL 0x0041D74C.
+  - Added scripts/guest_stack.py (maps watchdog GS dump to functions/sections).
+- 2026-10-17: iteration 3 (xbox_OhciInit wired, seed 0x0041D74C): build OK.
+  - Run 8 (+RECOMP_USB=1 RECOMP_USB_PADS=1 RECOMP_KEYBOARD=1 RECOMP_USB_STATS=1): OHCI two controllers up, "operational after 3200 ms; device arriving on port 1", XAPI does 4 control setups then nothing (0 periodic transfers, 0 reports). Still 0 draws / 0 flips; main still in sub_00012DB0 pad-event loop.
+  - New unresolved ICALL 0x0042163F (XPP section) - likely enumeration completion callback. Seeding -> iteration 4.
+- 2026-10-17: iteration 4 (seed 0x0042163F, XPP): build OK. No unresolved ICALLs left in runs. icalls ~5.8M / 30 s.
+  - USB (run 10, RECOMP_USB_TRACE): enumeration completes - GET_DESCRIPTOR(device), SET_ADDRESS 1, GET_DESCRIPTOR(config, 32 B), SET_CONFIGURATION 1, XID descriptor C1 06 4200 (16 B). Control ED then unlinked. Game never opens the interrupt pipe (0 periodic transfers) - not needed yet at this point.
+  - RECOMP_GUEST_LOCK=1 (run 11): no change.
+  - CORRECTION: sub_00012DB0 loop is not an input wait. sub_0001E740 = CRC32 of lowercased string (table 0x50CCF0); sub_000243D0 = lookup by hash in the 32-byte-entry archive registry at [0x50BAB8] (3 entries). Name buffer 0x0050B800 = "D:\Common.mgf" (RECOMP_WATCH caught the write, RECOMP_PEEK read it). Front end waits for Common.mgf to be registered.
+  - Thread 2 (sub_0002C210, events at 0x4A1944, state ptr [0x4E4D48]) = HDD cache copier. Z:\Control.cache missing -> copies D:\Audio\SFXStream.HDxwb (20,185,088 B) to z:\filecopy.tmp (host: %LOCALAPPDATA%\xboxrecomp\Cache). filecopy.tmp is pre-sized to the full length, but bytes-remaining [0x4E4D68] stays 0x01340000 (= full size) and only ONE positioned read (@0, 128 KB, event 0x48000003) is ever issued. State word 0x431. Src/dst handles [0x4A1950]=0x48000007, [0x4A1954]=0x48000008.
+  - Copier loop calls sub_002BBCC0(src, 0x4E4D4C overlapped, &n, 0) (looks like GetOverlappedResult) and treats it as not done -> busy loop -> Common.mgf never queued -> front end never proceeds. Bridge NtReadFile does write the IO status block; root cause still open.
+  - Next: decompile sub_002BBCC0 / sub_0002C580 path at 0x2C7F1 and the write side (sub_002BD31B, NtWriteFile); dump overlapped at 0x4E4D4C (+0 Internal, +4 InternalHigh, +0x10 hEvent) at watchdog.
+  - Note: runtime created sparse partition images in %LOCALAPPDATA%\xboxrecomp (~5 GB logical, ~20 MB real).
+- 2026-10-17: HDD CACHE COPY FIXED -> FIRST FRAME
+  - Root cause: copier (sub_0002C580) issues overlapped WriteFile per 128 KB chunk via XAPI sub_002BD1C1 (sets OVERLAPPED.Internal=0x103 before NtWriteFile) and clears its read-in-flight flag 0x20 ONLY on ERROR_IO_PENDING (0x3E5). Bridge NtReadFile returned STATUS_PENDING for async handles under RECOMP_ASYNC_IO, NtWriteFile did not -> immediate success -> re-validates same read, rewrites chunk 0 forever. (sub_002BBCC0 = XAPI GetOverlappedResult; OVERLAPPED at 0x4E4D4C, hEvent = events[0].)
+  - Fix (toolkit): bridge_NtWriteFile returns STATUS_PENDING for async handles when RECOMP_ASYNC_IO is set, same contract as NtReadFile. Patch: patches/xboxrecomp-ntwritefile-async-pending.patch. RECOMP_ASYNC_IO=1 now REQUIRED.
+  - Result run 16: cache filled (%LOCALAPPDATA%\xboxrecomp\Cache: ef546afd.cache 20,185,088 = SFXStream, 29223b58.cache 37,552,128, fbd13caa.cache 160,628,736, Control.cache 116 B), renames OK, then opens Common.mgf, Templates.mgf, Music.DVDxwb, Voice_English.DVDxwb. GPU: 5 draws, 1 flip.
+  - Run 17 (RECOMP_FB_DUMP=analysis\fb17\frame, RECOMP_FB_DUMP_FLIPS=1): analysis/fb17/frame00000.png = MechAssault 2 LOADING screen (640x480), correct art. FIRST RENDERED FRAME.
+  - Next stall: main thread in D3D display-mode switch sub_0040ECF0 -> sub_0040F510 = D3D_BlockOnTime(fence, 2), device ptr MEM32(0x0041BC68), spins on *(dev+0x30) vs dev+0x2C. Executor never told semaphore address. Fix: recomp_manual.c wraps sub_0040F510 (calls sub_0040F510_gen) and calls nv2a_pb_set_semaphore_target(MEM32(dev+0x30)); regenerated with --exclude-manual.
+  - Gotcha: PowerShell Remove-Item on analysis\fb\* is blocked by the harness; use a fresh folder per run.
+- 2026-10-17: FENCE WAIT FIXED -> LOADING COMPLETES -> 3D FRONT END RENDERS
+  - Run 18: "[D3D] GPU semaphore at 0x8012F000 (device 0x004197C0)". 26 flips in 60 s; loading bar fills to ~95% (analysis/fb18/sheet.png, sheet2.png).
+  - Run 19 (180 s): 71 flips (~0.4 fps). Frames 30-70 (analysis/fb19/sheet.png) = textured, lit 3D hangar/dropship interior, camera moving. No menu UI/text yet. Bright seam lines across floor (rasterizer gaps). New cache file z:\46229b6e.cache, T:\$C\.
+  - New unresolved ICALLs: 0x00420BDA x1704 (XPP), 0x00310954 x649, 0x00100CE0 x95, 0x001FD293 x46, 0x001FD409 x46, 0x00173E98 x1 -> seeding (iteration 6).
+  - Current env for a full run: RECOMP_AC97_READY=1 RECOMP_PB_EXEC=1 RECOMP_ASYNC_IO=1 RECOMP_VBLANK=1 RECOMP_USB=1 RECOMP_USB_PADS=1 RECOMP_KEYBOARD=1 (+ RECOMP_FB_DUMP=<prefix> RECOMP_FB_DUMP_FLIPS=1 to capture frames, RECOMP_WATCHDOG_SECS=N to cap).
+- 2026-10-17: GoGui / relaunch investigation
+  - New seeds (iteration 6) caused a deterministic crash (also with RECOMP_GUEST_LOCK). Added MA2_SKIP_ICALL runtime switch (recomp_manual.c) to make chosen ICALL targets behave as unresolved; bisect -> 0x001FD293 (vtable method that fires event "GoGui", string at 0x00482954). Skipping it = 3D background without menu; running it = GUI init reaches a movie lookup in Movie\60\ that finds nothing (MAIntro hidden) -> null vtable calls -> stall/crash.
+  - Restored MAIntro.bik (both 50/60). Game then plays intro and calls HalReturnToFirmware(2) with launch data type 1, title 0x4D53006B, data {1,0,1}: NOT a self-relaunch but XOnline (sub_0036BF50 / sub_0036BC43) booting xonlinedash.xbe (\Device\Harddisk0\partition2\XODash or \Device\Cdrom0\XODASH) after queueing a self-relaunch. Path: game leave helper sub_0023EABB(mode 0) -> XOnline thunk sub_00366DBC -> sub_0036BFD0.
+  - XAPI XGetLaunchInfo = sub_002B93D3 (checks title id vs certificate [[0x10118]+8], copies 3 KB, frees page); game consumer sub_0002BB30 -> boot reason [0x0050BAE0] (type1: 'CDX1' check), data copy at 0x0050BAE8.
+  - Runtime patch #2 (patches/xboxrecomp-ma2-runtime.patch): RECOMP_LAUNCH_PAGE boot loader + HalReturnToFirmware(2) self-relaunch (freeze threads, CreateProcess child with inherited stdio, wait, exit code; depth cap 8; RECOMP_NO_RELAUNCH to disable). Works mechanically but game reboots each time (it is the XOnline dash path).
+  - Fix in progress: recomp_manual.c wraps sub_00366DBC to refuse the dash launch (eax=0x80150005, esp+=8); MA2_ALLOW_XODASH=1 restores. Entry traces on the 4 callers of sub_0023EABB (config/trace_functions.json).
+  - Gotcha: guest-stack scans do not identify direct callers here (lifter pushes dummy 0 return addresses); use --trace-functions.
+- 2026-10-17: post-intro quit traced
+  - sub_00366DBC wrapper never fires (not the path). Real chain at the reboot (scripts/exit_chain.py, exit dump deepened to 2048 slots): XAPI main-thread startup sub_002B947E -> main() = sub_00012400 RETURNS -> sub_002BCCFC(1,1,0) = XapiBootToDash -> sub_002B92B0 (XLaunchNewImage NULL) -> XOnline launch hook (list 0x00496CB4..0x00496CBC) -> sub_0036BC43 -> xonlinedash.xbe. Data {1,0,1} = boot-to-dash reason 1.
+  - main: init sub_000121C0, app object 0x0050CBA0, app init sub_00012BB0 (error UI on failure via sub_00035A20), run loop sub_00014A70 (body split as sub_00014B02), shutdown sub_00014A10; SEH handler 0x00012492 -> sub_000125B0. No exception logged.
+  - Run loop: while (sub_00015610(app)) {...}; sub_00015610 returns the al of vfunc[0x14] on its state object ([esp+0x14] at 0x157EC) -> after the intro movie the state machine reports "not running" -> main returns -> dashboard.
+  - Not input: same with RECOMP_KEYBOARD off and with no USB at all (runs inA/inB/inC).
+  - Intro movie reads fine: header + one 6,448,004-byte read, no errors; 0 flips during the movie.
+  - Intro state object (sub_001F40B3): skip logic jumps to frame 0x2EF/0x272 when skippable ([esi+0x68]) and sub_0001EE10 reports a button.
+  - Gotcha: relaunch chain leaves ma2.exe processes behind (5 found) -> exe locked, LNK1104; run.ps1 now kills all ma2.exe before/after.
+  - Open question: why the flow state machine ends after the intro instead of going to loading/front end. Next: trace sub_00015610's state object vfuncs (+0x14 result) and the intro state's completion path; compare with the movie-hidden path that reaches loading + 3D front end.
+- 2026-10-17: ROOT CAUSE of post-intro quit = untranslated cpuid/pushfd/popfd
+  - Flow traces (config/trace_functions.json): sub_00012BB0 (app init) ok; sub_00015610 -> sub_00015270 (intro-skip check: parses launch cmdline m:"..." / n:"..." via strings at 0x453DD0/0x453DDC) = 0 -> movie screen object (vtable 0x00481D00: +0x14 sub_001F40B3 update, +0x18 sub_001FD293 GoGui, +0x1C sub_001F4153, +0x38 sub_001F4044 open, +0x3C sub_001F40A3 close) -> update returns 1 at once with esp 8 bytes LOW (enter 00F7FE94, leave 00F7FE8C).
+  - Inside: Bink calls null routine pointers [0x004D36C8] (2 args), [0x004D36B8]/[0x004D36E0] (1 arg) at 0x0039A544/0x0039A57E/0x0039A586. Failed ICALL pops only the return address -> leaked args -> sub_00015610 reads app object from wrong [esp+0x14] -> wrong vfunc[0x14] returns 0 -> main returns -> XapiBootToDash -> XOnline dash.
+  - App object 0x0050CBA0 vtable 0x00453A30 (+0x14 = sub_00012DB0, the Common.mgf wait / front-end start).
+  - Why null: RAD CPU detect sub_0031C900 (EFLAGS.ID pushfd/popfd test + cpuid leaf 1 edx bit 23 MMX; caches [0x004A0C68], sets [0x00534E2C]) ran with those instructions as no-ops -> "no MMX" -> MMX routine table never filled (Xbox build links only MMX paths).
+  - Fix (toolkit, in patches/xboxrecomp-ma2-runtime.patch): lifter emits xbox_Cpuid / xbox_PushfdValue / xbox_PopfdValue; kernel_hal.c answers as Xbox PIII (GenuineIntel, 0x68A, edx 0x0383F9FF) and keeps per-thread system EFLAGS bits (ID/AC/DF/IF). Toolkit pytest 714 passed.
+  - Movie path also: Interface\Movie\MAIntro\MAIntro.mgv (GUI movie view inside an .mgf).
+- 2026-10-17: CPUID FIX -> INTRO PLAYS -> TITLE SCREEN -> MAIN MENU
+  - Run 32 (cpuid/pushfd/popfd lifted): 869 flips in 180 s, no quit. Frames: Microsoft Game Studios, WizKids, Day 1 Studios logos (Bink), then "MechAssault 2 Lone Wolf - Press START" with ESRB/copyright text (analysis/fb_run32/sheet6.png). Dotted artifacts in Bink frames.
+  - Run 33/34: stall right after title: sub_0040F4A0 spins on PGRAPH 0x400B10 (latch of method 0x0310) = 0. Executor only models it with RECOMP_PB_WALK=dma -> added to scripts/run.ps1 (required now).
+  - Run 35/36: stall in D3D_BlockOnTime from the GUI movie (sub_001FDCA2 -> sub_000B06F0 -> sub_00067960 -> sub_0040F8F0). sem 0x12EB, seq 0x12ED, DMA PUT==GET (idle): release never kicked. Fix in recomp_manual.c sub_0040F510 wrapper: wait up to 2 s; if the GPU is idle 20 ms (USER DMA PUT==GET, regs 0x800040/0x800044) and the fence is not reached, write the fence into the semaphore and the matching fence bits into the 0x400B10 latch. MA2_NO_IDLE_FENCE=1 disables.
+  - Run 38 (300 s, RECOMP_PAD_SCRIPT START every 3 s from 150 s, A every 4 s from 236 s): 1040 flips. Title screen -> MAIN MENU (CAMPAIGN carousel, "Player Options", "A Select") over the 3D hangar -> A selects Campaign -> LOADING bar fills -> black frame -> stall (analysis/fb_run38/sheet_end.png).
+  - Next stall: D3D KickOff sub_0040F220 -> sub_0040F7D0 -> sub_0040F980 (probably pushbuffer ring make-space wait), reached from sub_004094F0 <- sub_00065BA0 <- sub_00060840 <- sub_00037100 (campaign load / first mission).
+  - Timing: intro+title ~150 s at current speed; title appears ~frame 850.
