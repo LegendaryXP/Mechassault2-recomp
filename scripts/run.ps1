@@ -5,6 +5,7 @@ param(
     [int]$Secs = 90,
     [string]$Skip = "",
     [switch]$Frames,
+    [string]$DumpWhile = "",
     [switch]$NoKeyboard,
     [switch]$NoUsb
 )
@@ -25,6 +26,11 @@ if ($Frames) {
     $fb = "$root\analysis\fb_$Name"
     New-Item -ItemType Directory -Force $fb | Out-Null
     $env:RECOMP_FB_DUMP = "$fb\frame"; $env:RECOMP_FB_DUMP_FLIPS = '1'
+} elseif ($DumpWhile) {
+    # Every frame, but only while the file $DumpWhile exists.
+    $fb = "$root\analysis\fb_$Name"
+    New-Item -ItemType Directory -Force $fb | Out-Null
+    $env:RECOMP_FB_DUMP = "$fb\frame"; $env:RECOMP_FB_DUMP_FLIPS = $DumpWhile
 } else {
     $env:RECOMP_FB_DUMP = $null; $env:RECOMP_FB_DUMP_FLIPS = $null
 }

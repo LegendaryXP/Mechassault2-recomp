@@ -1,8 +1,32 @@
 diff --git a/src/apu/apu_core.c b/src/apu/apu_core.c
-index 1f664a3..7f91379 100644
+index 1f664a3..214e161 100644
 --- a/src/apu/apu_core.c
 +++ b/src/apu/apu_core.c
-@@ -172,6 +172,36 @@ static int apu_mmio_trace(void)
+@@ -155,6 +155,23 @@ const char *mcpx_apu_phys_class(uint64_t addr)
+     return "ram";
+ }
+ 
++/* The other copy of an address mcpx_apu_phys resolved to a named heap page
++ * while the window also has that page number in use (or did: below the
++ * arena's high-water mark), or NULL when the number names one copy only.
++ * mcpx_apu_phys has to pick one and picks RAM; a caller that can tell valid
++ * data from garbage -- the ADPCM fetch, by its block headers -- can check the
++ * other. MechAssault 2's music streams live in the window at numbers whose
++ * heap pages are named: read from RAM, every music voice was noise. */
++uint8_t *mcpx_apu_phys_alias(uint64_t addr)
++{
++    uint32_t a = (uint32_t)addr & 0x0FFFFFFFu;
++    if (a >= (64u << 20) || !xbox_PhysRamNameMap()[a >> 12])
++        return NULL;
++    if (xbox_ContiguousPageMap()[a >> 12] || a < xbox_ContiguousAllocatedBytes())
++        return g_apu_ram_ptr + 0x80000000u + a;
++    return NULL;
++}
++
+ /* A diagnostic switch is on when set to anything but empty or a leading
+  * '0', as RECOMP_HEADLESS is read: =0 turns it off rather than on. */
+ int apu_env_on(const char *name)
+@@ -172,6 +189,36 @@ static int apu_mmio_trace(void)
      return on;
  }
  
@@ -39,7 +63,7 @@ index 1f664a3..7f91379 100644
  /* The interrupt line, as the frame thread sees it. update_irq used to call
   * pci_irq_assert, which is an empty stub here, so DirectSound's service
   * routine never ran and no voice completion ever reached it. */
-@@ -1042,12 +1072,52 @@ static void apu_irq_stats_line(void)
+@@ -1042,12 +1089,52 @@ static void apu_irq_stats_line(void)
      if (now < s_irq_next_ns)
          return;
      if (s_irq_next_ns)
@@ -94,7 +118,7 @@ index 1f664a3..7f91379 100644
  static void *mcpx_apu_frame_thread(void *arg)
  {
      MCPXAPUState *d = MCPX_APU_DEVICE(arg);
-@@ -1077,6 +1147,7 @@ static void *mcpx_apu_frame_thread(void *arg)
+@@ -1077,6 +1164,7 @@ static void *mcpx_apu_frame_thread(void *arg)
           * forever to post its next command: Burnout 3 stalls in
           * sub_002F805E polling the same doorbell it was acked on at init. */
          mcpx_apu_dsp_ack_poll(d);
@@ -102,7 +126,7 @@ index 1f664a3..7f91379 100644
  
          int xcntmode = GET_MASK(qatomic_read(&d->regs[NV_PAPU_SECTL]),
                                  NV_PAPU_SECTL_XCNTMODE);
-@@ -1113,6 +1184,9 @@ static void *mcpx_apu_frame_thread(void *arg)
+@@ -1113,6 +1201,9 @@ static void *mcpx_apu_frame_thread(void *arg)
              apu_irq_stats.fe_trapped_frames++;
          } else {
              /* Lightweight: just monitor frame (test tone + software mixer) */
@@ -112,7 +136,7 @@ index 1f664a3..7f91379 100644
              mcpx_apu_monitor_frame(d);
              d->ep_frame_div++;
          }
-@@ -1137,8 +1211,10 @@ static void *mcpx_apu_frame_thread(void *arg)
+@@ -1137,8 +1228,10 @@ static void *mcpx_apu_frame_thread(void *arg)
                      && (sectl & NV_PAPU_SECTL_XCNTMODE)
                             != NV_PAPU_SECTL_XCNTMODE_OFF) {
                  d->sample_count -= ssl;
@@ -126,7 +150,7 @@ index 1f664a3..7f91379 100644
          }
  
 diff --git a/src/apu/apu_dsp.c b/src/apu/apu_dsp.c
-index bd36f2a..e49651c 100644
+index bd36f2a..bd4b2de 100644
 --- a/src/apu/apu_dsp.c
 +++ b/src/apu/apu_dsp.c
 @@ -25,6 +25,8 @@
@@ -157,7 +181,7 @@ index bd36f2a..e49651c 100644
  /* GPRST (GP region + 0xFFFC): the GP runs only with both reset bits set, as
   * in xemu's gp_write. Nothing else models the GP, so this is kept for the
   * =auto ack alone. Before the first write the GP counts as running: a title
-@@ -229,9 +243,54 @@ void mcpx_apu_update_dsp_preference(MCPXAPUState *d)
+@@ -229,9 +243,66 @@ void mcpx_apu_update_dsp_preference(MCPXAPUState *d)
      (void)d;
  }
  
@@ -179,6 +203,7 @@ index bd36f2a..e49651c 100644
 +{
 +    static float peak[NUM_MIXBINS];
 +    static double sq[NUM_MIXBINS];
++    static double x04, x15, x01;      /* front/rear and left/right products */
 +    static unsigned n, clips;
 +    int b, i;
 +
@@ -190,6 +215,11 @@ index bd36f2a..e49651c 100644
 +                peak[b] = a;
 +            sq[b] += (double)v * v;
 +        }
++    for (i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
++        x04 += (double)mixbins[0][i] * mixbins[4][i];
++        x15 += (double)mixbins[1][i] * mixbins[5][i];
++        x01 += (double)mixbins[0][i] * mixbins[1][i];
++    }
 +    clips += clipped;
 +    n += NUM_SAMPLES_PER_FRAME;
 +    if (n < 48000 * 5)
@@ -198,9 +228,15 @@ index bd36f2a..e49651c 100644
 +    for (b = 0; b < NUM_MIXBINS; b++)
 +        if (peak[b] > 0.001f)
 +            fprintf(stderr, " %d=%.2f/%.3f", b, peak[b], sqrt(sq[b] / n));
-+    fprintf(stderr, "\n");
++    /* Correlation of front with back (1: the same signal, -1: inverted)
++     * and of left with right. */
++    fprintf(stderr, "; corr 0/4 %.2f 1/5 %.2f 0/1 %.2f\n",
++            sq[0] * sq[4] > 0 ? x04 / sqrt(sq[0] * sq[4]) : 0.0,
++            sq[1] * sq[5] > 0 ? x15 / sqrt(sq[1] * sq[5]) : 0.0,
++            sq[0] * sq[1] > 0 ? x01 / sqrt(sq[0] * sq[1]) : 0.0);
 +    memset(peak, 0, sizeof peak);
 +    memset(sq, 0, sizeof sq);
++    x04 = x15 = x01 = 0.0;
 +    n = clips = 0;
 +}
 +
@@ -212,7 +248,7 @@ index bd36f2a..e49651c 100644
      /* Bypass DSP: take mixbin 0 (front-left) and mixbin 1 (front-right)
       * and write them directly to the monitor frame buffer as the final
       * EP output.
-@@ -249,6 +308,8 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
+@@ -249,6 +320,8 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
      int off = (d->ep_frame_div % 8) * NUM_SAMPLES_PER_FRAME;
  
      if (d->monitor.point != MCPX_APU_DEBUG_MON_VP) {
@@ -221,7 +257,7 @@ index bd36f2a..e49651c 100644
          for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
              /* Bins 2..31 used to be computed and then dropped on the floor.
               * On hardware the GP and EP mix the submixes down; here they are
-@@ -273,33 +334,77 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
+@@ -273,33 +346,96 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
               * Gating the HRTF submix override was tried first and did not fix
               * it, so the defect is the width of this mixdown and nothing else.
               *
@@ -230,9 +266,12 @@ index bd36f2a..e49651c 100644
 -             * counts. This is not what a real EP does; it is the cheapest
 -             * mixdown that stops discarding audio. */
 +             * The mixdown follows the XDK's mixbin layout (DSMIXBIN_*), as a
-+             * stereo downmix would: 0/1 front L/R, 4/5 back L/R and 6-9 the
-+             * crosstalk (3D) front and back L/R go to their side; 2, the
-+             * centre, goes to both at -3 dB; 3, the LFE, to both at half;
++             * stereo downmix would: 0/1 front L/R and 6/7 the crosstalk (3D)
++             * front L/R go to their side at full level, 4/5 back L/R and 8/9
++             * the crosstalk back L/R at -3 dB (MechAssault 2's movies send
++             * the same sound to front and back, which at full level came out
++             * twice as loud); 2, the centre, goes to both at -3 dB; 3, the
++             * LFE, to both at half;
 +             * 10 (the I3DL2 reverb send) and 11-31 (the effect sends) are
 +             * copies of voices already in the bins above, fed to GP effects
 +             * there is no DSP for, so they go in quietly, at both sides.
@@ -253,8 +292,10 @@ index bd36f2a..e49651c 100644
 +                float sends = 0.0f;
 +                for (int b = 10; b < NUM_MIXBINS; ++b)
 +                    sends += mixbins[b][i];
-+                left  = mixbins[0][i] + mixbins[4][i] + mixbins[6][i] + mixbins[8][i];
-+                right = mixbins[1][i] + mixbins[5][i] + mixbins[7][i] + mixbins[9][i];
++                left  = mixbins[0][i] + mixbins[6][i]
++                      + 0.707f * (mixbins[4][i] + mixbins[8][i]);
++                right = mixbins[1][i] + mixbins[7][i]
++                      + 0.707f * (mixbins[5][i] + mixbins[9][i]);
 +                left  += 0.707f * mixbins[2][i] + 0.5f * mixbins[3][i] + 0.25f * sends;
 +                right += 0.707f * mixbins[2][i] + 0.5f * mixbins[3][i] + 0.25f * sends;
              } else {
@@ -266,6 +307,20 @@ index bd36f2a..e49651c 100644
 -            if (left < -1.0f) left = -1.0f;
 -            if (right > 1.0f) right = 1.0f;
 -            if (right < -1.0f) right = -1.0f;
++            /* A DC blocker, a one-pole high-pass at ~15 Hz: what an output
++             * stage does anyway. MechAssault 2's menu bass stream carries
++             * three quarters of its energy below 20 Hz, which no speaker
++             * plays and which ate the limiter's headroom. */
++            {
++                static float x1[2], y1[2];
++                const float r = 0.998f;
++                float yl = left - x1[0] + r * y1[0];
++                float yr = right - x1[1] + r * y1[1];
++                x1[0] = left;  y1[0] = yl;
++                x1[1] = right; y1[1] = yr;
++                left = yl;
++                right = yr;
++            }
 +            out[i][0] = left;
 +            out[i][1] = right;
 +            if (fabsf(left) > peak) peak = fabsf(left);
@@ -318,6 +373,20 @@ index bd36f2a..e49651c 100644
      }
  
      g_dbg.gp.cycles = 0;
+diff --git a/src/apu/apu_shim.h b/src/apu/apu_shim.h
+index 5f3f665..a29fb0e 100644
+--- a/src/apu/apu_shim.h
++++ b/src/apu/apu_shim.h
+@@ -102,6 +102,9 @@ extern uint8_t *g_apu_ram_ptr; /* Set at init to point at Xbox 64MB RAM */
+ uint8_t *mcpx_apu_phys(uint64_t addr);
+ /* Which case of mcpx_apu_phys resolved an address, for trace lines. */
+ const char *mcpx_apu_phys_class(uint64_t addr);
++/* The window copy of an address that mcpx_apu_phys resolved to a named heap
++ * page while the window holds the same number too; NULL otherwise. */
++uint8_t *mcpx_apu_phys_alias(uint64_t addr);
+ 
+ /* Little-endian physical memory reads */
+ static inline uint32_t ldl_le_phys(void *as, hwaddr addr) {
 diff --git a/src/apu/apu_state.h b/src/apu/apu_state.h
 index f4fca14..0a303fc 100644
 --- a/src/apu/apu_state.h
@@ -330,6 +399,76 @@ index f4fca14..0a303fc 100644
 +    uint32_t lw_sectl, lw_fectl; /* the registers the last such frame saw */
  } ApuIrqStats;
  extern ApuIrqStats apu_irq_stats;
+diff --git a/src/apu/apu_vp.c b/src/apu/apu_vp.c
+index 128d86f..6cbb56d 100644
+--- a/src/apu/apu_vp.c
++++ b/src/apu/apu_vp.c
+@@ -1067,6 +1067,56 @@ static void vp_ring_report(unsigned secs)
+  * Sample fetching from voice buffers
+  * ============================================================ */
+ 
++/* Which copy of a stream's ADPCM block to read.
++ *
++ * A physical number can name a heap page and a window page at once (see
++ * mcpx_apu_phys), and mcpx_apu_phys picks the heap page. ADPCM says which
++ * copy is meant: a block header's step index is 0..88, which data that is
++ * not ADPCM breaks about two times in three. So where the number is shared,
++ * both headers are checked, and a voice keeps reading the window copy from
++ * the first block whose heap copy is impossible and whose window copy is
++ * not, until the reverse is seen. MechAssault 2's menu music (five stream
++ * voices, in the window at numbers whose heap pages are named) was read from
++ * the heap: 50-99% impossible headers, decoded into full-scale noise.
++ * RECOMP_APU_ADPCM_ALIAS=0 always reads what mcpx_apu_phys resolves. */
++static int adpcm_header_bad(const uint8_t *p, unsigned int channels)
++{
++    for (unsigned int c = 0; c < channels; c++)
++        if (p[c * 4 + 2] > 88)
++            return 1;
++    return 0;
++}
++
++static const uint8_t *adpcm_stream_source(uint32_t v, hwaddr addr,
++                                          unsigned int channels)
++{
++    static int on = -1;
++    static uint8_t use_alt[MCPX_HW_MAX_VOICES];
++    const uint8_t *p = mcpx_apu_phys(addr), *alt;
++
++    if (on < 0) {
++        const char *e = getenv("RECOMP_APU_ADPCM_ALIAS");
++        on = !(e && *e == '0');
++    }
++    if (!on || v >= MCPX_HW_MAX_VOICES || !(alt = mcpx_apu_phys_alias(addr)))
++        return p;
++    {
++        int bad = adpcm_header_bad(p, channels);
++        int alt_bad = adpcm_header_bad(alt, channels);
++        if (bad && !alt_bad && !use_alt[v]) {
++            static int shown;
++            use_alt[v] = 1;
++            if (shown++ < 8)
++                fprintf(stderr, "[APU] voice %u: ADPCM stream at 0x%08X read from"
++                        " the window copy (the heap page of that number holds"
++                        " no ADPCM)\n", v, (uint32_t)addr);
++        } else if (!bad && alt_bad) {
++            use_alt[v] = 0;
++        }
++    }
++    return use_alt[v] ? alt : p;
++}
++
+ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
+                        int num_samples_requested)
+ {
+@@ -1191,7 +1241,7 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
+                 uint32_t linear_addr = block_index * (uint32_t)block_size;
+                 if (stream) {
+                     hwaddr addr = segment_offset + linear_addr;
+-                    memcpy(adpcm_block, mcpx_apu_phys(addr),
++                    memcpy(adpcm_block, adpcm_stream_source(v, addr, channels),
+                            block_size);
+                 } else {
+                     linear_addr += ba;
 diff --git a/src/apu/apu_xaudio2.c b/src/apu/apu_xaudio2.c
 index e725646..ef7947b 100644
 --- a/src/apu/apu_xaudio2.c
@@ -349,10 +488,29 @@ index e725646..ef7947b 100644
      wfx.wFormatTag      = WAVE_FORMAT_PCM;
      wfx.nChannels       = XA2_CHANNELS;
 diff --git a/src/input/mkb_input.c b/src/input/mkb_input.c
-index d6f0042..073a666 100644
+index d6f0042..a9c31b5 100644
 --- a/src/input/mkb_input.c
 +++ b/src/input/mkb_input.c
-@@ -36,6 +36,127 @@
+@@ -9,10 +9,14 @@
+  * have to care).
+  *
+  * The poll side drains the accumulated deltas and turns them into a
+- * stick deflection that is proportional to the movement since the last
+- * poll: the title integrates deflection over its own frame, so the
+- * total rotation comes out proportional to total mouse travel at any
+- * frame rate, which is the property mouse aim has to keep.
++ * stick deflection proportional to the mouse's speed -- counts per 10 ms,
++ * averaged over RECOMP_MKB_SMOOTH ms of real time. The title integrates
++ * deflection over its own frame, so the total rotation comes out
++ * proportional to total mouse travel at any frame rate and any poll rate,
++ * which is the property mouse aim has to keep. (It used to be the counts
++ * since the last poll, and a USB pad is polled every few milliseconds while
++ * the title reads it once a frame: it saw a few ms of motion, too little to
++ * clear its dead zone, or a centred stick between two mouse packets.)
+  *
+  * Small movements get a floor of RECOMP_MKB_DZ of full throw, because
+  * every console title applies its own dead zone to the stick, and a
+@@ -36,6 +40,127 @@
  #include <stdlib.h>
  #include <string.h>
  #include <math.h>
@@ -480,7 +638,29 @@ index d6f0042..073a666 100644
  
  /* ---- configuration ----------------------------------------------------- */
  
-@@ -68,6 +189,9 @@ static int mkb_apply_kv(const char *key, const char *val)
+@@ -43,12 +168,13 @@ typedef struct {
+     double sens;        /* multiplier on the aim deflection          */
+     double dz;          /* assumed game deadzone, 0..1               */
+     double acc;         /* aim acceleration exponent, 1 = linear     */
+-    long   full;        /* mouse counts for full throw, per poll     */
++    long   full;        /* mouse counts per 10 ms for a full throw   */
+     int    invert_y;    /* invert the vertical aim axis              */
+     int    swap_sticks; /* mouse aims with the left stick instead    */
++    double smooth;      /* ms over which the mouse speed is averaged */
+ } MkbConfig;
+ 
+-static MkbConfig s_cfg = { 1.0, 0.18, 1.0, 8, 0, 0 };
++static MkbConfig s_cfg = { 1.0, 0.18, 1.0, 20, 0, 0, 25.0 };
+ 
+ /* One "key=value" line; returns 1 when the key was recognised. */
+ static int mkb_apply_kv(const char *key, const char *val)
+@@ -64,10 +190,15 @@ static int mkb_apply_kv(const char *key, const char *val)
+         d = strtod(val, NULL); if (d > 0.0 && d < 10.0) s_cfg.acc = d;
+     } else if (!strcmp(key, "full")) {
+         l = strtol(val, NULL, 0); if (l > 0 && l < 1000) s_cfg.full = l;
++    } else if (!strcmp(key, "smooth")) {
++        d = strtod(val, NULL); if (d >= 1.0 && d <= 500.0) s_cfg.smooth = d;
+     } else if (!strcmp(key, "invert_y")) {
          s_cfg.invert_y = atoi(val) != 0;
      } else if (!strcmp(key, "swap_sticks")) {
          s_cfg.swap_sticks = atoi(val) != 0;
@@ -490,7 +670,15 @@ index d6f0042..073a666 100644
      } else {
          return 0;
      }
-@@ -91,6 +215,7 @@ static void mkb_load_config(void)
+@@ -81,6 +212,7 @@ static void mkb_load_config(void)
+         "RECOMP_MKB_DZ",   "dz",
+         "RECOMP_MKB_ACC",  "acc",
+         "RECOMP_MKB_FULL", "full",
++        "RECOMP_MKB_SMOOTH", "smooth",
+         "RECOMP_MKB_INVERT_Y",  "invert_y",
+         "RECOMP_MKB_SWAP_STICKS", "swap_sticks",
+         NULL
+@@ -91,6 +223,7 @@ static void mkb_load_config(void)
      FILE *f;
      int i;
  
@@ -498,7 +686,7 @@ index d6f0042..073a666 100644
      for (i = 0; kv[i]; i += 2) {
          const char *v = getenv(kv[i]);
          if (v && *v)
-@@ -114,6 +239,9 @@ static void mkb_load_config(void)
+@@ -114,6 +247,9 @@ static void mkb_load_config(void)
          while (fgets(line, sizeof line, f)) {
              char *eq = strchr(line, '=');
              char *k, *v;
@@ -508,7 +696,7 @@ index d6f0042..073a666 100644
              if (!eq) continue;
              *eq = 0;
              k = line; v = eq + 1;
-@@ -128,6 +256,25 @@ static void mkb_load_config(void)
+@@ -128,22 +264,76 @@ static void mkb_load_config(void)
      fclose(f);
  }
  
@@ -534,9 +722,11 @@ index d6f0042..073a666 100644
  /* ---- raw input thread -------------------------------------------------- */
  
  /* Accumulators, written by the input thread and drained by the poll.
-@@ -135,15 +282,48 @@ static void mkb_load_config(void)
+  * InterlockedExchange is the whole protocol: the input thread adds
   * with InterlockedAdd, the poll takes everything with Exchange(0). */
  static volatile LONG s_dx, s_dy;
++/* The mouse speed the aim stick shows, counts per ms (see mkb_merge). */
++static double s_aim_vx, s_aim_vy;
  static volatile LONG s_wheel;        /* wheel steps since last poll   */
 -static volatile LONG s_mouse_btn;    /* 1 L, 2 R, 4 M, 8 X1, 16 X2    */
 +static volatile LONG s_mouse_btn;    /* 1 L, 2 R, 4 M, 8 X1, 16 X2: held */
@@ -589,7 +779,7 @@ index d6f0042..073a666 100644
  
  static void mkb_handle_raw(HRAWINPUT h)
  {
-@@ -155,6 +335,8 @@ static void mkb_handle_raw(HRAWINPUT h)
+@@ -155,6 +345,8 @@ static void mkb_handle_raw(HRAWINPUT h)
              == (UINT)-1)
          return;
  
@@ -598,7 +788,7 @@ index d6f0042..073a666 100644
      if (ri->header.dwType == RIM_TYPEMOUSE) {
          const RAWMOUSE *m = &ri->data.mouse;
  
-@@ -162,6 +344,26 @@ static void mkb_handle_raw(HRAWINPUT h)
+@@ -162,6 +354,26 @@ static void mkb_handle_raw(HRAWINPUT h)
              if (m->lLastX) InterlockedAdd(&s_dx, m->lLastX);
              if (m->lLastY) InterlockedAdd(&s_dy, m->lLastY);
          }
@@ -625,7 +815,7 @@ index d6f0042..073a666 100644
          if (m->usButtonFlags & RI_MOUSE_LEFT_BUTTON_DOWN)
              InterlockedOr(&s_mouse_btn, 1);
          if (m->usButtonFlags & RI_MOUSE_LEFT_BUTTON_UP)
-@@ -190,20 +392,33 @@ static void mkb_handle_raw(HRAWINPUT h)
+@@ -190,20 +402,33 @@ static void mkb_handle_raw(HRAWINPUT h)
          const RAWKEYBOARD *k = &ri->data.keyboard;
          UINT vk = k->VKey;
  
@@ -668,7 +858,7 @@ index d6f0042..073a666 100644
          }
      }
  }
-@@ -256,9 +471,17 @@ static DWORD WINAPI mkb_thread(LPVOID unused)
+@@ -256,9 +481,17 @@ static DWORD WINAPI mkb_thread(LPVOID unused)
      }
  
      InterlockedExchange(&s_thread_up, 1);
@@ -689,7 +879,7 @@ index d6f0042..073a666 100644
      fflush(stderr);
  
      while (GetMessageA(&msg, NULL, 0, 0) > 0) {
-@@ -281,7 +504,9 @@ int mkb_enabled(void)
+@@ -281,7 +514,9 @@ int mkb_enabled(void)
          const char *v = getenv("RECOMP_MKB");
          on = v && *v && *v != '0';
          if (on) {
@@ -699,7 +889,7 @@ index d6f0042..073a666 100644
              if (InterlockedCompareExchange(&s_thread_up, 0, 0) == 0) {
                  static LONG started = 0;
                  if (InterlockedCompareExchange(&started, 1, 0) == 0)
-@@ -323,8 +548,15 @@ static void mkb_manage_cursor(int capture)
+@@ -323,8 +558,15 @@ static void mkb_manage_cursor(int capture)
      if (capture) {
          RECT r;
          HWND fg = GetForegroundWindow();
@@ -716,7 +906,7 @@ index d6f0042..073a666 100644
          if (hidden < 5) { ShowCursor(FALSE); hidden++; }
      } else {
          if (hidden > 0) { ShowCursor(TRUE); hidden--; }
-@@ -356,87 +588,214 @@ static void mkb_aim_vector(double ax, double ay, SHORT *out_x, SHORT *out_y)
+@@ -356,86 +598,288 @@ static void mkb_aim_vector(double ax, double ay, SHORT *out_x, SHORT *out_y)
  
  #define MK_VK(k)  ((unsigned)(k) < 256 && s_vk_down[(k)])
  
@@ -843,7 +1033,17 @@ index d6f0042..073a666 100644
 -    if (!s_active) {
 -        mkb_manage_cursor(0);
 -        return 0;
--    }
++    /* Milliseconds from the performance counter: GetTickCount moves in
++     * 15.6 ms steps, which handed a scripted mouse move to one poll in four
++     * as a burst. */
++    {
++        static LARGE_INTEGER f;
++        LARGE_INTEGER c;
++        if (!f.QuadPart)
++            QueryPerformanceFrequency(&f);
++        QueryPerformanceCounter(&c);
++        now = (unsigned long)(c.QuadPart * 1000 / f.QuadPart);
+     }
 -
 -    /* Foreground gate: while the user is elsewhere the mouse belongs to
 -     * whoever has it, and the game should read a pad at rest. */
@@ -852,7 +1052,6 @@ index d6f0042..073a666 100644
 -        InterlockedExchange(&s_dx, 0);
 -        InterlockedExchange(&s_dy, 0);
 -        return 0;
-+    now = GetTickCount();
 +    if (!t0)
 +        t0 = now;
 +    t = now - t0;
@@ -864,6 +1063,7 @@ index d6f0042..073a666 100644
 +            if (s_captured)
 +                mkb_set_captured(0, "window left");
 +            mkb_manage_cursor(0);
++            s_aim_vx = s_aim_vy = 0.0;
 +            InterlockedExchange(&s_dx, 0);
 +            InterlockedExchange(&s_dy, 0);
 +            InterlockedExchange(&s_wheel, 0);
@@ -947,14 +1147,53 @@ index d6f0042..073a666 100644
 +                           &look_x, &look_y);
      }
  
-     /* ---- mouse: aim ---- */
-     if (dx || dy) {
+-    /* ---- mouse: aim ---- */
+-    if (dx || dy) {
 -        double ax =  (double)dx / (double)s_cfg.full;
 -        double ay = -(double)dy / (double)s_cfg.full;
 -        if (s_cfg.invert_y) ay = -ay;
 -        mkb_aim_vector(ax, ay, &aim_x, &aim_y);
-+        double fx =  (double)dx / (double)s_cfg.full;
-+        double fy = -(double)dy / (double)s_cfg.full;
++    /* ---- mouse: aim ----
++     *
++     * A stick reading is a speed, and the game samples the pad on its own
++     * schedule: each USB report carries what this poll returns, and the
++     * title reads whichever report is newest when its frame wants input. So
++     * the mouse is turned into a speed too: counts per 10 ms, averaged over
++     * `smooth` ms of real time, held on the stick until the mouse slows.
++     * It used to be this poll's counts over `full` -- a few milliseconds of
++     * motion per report, so a slow or steady move came out as a small
++     * deflection inside the game's deadzone, and a report that fell between
++     * two mouse packets read as a centred stick: the camera barely turned. */
++    {
++        static LARGE_INTEGER qf, qlast;
++        LARGE_INTEGER qn;
++        double dt_ms = 0.0;
++
++        if (!qf.QuadPart)
++            QueryPerformanceFrequency(&qf);
++        QueryPerformanceCounter(&qn);
++        if (qlast.QuadPart)
++            dt_ms = (double)(qn.QuadPart - qlast.QuadPart) * 1000.0
++                  / (double)qf.QuadPart;
++        if (dt_ms >= 0.05 || !qlast.QuadPart) {
++            double a;
++            if (dt_ms > 100.0) dt_ms = 100.0;          /* after a pause */
++            if (dt_ms < 0.05)  dt_ms = 0.05;
++            a = 1.0 - exp(-dt_ms / s_cfg.smooth);
++            s_aim_vx += ((double)dx / dt_ms - s_aim_vx) * a;   /* counts/ms */
++            s_aim_vy += ((double)dy / dt_ms - s_aim_vy) * a;
++            if (s_aim_vx * s_aim_vx + s_aim_vy * s_aim_vy < 1e-4)
++                s_aim_vx = s_aim_vy = 0.0;             /* < 10 counts/s */
++            qlast = qn;
++        } else {
++            /* Two polls in the same instant: keep the counts for the next. */
++            InterlockedAdd(&s_dx, dx);
++            InterlockedAdd(&s_dy, dy);
++        }
++    }
++    if (s_aim_vx || s_aim_vy) {
++        double fx =  s_aim_vx * 10.0 / (double)s_cfg.full;
++        double fy = -s_aim_vy * 10.0 / (double)s_cfg.full;
 +        if (s_cfg.invert_y) fy = -fy;
 +        mkb_aim_vector(fx, fy, &aim_x, &aim_y);
 +    } else if (look_x || look_y) {
@@ -982,10 +1221,35 @@ index d6f0042..073a666 100644
 -    /* ---- wheel / middle button: cycle weapon ---- */
 -    if (wheel || (btn & 0x04))
 -        analog[XBOX_BUTTON_Y] = 255;
--
++    /* RECOMP_MKB_TRACE=1: once a second, how often the pad was polled, how
++     * far the mouse moved, and the largest aim deflection handed out. */
++    {
++        static int trace = -1;
++        static unsigned long t_last, polls;
++        static long sum_x, sum_y;
++        static int peak;
++        int m;
++        if (trace < 0) {
++            const char *e = getenv("RECOMP_MKB_TRACE");
++            trace = e && *e && *e != '0';
++        }
++        if (trace) {
++            polls++;
++            sum_x += dx; sum_y += dy;
++            m = abs(aim_x) > abs(aim_y) ? abs(aim_x) : abs(aim_y);
++            if (m > peak) peak = m;
++            if (now - t_last >= 1000) {
++                fprintf(stderr, "  [MKB] %lu polls/s, mouse %ld,%ld counts,"
++                        " aim peak %d (%.0f%%)\n", polls, sum_x, sum_y, peak,
++                        peak * 100.0 / 32767.0);
++                fflush(stderr);
++                t_last = now; polls = 0; sum_x = sum_y = 0; peak = 0;
++            }
++        }
++    }
+ 
      /* ---- merge on top of whatever the host pad produced ---- */
      if (b)        { pState->Gamepad.wButtons |= b; any = 1; }
-     for (i = 0; i < 8; i++) {
 diff --git a/src/input/mkb_input.h b/src/input/mkb_input.h
 index 664efad..a05246c 100644
 --- a/src/input/mkb_input.h
@@ -3288,10 +3552,10 @@ index 87b7ef7..e6c21cc 100644
  static void publish(uint32_t bpp)
 diff --git a/src/video/nv2a_d3d11.c b/src/video/nv2a_d3d11.c
 new file mode 100644
-index 0000000..7540b35
+index 0000000..2efc93a
 --- /dev/null
 +++ b/src/video/nv2a_d3d11.c
-@@ -0,0 +1,2793 @@
+@@ -0,0 +1,2955 @@
 +/*
 + * nv2a_d3d11.c -- a Direct3D 11 render back end for the pushbuffer executor.
 + *
@@ -3565,6 +3829,22 @@ index 0000000..7540b35
 +"#define K_TEXTURED g_misc2.x\n"
 +"#define STAGE_LOOP [loop]\n"
 +"#endif\n"
++/* RECOMP_D3D11_AF: 2D lookups take their uv's screen gradients, taken at
++ * the top of ps_main where every pixel of a quad is still running, so an
++ * anisotropic sampler has a footprint to work with. Without it, level 0. */
++"#ifdef AF\n"
++"static float2 GX[4], GY[4];\n"
++"#define TSAMPLE(T, S, uv, st) T.SampleGrad(S, uv, GX[st], GY[st])\n"
++"void grads(uint st, float4 c) {\n"
++"  uint mode = (K_FIN.w >> (st * 5)) & 0x1F;\n"
++"  float q = (c.w != 0.0) ? c.w : 1.0;\n"
++"  float2 uv = (mode == 3) ? c.xy : c.xy / q;\n"
++"  uv = K_TFN(st) ? uv : uv / max(g_tsz[st].xy, 1.0);\n"
++"  GX[st] = ddx(uv); GY[st] = ddy(uv);\n"
++"}\n"
++"#else\n"
++"#define TSAMPLE(T, S, uv, st) T.SampleLevel(S, uv, 0)\n"
++"#endif\n"
 +"float map_in(float x, uint m) {\n"
 +"  float p = max(x, 0.0);\n"
 +"  if (m == 0) return p;\n"
@@ -3595,10 +3875,10 @@ index 0000000..7540b35
 +"}\n"
 +"float4 tex2d(uint st, float2 uv) {\n"
 +"  float4 v;\n"
-+"  if (st == 0) v = T0.SampleLevel(S0, uv, 0);\n"
-+"  else if (st == 1) v = T1.SampleLevel(S1, uv, 0);\n"
-+"  else if (st == 2) v = T2.SampleLevel(S2, uv, 0);\n"
-+"  else v = T3.SampleLevel(S3, uv, 0);\n"
++"  if (st == 0) v = TSAMPLE(T0, S0, uv, 0);\n"
++"  else if (st == 1) v = TSAMPLE(T1, S1, uv, 1);\n"
++"  else if (st == 2) v = TSAMPLE(T2, S2, uv, 2);\n"
++"  else v = TSAMPLE(T3, S3, uv, 3);\n"
 +"  return K_TFG(st) ? v.bgbg : v;\n"            /* LIN_G8B8 over a G8B8 target */
 +"}\n"
 +"float4 texcube(uint st, float3 d) {\n"
@@ -3646,6 +3926,9 @@ index 0000000..7540b35
 +"  return true;\n"
 +"}\n"
 +"float4 ps_main(VO i) : SV_Target {\n"
++"#ifdef AF\n"
++"  grads(0, i.t0); grads(1, i.t1); grads(2, i.t2); grads(3, i.t3);\n"
++"#endif\n"
 +"  float4 col = i.d0;\n"
 +"  if (K_MISC.z == 0) {\n"                         /* texel * diffuse */
 +"    float4 o = col;\n"
@@ -3757,6 +4040,8 @@ index 0000000..7540b35
 + * the clipper has interpolated it. */
 +static int s_failed;
 +static float s_scale = 1.0f;          /* RECOMP_RENDER_SCALE, see below */
++static int s_af;                      /* RECOMP_D3D11_AF, see sampler() */
++static UINT s_msaa = 1;               /* RECOMP_D3D11_MSAA, see rt_resolve() */
 +static uint32_t s_frame = 1;
 +static GV *s_gv;
 +static UINT s_gv_cap;
@@ -3796,10 +4081,13 @@ index 0000000..7540b35
 +    fflush(stderr);
 +}
 +
++static const D3D_SHADER_MACRO s_af_macro[] = { { "AF", "1" }, { NULL, NULL } };
++
 +static int compile(const char *entry, const char *target, ID3DBlob **out)
 +{
 +    ID3DBlob *err = NULL;
-+    HRESULT hr = D3DCompile(s_hlsl, sizeof s_hlsl - 1, "nv2a_d3d11", NULL, NULL,
++    HRESULT hr = D3DCompile(s_hlsl, sizeof s_hlsl - 1, "nv2a_d3d11",
++                            s_af ? s_af_macro : NULL, NULL,
 +                            entry, target, D3DCOMPILE_OPTIMIZATION_LEVEL3, 0,
 +                            out, &err);
 +    if (FAILED(hr)) {
@@ -3881,6 +4169,25 @@ index 0000000..7540b35
 +                           D3D11_SDK_VERSION, &s_dev, &fl, &s_ctx);
 +    if (FAILED(hr)) { d3d_log("D3D11CreateDevice", hr); return 0; }
 +    ID3D11DeviceContext_QueryInterface(s_ctx, &IID_ID3D11DeviceContext1, (void **)&s_ctx1);
++    {
++        const char *e = getenv("RECOMP_D3D11_AF");
++        int n = e ? atoi(e) : 0;
++        s_af = n < 1 ? 0 : n > 16 ? 16 : n;
++    }
++    {
++        const char *e = getenv("RECOMP_D3D11_MSAA");
++        UINT n = e ? (UINT)atoi(e) : 1, qc = 0, qd = 0;
++        n = n >= 8 ? 8 : n >= 4 ? 4 : n >= 2 ? 2 : 1;
++        /* The largest count both the colour and the depth format take. */
++        for (; n > 1; n /= 2) {
++            qc = qd = 0;
++            ID3D11Device_CheckMultisampleQualityLevels(s_dev, DXGI_FORMAT_B8G8R8A8_UNORM, n, &qc);
++            ID3D11Device_CheckMultisampleQualityLevels(s_dev, DXGI_FORMAT_D32_FLOAT_S8X24_UINT, n, &qd);
++            if (qc && qd)
++                break;
++        }
++        s_msaa = n;
++    }
 +    if (!compile("vs_main", "vs_5_0", &vsb) || !compile("ps_main", "ps_5_0", &psb))
 +        return 0;
 +    {
@@ -3971,6 +4278,7 @@ index 0000000..7540b35
 +    rd.CullMode = D3D11_CULL_NONE;      /* the CPU rasteriser draws both windings */
 +    rd.DepthClipEnable = FALSE;         /* window z is clamped, not clipped */
 +    rd.ScissorEnable = TRUE;
++    rd.MultisampleEnable = s_msaa > 1;
 +    hr = ID3D11Device_CreateRasterizerState(s_dev, &rd, &s_rs);
 +    if (FAILED(hr)) { d3d_log("CreateRasterizerState", hr); return 0; }
 +
@@ -3983,6 +4291,8 @@ index 0000000..7540b35
 +    s_whitecube = make_white(1);
 +    s_failed = 0;
 +    fprintf(stderr, "  [D3D11] back end up (feature level 0x%X)\n", (unsigned)fl);
++    if (s_af || s_msaa > 1)
++        fprintf(stderr, "  [D3D11] anisotropic filtering %dx, MSAA %ux\n", s_af, s_msaa);
 +    fflush(stderr);
 +    return 1;
 +}
@@ -4024,27 +4334,67 @@ index 0000000..7540b35
 +{
 +    return a->offset == b->offset && a->width == b->width && a->height == b->height
 +        && a->pitch == b->pitch && a->color == b->color && a->cube == b->cube
-+        && a->palette == b->palette && a->face_stride == b->face_stride;
++        && a->palette == b->palette && a->face_stride == b->face_stride
++        && (!s_af || a->levels == b->levels);
++}
++
++/* Levels a texture is made with: 1, or with RECOMP_D3D11_AF the mip levels
++ * a 2D swizzled/DXT texture stores after level 0 (each half the last, at
++ * least 1, packed with no gap -- tex_face_stride's layout), so anisotropic
++ * filtering has them to choose from. */
++static uint32_t tex_levels(const Nv2aTexture *t)
++{
++    uint32_t n = 1, w = t->width, h = t->height;
++    if (!s_af || t->cube || !t->normalized)
++        return 1;
++    while (n < t->levels && n < 13 && (w > 1 || h > 1)) {
++        w = w > 1 ? w / 2 : 1;
++        h = h > 1 ? h / 2 : 1;
++        n++;
++    }
++    return n;
++}
++
++/* Level l of t, one face: its address and size. */
++static Nv2aTexture tex_level(const Nv2aTexture *t, uint32_t l)
++{
++    Nv2aTexture v = *t;
++    uint32_t i;
++    for (i = 0; i < l; i++) {
++        v.offset += nv2a_backend_texture_bytes(&v);
++        v.width = v.width > 1 ? v.width / 2 : 1;
++        v.height = v.height > 1 ? v.height / 2 : 1;
++    }
++    return v;
 +}
 +
 +static uint32_t tex_span(const Nv2aTexture *t)
 +{
-+    uint32_t one = nv2a_backend_texture_bytes(t);
++    uint32_t n = tex_levels(t), one;
++    if (n > 1) {
++        Nv2aTexture last = tex_level(t, n - 1);
++        return last.offset + nv2a_backend_texture_bytes(&last) - t->offset;
++    }
++    one = nv2a_backend_texture_bytes(t);
 +    return t->cube ? t->face_stride * 5 + one : one;
 +}
 +
 +static ID3D11ShaderResourceView *tex_create(const Nv2aTexture *t)
 +{
 +    D3D11_TEXTURE2D_DESC td;
-+    D3D11_SUBRESOURCE_DATA sd[6];
++    D3D11_SUBRESOURCE_DATA sd[16];
 +    D3D11_SHADER_RESOURCE_VIEW_DESC vd;
 +    ID3D11Texture2D *tx = NULL;
 +    ID3D11ShaderResourceView *v = NULL;
-+    uint32_t faces = t->cube ? 6 : 1, f;
-+    size_t texels = (size_t)t->width * t->height;
++    uint32_t faces = t->cube ? 6 : 1, levels = tex_levels(t), f, l;
++    size_t texels = 0, at = 0;
 +
 +    if (!t->width || !t->height || t->width > 4096 || t->height > 4096)
 +        return NULL;
++    for (l = 0; l < levels; l++) {
++        Nv2aTexture lv = tex_level(t, l);
++        texels += (size_t)lv.width * lv.height;
++    }
 +    if (s_decode_cap < texels * faces) {
 +        free(s_decode);
 +        s_decode_cap = texels * faces;
@@ -4056,48 +4406,54 @@ index 0000000..7540b35
 +        && !(t->width & 3) && !(t->height & 3)) {
 +        const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
 +        UINT bb = t->color == 0x0C ? 8 : 16;
-+        for (f = 0; f < faces; f++) {
-+            sd[f].pSysMem = mem + t->offset + f * t->face_stride;
-+            sd[f].SysMemPitch = (t->width / 4) * bb;
-+            sd[f].SysMemSlicePitch = (t->width / 4) * (t->height / 4) * bb;
-+        }
++        for (f = 0; f < faces; f++)
++            for (l = 0; l < levels; l++) {
++                Nv2aTexture lv = tex_level(t, l);
++                D3D11_SUBRESOURCE_DATA *d = &sd[f * levels + l];
++                d->pSysMem = mem + lv.offset + f * t->face_stride;
++                d->SysMemPitch = ((lv.width + 3) / 4) * bb;
++                d->SysMemSlicePitch = d->SysMemPitch * ((lv.height + 3) / 4);
++            }
 +        memset(&td, 0, sizeof td);
 +        td.Width = t->width;
 +        td.Height = t->height;
-+        td.MipLevels = 1;
++        td.MipLevels = levels;
 +        td.ArraySize = faces;
 +        td.Format = t->color == 0x0C ? DXGI_FORMAT_BC1_UNORM
 +                  : t->color == 0x0E ? DXGI_FORMAT_BC2_UNORM : DXGI_FORMAT_BC3_UNORM;
 +        goto create;
 +    }
-+    for (f = 0; f < faces; f++) {
-+        Nv2aTexture one = *t;
-+        uint32_t *dst = s_decode + texels * f;
-+        const uint8_t *src = (const uint8_t *)xbox_GetMemoryOffset() + t->offset
++    for (f = 0; f < faces; f++)
++    for (l = 0; l < levels; l++) {
++        Nv2aTexture one = tex_level(t, l);
++        uint32_t tw = one.width, th = one.height;
++        size_t n = (size_t)tw * th;
++        uint32_t *dst = s_decode + at;
++        const uint8_t *src = (const uint8_t *)xbox_GetMemoryOffset() + one.offset
 +                           + f * t->face_stride;
-+        int pow2 = !(t->width & (t->width - 1)) && !(t->height & (t->height - 1));
-+        one.offset = t->offset + f * t->face_stride;
-+        sd[f].pSysMem = dst;
-+        sd[f].SysMemPitch = t->width * 4;
-+        sd[f].SysMemSlicePitch = (UINT)(texels * 4);
++        int pow2 = !(tw & (tw - 1)) && !(th & (th - 1));
++        one.offset += f * t->face_stride;
++        at += n;
++        sd[f * levels + l].pSysMem = dst;
++        sd[f * levels + l].SysMemPitch = tw * 4;
++        sd[f * levels + l].SysMemSlicePitch = (UINT)(n * 4);
 +        /* 32-bit ARGB in bulk: the same bytes as B8G8R8A8, just placed. */
 +        if ((t->color == 0x06 || t->color == 0x07) && pow2) {       /* swizzled */
-+            xbox_unswizzle_rect(dst, src, t->width, t->height, 4);
++            xbox_unswizzle_rect(dst, src, tw, th, 4);
 +            if (t->color == 0x07) {
 +                size_t k;
-+                for (k = 0; k < texels; k++) dst[k] |= 0xFF000000u;
++                for (k = 0; k < n; k++) dst[k] |= 0xFF000000u;
 +            }
 +            continue;
 +        }
-+        if ((t->color == 0x12 || t->color == 0x1E) && t->pitch >= t->width * 4) {
++        if ((t->color == 0x12 || t->color == 0x1E) && t->pitch >= tw * 4) {
 +            uint32_t y;
-+            for (y = 0; y < t->height; y++) {
-+                memcpy(dst + (size_t)y * t->width, src + (size_t)y * t->pitch,
-+                       (size_t)t->width * 4);
++            for (y = 0; y < th; y++) {
++                memcpy(dst + (size_t)y * tw, src + (size_t)y * t->pitch, (size_t)tw * 4);
 +                if (t->color == 0x1E) {
 +                    uint32_t x;
-+                    for (x = 0; x < t->width; x++)
-+                        dst[(size_t)y * t->width + x] |= 0xFF000000u;
++                    for (x = 0; x < tw; x++)
++                        dst[(size_t)y * tw + x] |= 0xFF000000u;
 +                }
 +            }
 +            continue;
@@ -4105,19 +4461,18 @@ index 0000000..7540b35
 +        /* Two 8-bit channels in 16 bits, widened in place from the top down
 +         * so no texel is overwritten before it is read. Same channel mapping
 +         * as the executor's decoder: G8B8 reads (B,G,B,G), A8Y8 (Y,Y,Y,A). */
-+        if ((t->color == 0x17 && t->pitch >= t->width * 2)          /* LIN_G8B8 */
++        if ((t->color == 0x17 && t->pitch >= tw * 2)                /* LIN_G8B8 */
 +            || (t->color == 0x1A && pow2)) {                        /* SZ_A8Y8 */
 +            uint16_t *s16 = (uint16_t *)dst;
 +            size_t k;
 +            if (t->color == 0x1A)
-+                xbox_unswizzle_rect(dst, src, t->width, t->height, 2);
++                xbox_unswizzle_rect(dst, src, tw, th, 2);
 +            else {
 +                uint32_t y;
-+                for (y = 0; y < t->height; y++)
-+                    memcpy(s16 + (size_t)y * t->width, src + (size_t)y * t->pitch,
-+                           (size_t)t->width * 2);
++                for (y = 0; y < th; y++)
++                    memcpy(s16 + (size_t)y * tw, src + (size_t)y * t->pitch, (size_t)tw * 2);
 +            }
-+            for (k = texels; k-- > 0; ) {
++            for (k = n; k-- > 0; ) {
 +                uint32_t v = s16[k], lo = v & 0xFFu, hi = v >> 8;
 +                dst[k] = t->color == 0x17 ? (hi << 24) | (lo << 16) | (hi << 8) | lo
 +                                          : (hi << 24) | (lo * 0x010101u);
@@ -4134,7 +4489,7 @@ index 0000000..7540b35
 +    memset(&td, 0, sizeof td);
 +    td.Width = t->width;
 +    td.Height = t->height;
-+    td.MipLevels = 1;
++    td.MipLevels = levels;
 +    td.ArraySize = faces;
 +    td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
 +create:
@@ -4151,7 +4506,7 @@ index 0000000..7540b35
 +        vd.TextureCube.MipLevels = 1;
 +    } else {
 +        vd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-+        vd.Texture2D.MipLevels = 1;
++        vd.Texture2D.MipLevels = levels;
 +    }
 +    ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)tx, &vd, &v);
 +    ID3D11Texture2D_Release(tx);
@@ -4170,16 +4525,20 @@ index 0000000..7540b35
 +/* Colour formats the executor's decoder cannot read. The CPU rasteriser
 + * samples white for them; so does this, without hashing or writing anything
 + * back first. */
++static int s_tex_rt;                /* the last tex_get was a render target */
++
 +static ID3D11ShaderResourceView *tex_get(const Nv2aTexture *t, float *w, float *h,
 +                                         int *g8b8)
 +{
 +    ID3D11ShaderResourceView *a;
 +    *g8b8 = 0;
++    s_tex_rt = 0;
 +    if (s_fmt_bad[t->color & 0xFF])
 +        return NULL;
 +    *w = (float)t->width;
 +    *h = (float)t->height;
 +    a = rt_alias(t, w, h, g8b8);
++    s_tex_rt = a != NULL;
 +    if (a)
 +        return a;
 +    /* Memory a render target has drawn newer pixels into must be written
@@ -4280,6 +4639,11 @@ index 0000000..7540b35
 +    ID3D11Texture2D *lo;
 +    ID3D11RenderTargetView *lo_rtv;
 +    ID3D11ShaderResourceView *lo_srv;
++    /* RECOMP_D3D11_MSAA: draws go to `ms`, s_msaa samples a pixel, and tex
++     * is its resolved image, current when ms_dirty is clear. */
++    ID3D11Texture2D *ms;
++    ID3D11RenderTargetView *ms_rtv;
++    int ms_dirty;
 +} Target;
 +
 +typedef struct {
@@ -4461,6 +4825,27 @@ index 0000000..7540b35
 +    return (UINT)(v * s_scale + 0.5f);
 +}
 +
++/* RECOMP_D3D11_MSAA=2/4/8: every render target and depth buffer has that
++ * many samples a pixel, and the title draws into those. Anything that reads
++ * a target -- a texture lookup (rt_alias), a write-back to guest memory,
++ * the window -- reads `tex`, so it is resolved first: the samples averaged
++ * into it, once per batch of drawing. Pixels going the other way (uploads)
++ * land in tex and are copied to every sample. */
++static ID3D11RenderTargetView *rt_view(const Target *t)
++{
++    return t->ms_rtv ? t->ms_rtv : t->rtv;
++}
++
++static void rt_resolve(Target *t)
++{
++    if (!t->ms || !t->ms_dirty)
++        return;
++    t->ms_dirty = 0;
++    ID3D11DeviceContext_ResolveSubresource(s_ctx, (ID3D11Resource *)t->tex, 0,
++                                           (ID3D11Resource *)t->ms, 0,
++                                           DXGI_FORMAT_B8G8R8A8_UNORM);
++}
++
 +/* Guest pixels -> render target. 32-bit surfaces are B8G8R8A8 already;
 + * 16-bit ones are widened as R5G6B5, or as G8B8 into blue and green. */
 +static void rt_upload(Target *t)
@@ -4497,6 +4882,11 @@ index 0000000..7540b35
 +    if (t->lo)                               /* scaled: guest size -> target */
 +        blit(t->lo_srv, t->rtv, 0.0f, 0.0f, (float)t->sw, (float)t->sh,
 +             0.0f, 0.0f, 1.0f, 1.0f);
++    if (t->ms) {                             /* resolved image -> every sample */
++        blit(t->srv, t->ms_rtv, 0.0f, 0.0f, (float)t->sw, (float)t->sh,
++             0.0f, 0.0f, 1.0f, 1.0f);
++        t->ms_dirty = 0;
++    }
 +}
 +
 +/* Render target -> guest pixels. */
@@ -4510,6 +4900,7 @@ index 0000000..7540b35
 +        return;
 +    t->dirty = 0;
 +    s_st.writebacks++;
++    rt_resolve(t);
 +    if (t->lo) {                             /* scaled: target -> guest size */
 +        blit(t->srv, t->lo_rtv, 0.0f, 0.0f, (float)t->width, (float)t->height,
 +             0.0f, 0.0f, 1.0f, 1.0f);
@@ -4566,6 +4957,8 @@ index 0000000..7540b35
 +    if (t->lo_rtv) ID3D11RenderTargetView_Release(t->lo_rtv);
 +    if (t->lo_srv) ID3D11ShaderResourceView_Release(t->lo_srv);
 +    if (t->lo) ID3D11Texture2D_Release(t->lo);
++    if (t->ms_rtv) ID3D11RenderTargetView_Release(t->ms_rtv);
++    if (t->ms) ID3D11Texture2D_Release(t->ms);
 +    memset(t, 0, sizeof *t);
 +}
 +
@@ -4607,6 +5000,17 @@ index 0000000..7540b35
 +        return NULL;
 +    t->sw = td.Width;
 +    t->sh = td.Height;
++    if (s_msaa > 1) {
++        td.SampleDesc.Count = s_msaa;
++        td.BindFlags = D3D11_BIND_RENDER_TARGET;
++        if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &t->ms))) {
++            rt_release(t);
++            return NULL;
++        }
++        ID3D11Device_CreateRenderTargetView(s_dev, (ID3D11Resource *)t->ms, NULL, &t->ms_rtv);
++        td.SampleDesc.Count = 1;
++        td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
++    }
 +    td.Width = w;
 +    td.Height = h;
 +    if (s_scale != 1.0f) {
@@ -4659,7 +5063,7 @@ index 0000000..7540b35
 +    td.MipLevels = 1;
 +    td.ArraySize = 1;
 +    td.Format = DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
-+    td.SampleDesc.Count = 1;
++    td.SampleDesc.Count = s_msaa;           /* as the colour targets */
 +    td.Usage = D3D11_USAGE_DEFAULT;
 +    td.BindFlags = D3D11_BIND_DEPTH_STENCIL;
 +    if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &d->tex)))
@@ -4711,7 +5115,10 @@ index 0000000..7540b35
 +        s_cur = t;
 +    }
 +    dsv = rs ? ds_get(rs->zeta_va, t->sw, t->sh) : NULL;
-+    ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &t->rtv, dsv);
++    {
++        ID3D11RenderTargetView *v = rt_view(t);
++        ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &v, dsv);
++    }
 +    return t;
 +}
 +
@@ -4751,6 +5158,7 @@ index 0000000..7540b35
 +                   || r->pitch != t->width * 4)
 +                : r->pitch != t->pitch)
 +            continue;
++        rt_resolve(r);
 +        if (r == s_cur) {
 +            /* Sampling the surface being drawn (a screen effect): sample a
 +             * GPU copy of it as it stands. */
@@ -4949,11 +5357,16 @@ index 0000000..7540b35
 +
 +/* As rc_texel: tent when MAG is 2 or MIN is 2/4/6, else nearest; wrap mode 1
 + * wraps, everything else clamps. */
-+static ID3D11SamplerState *sampler(const Nv2aTexture *t)
++/* RECOMP_D3D11_AF=<1-16>: a texture from guest memory that the title
++ * filters (tent, or any mipmap MIN 3-6) is sampled anisotropically instead,
++ * across the mip levels it stores (tex_levels). Nearest-sampled textures and
++ * render targets read as textures (`rt`) stay exact: one level, as before. */
++static ID3D11SamplerState *sampler(const Nv2aTexture *t, int rt)
 +{
 +    D3D11_SAMPLER_DESC d;
 +    uint32_t mag = t ? (t->filter >> 24) & 0xF : 0, min = t ? (t->filter >> 16) & 0xFF : 0;
 +    int lin = mag == 2 || min == 2 || min == 4 || min == 6, i;
++    int aniso = s_af && t && !rt && (lin || (min >= 3 && min <= 6));
 +
 +    memset(&d, 0, sizeof d);
 +    d.Filter = lin ? D3D11_FILTER_MIN_MAG_MIP_LINEAR : D3D11_FILTER_MIN_MAG_MIP_POINT;
@@ -4961,6 +5374,12 @@ index 0000000..7540b35
 +    d.AddressV = t && t->addr_v == 1 ? D3D11_TEXTURE_ADDRESS_WRAP : D3D11_TEXTURE_ADDRESS_CLAMP;
 +    d.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
 +    d.MaxLOD = D3D11_FLOAT32_MAX;
++    if (aniso) {
++        d.Filter = D3D11_FILTER_ANISOTROPIC;
++        d.MaxAnisotropy = (UINT)s_af;
++    } else if (s_af) {
++        d.MaxLOD = 0.0f;                /* level 0 whatever the gradients say */
++    }
 +    d.ComparisonFunc = D3D11_COMPARISON_NEVER;
 +    for (i = 0; i < s_nss; i++)
 +        if (!memcmp(&s_ss[i].d, &d, sizeof d))
@@ -5020,10 +5439,11 @@ index 0000000..7540b35
 +        r.right = (LONG)scaled(s->clip_x + s->width < t->width ? s->clip_x + s->width : t->width);
 +        r.bottom = (LONG)scaled(s->clip_y + s->height < t->height ? s->clip_y + s->height : t->height);
 +        if (s_ctx1)
-+            ID3D11DeviceContext1_ClearView(s_ctx1, (ID3D11View *)t->rtv, c, &r, 1);
++            ID3D11DeviceContext1_ClearView(s_ctx1, (ID3D11View *)rt_view(t), c, &r, 1);
 +        else
-+            ID3D11DeviceContext_ClearRenderTargetView(s_ctx, t->rtv, c);
++            ID3D11DeviceContext_ClearRenderTargetView(s_ctx, rt_view(t), c);
 +        t->dirty = 1;
++        t->ms_dirty = 1;
 +    }
 +    dsv = ds_get(rs->zeta_va, t->sw, t->sh);
 +    if (dsv && (flags & 3)) {
@@ -5088,7 +5508,7 @@ index 0000000..7540b35
 +    const PsKey *k = &e->key;
 +    char w[4][192], fin[96], misc[96], tf[96], tex[16], path[MAX_PATH];
 +    const uint32_t *words[4] = { k->cicw, k->aicw, k->cocw, k->aocw };
-+    D3D_SHADER_MACRO m[10];
++    D3D_SHADER_MACRO m[11];
 +    ID3DBlob *blob = NULL, *err = NULL;
 +    ID3D11PixelShader *ps = NULL;
 +    int i;
@@ -5111,7 +5531,8 @@ index 0000000..7540b35
 +    m[6].Name = "SPEC_MISC";    m[6].Definition = misc;
 +    m[7].Name = "SPEC_TF";      m[7].Definition = tf;
 +    m[8].Name = "SPEC_TEXTURED"; m[8].Definition = tex;
-+    m[9].Name = NULL;           m[9].Definition = NULL;
++    m[9].Name = s_af ? "AF" : NULL; m[9].Definition = s_af ? "1" : NULL;
++    m[10].Name = NULL;          m[10].Definition = NULL;
 +    if (FAILED(D3DCompile(s_hlsl, sizeof s_hlsl - 1, "nv2a_ps_spec", m, NULL, "ps_main",
 +                          "ps_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &blob, &err))
 +        || FAILED(ID3D11Device_CreatePixelShader(s_dev, ID3D10Blob_GetBufferPointer(blob),
@@ -5194,6 +5615,8 @@ index 0000000..7540b35
 +    snprintf(s_cache_dir, sizeof s_cache_dir, "%s", dir && *dir ? dir : "shader_cache");
 +    CreateDirectoryA(s_cache_dir, NULL);
 +    s_src_hash = fnv64(s_hlsl, sizeof s_hlsl - 1, 0xCBF29CE484222325ull);
++    if (s_af)                           /* its own cache files */
++        s_src_hash = fnv64("AF", 2, s_src_hash);
 +    InitializeCriticalSection(&s_psq_lock);
 +    s_psq_sem = CreateSemaphoreA(NULL, 0, PS_MAX, NULL);
 +    for (i = 0; i < 3; i++) {
@@ -5295,7 +5718,7 @@ index 0000000..7540b35
 +    cb.misc[2] = r->alpha_ref;
 +    cb.misc[3] = b->clip_plane_mode;
 +    for (st = 0; st < 8; st++) srv[st] = st < 4 ? s_white2d : s_whitecube;
-+    for (st = 0; st < 4; st++) smp[st] = sampler(NULL);
++    for (st = 0; st < 4; st++) smp[st] = sampler(NULL, 0);
 +    if (b->rc) {
 +        const Nv2aCombiner *rc = b->rc;
 +        float fogc[4];
@@ -5328,7 +5751,7 @@ index 0000000..7540b35
 +                if (v) srv[tx->cube ? 4 + st : st] = v;
 +                if (g8) cb.misc2[1] |= 1u << st;
 +            }
-+            smp[st] = sampler(tx);
++            smp[st] = sampler(tx, s_tex_rt);
 +        }
 +    } else if (b->texture) {
 +        cb.misc2[0] = 1;
@@ -5343,7 +5766,7 @@ index 0000000..7540b35
 +        {
 +            Nv2aTexture pt = *b->texture;
 +            pt.filter = 0;
-+            smp[0] = sampler(&pt);
++            smp[0] = sampler(&pt, 0);
 +        }
 +    }
 +    if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_cb, 0,
@@ -5423,6 +5846,7 @@ index 0000000..7540b35
 +    ID3D11DeviceContext_Draw(s_ctx, b->count, 0);
 +    gp_mark(gp_kind(b, 0), b->count, t);
 +    t->dirty = 1;
++    t->ms_dirty = 1;
 +    s_st.draws++;
 +    s_st.verts += b->count;
 +}
@@ -5776,6 +6200,7 @@ index 0000000..7540b35
 +    gp_mark(gp_kind(b, 1), p->count, t);
 +    maybe_flush();
 +    t->dirty = 1;
++    t->ms_dirty = 1;
 +    s_st.draws++;
 +    s_st.pdraws++;
 +    s_st.pverts += p->count;
@@ -5891,6 +6316,7 @@ index 0000000..7540b35
 +        if (sx > 1.0f) sx = 1.0f;
 +        if (sy > 1.0f) sy = 1.0f;
 +        ID3D11DeviceContext_ClearRenderTargetView(s_ctx, s_bb_rtv, black);
++        rt_resolve(t);
 +        blit(t->srv, s_bb_rtv, ax, ay, vw, vh, 0.0f, 0.0f, sx, sy);
 +    }
 +    /* RECOMP_PRESENT_DUMP=<file.bmp>[:<n>]: the n-th presented frame
