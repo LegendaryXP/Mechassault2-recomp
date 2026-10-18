@@ -54,6 +54,12 @@ rem 4:3), for a 1080p screen.
 rem Battle runs 60-100 fps at this size on the test PC; RECOMP_RENDER_SCALE=1
 rem is the original resolution, 1.5 is 720p.
 if "%RECOMP_RENDER_SCALE%"=="" set RECOMP_RENDER_SCALE=2.25
+rem 16x anisotropic filtering (clean ground and walls into the distance) and
+rem 4x multisample anti-aliasing (smooth edges): about 1.3 ms of GPU time a
+rem frame at 2.25x on the test PC. RECOMP_D3D11_AF=0 / RECOMP_D3D11_MSAA=1
+rem turn them off.
+if "%RECOMP_D3D11_AF%"=="" set RECOMP_D3D11_AF=16
+if "%RECOMP_D3D11_MSAA%"=="" set RECOMP_D3D11_MSAA=4
 rem Start in borderless fullscreen: set RECOMP_FULLSCREEN=1 (or press F11).
 rem Audio: without these DirectSound kept restarting the sound chip, and
 rem three quarters of the sound came out as silence (the static).
