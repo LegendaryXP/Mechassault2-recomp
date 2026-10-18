@@ -1028,8 +1028,46 @@ index 664efad..a05246c 100644
  #ifdef __cplusplus
  }
  #endif
+diff --git a/src/kernel/kernel.h b/src/kernel/kernel.h
+index 564c0bf..d9979bc 100644
+--- a/src/kernel/kernel.h
++++ b/src/kernel/kernel.h
+@@ -1078,11 +1078,30 @@ NTSTATUS __stdcall xbox_ExSaveNonVolatileSetting(ULONG ValueIndex, ULONG Type, P
+ #define XC_PARENTAL_CONTROL       XC_P_CONTROL_GAMES
+ #define XC_PARENTAL_PASSWORD      XC_P_CONTROL_PASSWORD
+ 
+-/* Video standard flags in XC_VIDEO */
++/* XC_VIDEO flags as XGetVideoFlags returns them. The stored setting (what
++ * ExQueryNonVolatileSetting answers) keeps them in bits 16-23: XGetVideoFlags
++ * is (value >> 16) & 0x5F, and it also clears the three HDTV bits unless the
++ * AV pack is XC_AV_PACK_HDTV. */
+ #define XC_VIDEO_FLAGS_WIDESCREEN   0x01
+-#define XC_VIDEO_FLAGS_HDTV         0x02
+-#define XC_VIDEO_FLAGS_PAL_I        0x04
++#define XC_VIDEO_FLAGS_HDTV_720p    0x02
++#define XC_VIDEO_FLAGS_HDTV_1080i   0x04
++#define XC_VIDEO_FLAGS_HDTV_480p    0x08
+ #define XC_VIDEO_FLAGS_LETTERBOX    0x10
++#define XC_VIDEO_FLAGS_PAL_60Hz     0x40
++#define XC_VIDEO_FLAGS_SHIFT        16
++/* Older spellings. */
++#define XC_VIDEO_FLAGS_HDTV         XC_VIDEO_FLAGS_HDTV_720p
++#define XC_VIDEO_FLAGS_PAL_I        XC_VIDEO_FLAGS_HDTV_1080i
++
++/* AV pack as XGetAVPack returns it (= HalBootSMCVideoMode). Not the same
++ * numbering as the AV_PACK_* SMBus values above. */
++#define XC_AV_PACK_SCART            0
++#define XC_AV_PACK_HDTV             1
++
++/* RECOMP_WIDESCREEN (default on; =0 for a 4:3 TV): whether the emulated
++ * console is set up for a 16:9 TV on component (dashboard Widescreen + 480p,
++ * HDTV AV pack) or for a 4:3 TV on SCART, as before. kernel_xbox.c. */
++int xbox_VideoWidescreen(void);
+ 
+ /* Unknown ordinals - stub */
+ VOID    __stdcall xbox_Unknown_8(void);
 diff --git a/src/kernel/kernel_bridge.c b/src/kernel/kernel_bridge.c
-index 965dd08..d51377c 100644
+index 965dd08..aed1571 100644
 --- a/src/kernel/kernel_bridge.c
 +++ b/src/kernel/kernel_bridge.c
 @@ -44,6 +44,9 @@
@@ -1077,7 +1115,107 @@ index 965dd08..d51377c 100644
              uint32_t page = xbox_HeapAlloc(0x1000 + 0x0C00, 4096);
              if (page) {
                  size_t n = strlen(cmdline);
-@@ -1762,7 +1790,7 @@ static void bridge_HalReturnToFirmware(void)
+@@ -289,9 +317,12 @@ static void kernel_data_init(void)
+      * this to convert ticks to time gets a division by zero if it is left 0. */
+     BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_TIME_INCREMENT) = 0x2710;
+ 
+-    /* HalBootSMCVideoMode (ordinal 356) - SMC video mode word from boot. 0 is
+-     * "no video mode reported", which titles treat as auto-detect. */
+-    BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_BOOT_SMC_VIDEO) = 0;
++    /* HalBootSMCVideoMode (ordinal 356) - the AV pack the SMC saw at boot;
++     * XGetAVPack returns it as is. 0 is SCART. XGetVideoFlags drops the HDTV
++     * (480p/720p/1080i) flags on anything but the HDTV pack, and MA2 only
++     * goes widescreen in 480p, so a 16:9 setup needs the component pack. */
++    BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_BOOT_SMC_VIDEO) =
++        xbox_VideoWidescreen() ? XC_AV_PACK_HDTV : XC_AV_PACK_SCART;
+ 
+     /* IdexChannelObject is a structure, not an opaque pointer. Guest file-close
+      * code walks DeviceQueue.DeviceListHead at +0x28. Host-backed synchronous
+@@ -739,9 +770,30 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
+     return 0;
+ }
+ 
++/* PsCreateSystemThreadEx's CreateSuspended, which XAPI's CreateThread passes
++ * for CREATE_SUSPENDED. It used to be ignored: every worker started at once.
++ * A title that creates a worker suspended sets up what the worker needs
++ * after the call returns and only then resumes it -- MechAssault 2's Bink
++ * creates its two movie threads suspended and creates their events and mutex
++ * afterwards. Started early, a worker waited on handles that did not exist
++ * yet, and when the movie was closed before it ever started playing (START
++ * pressed as the attract movie opened) its quit request never reached the
++ * worker, and the close waited for it forever. NtResumeThread resumes the
++ * host thread. RECOMP_THREAD_SUSPEND=0 ignores the flag, as before. */
++static int bridge_honour_suspend(void)
++{
++    static int on = -1;
++    if (on < 0) {
++        const char *e = getenv("RECOMP_THREAD_SUSPEND");
++        on = !(e && *e == '0');
++    }
++    return on;
++}
++
+ static HANDLE bridge_spawn_thread(recomp_func_t fn, uint32_t ctx1,
+                                   uint32_t ctx2, uint32_t stack_top,
+-                                  uint32_t obj_va, uint32_t tls_size)
++                                  uint32_t obj_va, uint32_t tls_size,
++                                  int suspended)
+ {
+     struct bridge_thread_start *s = malloc(sizeof(*s));
+     HANDLE th;
+@@ -751,7 +803,9 @@ static HANDLE bridge_spawn_thread(recomp_func_t fn, uint32_t ctx1,
+     s->obj_va = obj_va;
+     s->tls_size = tls_size;
+ 
+-    th = CreateThread(NULL, 0, bridge_thread_main, s, 0, NULL);
++    th = CreateThread(NULL, 0, bridge_thread_main, s,
++                      suspended && bridge_honour_suspend() ? CREATE_SUSPENDED : 0,
++                      NULL);
+     if (!th) free(s);
+     /* Record the game thread so a host-tick-driven title's watchdog can sample
+      * it via xbox_thread_debug_handle. Harmless for default-model titles: they
+@@ -766,13 +820,15 @@ static HANDLE bridge_spawn_thread(recomp_func_t fn, uint32_t ctx1,
+  * of the host thread handle, which is what KeWaitForSingleObject waits on. */
+ static HANDLE bridge_spawn_guest_thread(recomp_func_t fn, uint32_t ctx1,
+                                         uint32_t ctx2, uint32_t stack_top,
+-                                        uint32_t handle_va, uint32_t tls_size)
++                                        uint32_t handle_va, uint32_t tls_size,
++                                        int suspended)
+ {
+     uint32_t obj = thobj_alloc();
+     HANDLE th, shadow = NULL;
+ 
+     thobj_ref(obj);
+-    th = bridge_spawn_thread(fn, ctx1, ctx2, stack_top, obj, tls_size);
++    th = bridge_spawn_thread(fn, ctx1, ctx2, stack_top, obj, tls_size,
++                             suspended);
+     if (!th) {
+         thobj_unref(obj);   /* the thread's own: it never ran */
+     } else {
+@@ -809,6 +865,7 @@ static void bridge_PsCreateSystemThreadEx(void)
+     uint32_t tls_size        = STACK_ARG(3);
+     uint32_t start_context1  = STACK_ARG(5);
+     uint32_t start_context2  = STACK_ARG(6);
++    int      suspended       = (STACK_ARG(7) & 0xFF) != 0;   /* BOOLEAN */
+     uint32_t start_routine   = STACK_ARG(9);
+     /* In SPAWN mode there is no privileged "first call": every thread is real,
+      * so the entry can return. In INLINE mode the first call runs the game. */
+@@ -905,10 +962,11 @@ static void bridge_PsCreateSystemThreadEx(void)
+                 } else {
+                     bridge_spawn_guest_thread(fn, start_context1, start_context2,
+                                               stack_top, xbox_handle_ptr,
+-                                              tls_size);
++                                              tls_size, suspended);
+                     fprintf(stderr, "  [KERNEL] PsCreateSystemThreadEx: spawned "
+-                            "worker 0x%08X (ctx=0x%08X, stack top 0x%08X)\n",
+-                            start_routine, start_context1, stack_top);
++                            "worker 0x%08X (ctx=0x%08X, stack top 0x%08X%s)\n",
++                            start_routine, start_context1, stack_top,
++                            suspended && bridge_honour_suspend() ? ", suspended" : "");
+                     fflush(stderr);
+                 }
+             }
+@@ -1762,7 +1820,7 @@ static void bridge_HalReturnToFirmware(void)
          uint32_t i;
  
          fprintf(stderr, "  [KERNEL] exit requested, guest esp=0x%08X:\n", g_esp);
@@ -1086,7 +1224,7 @@ index 965dd08..d51377c 100644
              uint32_t a = g_esp + i * 4;
              if (a < 0x00010000u || a >= 0x04000000u) break;
              fprintf(stderr, "    GS %08X %08X\n", a,
-@@ -1807,6 +1835,91 @@ static void bridge_HalReturnToFirmware(void)
+@@ -1807,6 +1865,91 @@ static void bridge_HalReturnToFirmware(void)
                      waited);
      }
  
@@ -1178,7 +1316,7 @@ index 965dd08..d51377c 100644
      xbox_HalReturnToFirmware(routine);
  }
  
-@@ -2308,6 +2421,15 @@ static void bridge_MmSetAddressProtect(void)
+@@ -2308,6 +2451,15 @@ static void bridge_MmSetAddressProtect(void)
      uint32_t size = STACK_ARG(1);
      uint32_t prot = STACK_ARG(2);
  
@@ -1194,7 +1332,41 @@ index 965dd08..d51377c 100644
      xbox_MmSetAddressProtect(XBOX_TO_NATIVE(addr), size, prot);
      g_eax = 0;
  }
-@@ -2698,6 +2820,30 @@ static int kernel_raise_interrupt(uint32_t vector)
+@@ -2335,8 +2487,24 @@ static void bridge_AvSetDisplayMode(void)
+          * start it on the first display mode -- before that there is nothing
+          * to show and no pitch to interpret it with. */
+         extern void xbox_FramebufferWindowSet(uint32_t, uint32_t);
++        extern void xbox_FramebufferWindowSetMode(uint32_t, uint32_t, int);
+         extern void xbox_FramebufferWindowStart(void);
+         uint32_t fb_va = fb;
++        /* The mode's size, for the window: the pitch over the pixel size
++         * (D3DFMT_LIN_X1R5G5B5 / LIN_R5G6B5 are 16-bit, the 32-bit ones are
++         * the rest) gives the width, and the width the line count. The pitch
++         * is a tile pitch, rounded up (720 wide is 3072 bytes, 768 pixels),
++         * so the width is the widest Xbox mode that fits in it. */
++        static const uint32_t widths[] = { 1920, 1280, 720, 640 };
++        uint32_t bpp = (format == 0x10 || format == 0x11) ? 2 : 4;
++        uint32_t w = pitch / bpp, h, i;
++        for (i = 0; i < sizeof widths / sizeof widths[0]; i++)
++            if (w >= widths[i]) { w = widths[i]; break; }
++        h = w >= 1920 ? 1080 : w >= 1280 ? 720 : 480;
++        /* A 16:9 TV shows a widescreen title's 720x480 (and any HD mode)
++         * full width; 640x480 is what a title that ignores the setting
++         * draws, and that stays 4:3 (pillarboxed). */
++        int wide = xbox_VideoWidescreen() && w > 640;
+ 
+         /* AvSetDisplayMode reports the scanout address the way the CRTC wants
+          * it -- a physical address. The window has to read it the way the CPU
+@@ -2350,6 +2518,8 @@ static void bridge_AvSetDisplayMode(void)
+             fb_va = XBOX_CONTIG_BASE + fb_va;
+ 
+         xbox_FramebufferWindowSet(fb_va, pitch);
++        if (w)
++            xbox_FramebufferWindowSetMode(w, h, wide);
+         xbox_FramebufferWindowStart();
+ 
+         /* Record the resolved address, not the physical one the title passed.
+@@ -2698,6 +2868,30 @@ static int kernel_raise_interrupt(uint32_t vector)
  
  static volatile LONG g_vblank_total;
  
@@ -1225,7 +1397,7 @@ index 965dd08..d51377c 100644
  uint32_t xbox_VblankCount(void)
  {
      return (uint32_t)g_vblank_total;
-@@ -2706,18 +2852,26 @@ uint32_t xbox_VblankCount(void)
+@@ -2706,18 +2900,26 @@ uint32_t xbox_VblankCount(void)
  static void kernel_vblank_tick(void)
  {
      static int enabled = -1;
@@ -1256,7 +1428,7 @@ index 965dd08..d51377c 100644
      InterlockedIncrement(&g_vblank_total);
  
      if (!xbox_GetConnectedInterrupt(NV2A_VECTOR))
-@@ -3023,10 +3177,14 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
+@@ -3023,10 +3225,14 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
          long long now;
          int i;
  
@@ -1273,7 +1445,7 @@ index 965dd08..d51377c 100644
  
          for (i = 0; i < XBOX_MAX_TIMERS; i++) {
              uint32_t dpc, fired_va;
-@@ -3083,7 +3241,7 @@ static void kernel_set_timer(uint32_t timer_va, long long due_100ns,
+@@ -3083,7 +3289,7 @@ static void kernel_set_timer(uint32_t timer_va, long long due_100ns,
      if (free_slot >= 0) {
          g_timers[free_slot].timer_va  = timer_va;
          g_timers[free_slot].dpc_va    = dpc_va;
@@ -1282,7 +1454,7 @@ index 965dd08..d51377c 100644
          g_timers[free_slot].period_ms = period_ms;
      }
      LeaveCriticalSection(&g_timer_lock);
-@@ -3923,6 +4081,9 @@ static int bridge_handle_is_async(uint32_t token)
+@@ -3923,6 +4129,9 @@ static int bridge_handle_is_async(uint32_t token)
      return 0;
  }
  
@@ -1292,7 +1464,7 @@ index 965dd08..d51377c 100644
  /* Off unless RECOMP_ASYNC_IO is set, so the two behaviours stay comparable
   * rather than one being swapped in blind. */
  static int bridge_async_io_enabled(void)
-@@ -3951,6 +4112,8 @@ static void bridge_NtReadFile(void)
+@@ -3951,6 +4160,8 @@ static void bridge_NtReadFile(void)
          g_eax = 0xC0000005u;                 /* STATUS_ACCESS_VIOLATION */
          return;
      }
@@ -1301,7 +1473,7 @@ index 965dd08..d51377c 100644
      if (offset_va) {
          off.LowPart  = BRIDGE_MEM32(offset_va);
          off.HighPart = (LONG)BRIDGE_MEM32(offset_va + 4);
-@@ -3958,11 +4121,19 @@ static void bridge_NtReadFile(void)
+@@ -3958,11 +4169,19 @@ static void bridge_NtReadFile(void)
      }
      g_eax = (uint32_t)xbox_NtReadFile(handle, NULL, NULL, NULL, &ios,
                  XBOX_TO_NATIVE(buffer_va), length, poff);
@@ -1323,7 +1495,7 @@ index 965dd08..d51377c 100644
          const uint8_t *p = (const uint8_t *)XBOX_TO_NATIVE(buffer_va);
          uint32_t got = (uint32_t)ios.Information;
          /* The offset matters as much as the length. A title streaming a pack
-@@ -3985,9 +4156,35 @@ static void bridge_NtReadFile(void)
+@@ -3985,9 +4204,35 @@ static void bridge_NtReadFile(void)
                      got > 2 ? p[2] : 0, got > 3 ? p[3] : 0);
          fflush(stderr);
      }
@@ -1359,7 +1531,7 @@ index 965dd08..d51377c 100644
  
      /* An asynchronous request returns STATUS_PENDING, even when the data was
       * already there.
-@@ -4036,6 +4233,20 @@ static void bridge_NtWriteFile(void)
+@@ -4036,6 +4281,20 @@ static void bridge_NtWriteFile(void)
      bridge_write_iostatus(iostatus, ios.Status, (uint32_t)ios.Information);
      bridge_complete_file_io(STACK_ARG(1), STACK_ARG(2), STACK_ARG(3),
                              iostatus);
@@ -1380,7 +1552,16 @@ index 965dd08..d51377c 100644
  }
  
  /* ── NtQueryInformationFile (ordinal 211, 5 args = 20 bytes) */
-@@ -10041,6 +10252,91 @@ static void kernel_thunk_dispatch(void)
+@@ -8449,7 +8708,7 @@ static void bridge_PsCreateSystemThread(void)
+                     bridge_run_thread_inline(fn, start_context1, start_context2);
+                 } else {
+                     bridge_spawn_guest_thread(fn, start_context1, start_context2,
+-                                              stack_top, xbox_handle_ptr, 0);
++                                              stack_top, xbox_handle_ptr, 0, 0);
+                 }
+             }
+         } else {
+@@ -10041,6 +10300,91 @@ static void kernel_thunk_dispatch(void)
      (void)held;
  }
  
@@ -1472,7 +1653,7 @@ index 965dd08..d51377c 100644
  static void kernel_thunk_dispatch_body(void)
  {
      int slot = g_kernel_dispatch_slot;
-@@ -10147,7 +10443,19 @@ static void kernel_thunk_dispatch_body(void)
+@@ -10147,7 +10491,19 @@ static void kernel_thunk_dispatch_body(void)
          }
      }
  
@@ -1494,10 +1675,39 @@ index 965dd08..d51377c 100644
      } else {
          /* No specific bridge - return 0. Warn once per ordinal rather than
 diff --git a/src/kernel/kernel_hal.c b/src/kernel/kernel_hal.c
-index 3a09ca8..028893b 100644
+index 3a09ca8..e09d521 100644
 --- a/src/kernel/kernel_hal.c
 +++ b/src/kernel/kernel_hal.c
-@@ -1060,6 +1060,70 @@ uint64_t xbox_ReadTimeStampCounter(void)
+@@ -733,10 +733,24 @@ VOID __stdcall xbox_AvSendTVEncoderOption(
+          *
+          * HDTV pack keeps 480p/720p available to titles that offer them;
+          * NTSC-M and 60Hz are the North American retail default, and match
+-         * the region reported by ExQueryNonVolatileSetting. */
+-        *Result = AV_PACK_HDTV
+-                | (AV_STANDARD_NTSC_M << AV_STANDARD_SHIFT)
+-                | AV_REFRESH_60Hz;
++         * the region reported by ExQueryNonVolatileSetting.
++         *
++         * The dashboard's video settings ride along in the high word, as the
++         * real kernel does it: XC_VIDEO keeps widescreen (0x00010000), 480p
++         * (0x00080000) etc. in the same bits as the mode rows. D3D only
++         * takes a row whose flags the TV allows, so without them a
++         * widescreen 480p CreateDevice found no row and failed (MA2 then
++         * crashed on the missing device). */
++        {
++            ULONG video = 0;
++            if (xbox_ExQueryNonVolatileSetting(XC_VIDEO, NULL, &video,
++                                               sizeof(video), NULL) != STATUS_SUCCESS)
++                video = 0;
++            *Result = AV_PACK_HDTV
++                    | (AV_STANDARD_NTSC_M << AV_STANDARD_SHIFT)
++                    | AV_REFRESH_60Hz
++                    | (video & 0xFFFF0000u);
++        }
+         break;
+ 
+     case AV_OPTION_QUERY_MODE:
+@@ -1060,6 +1074,70 @@ uint64_t xbox_ReadTimeStampCounter(void)
      }
  }
  
@@ -1627,6 +1837,49 @@ index e66e3de..df01bde 100644
  
      return STATUS_SUCCESS;
  }
+diff --git a/src/kernel/kernel_xbox.c b/src/kernel/kernel_xbox.c
+index 4ebdfb9..4e2a872 100644
+--- a/src/kernel/kernel_xbox.c
++++ b/src/kernel/kernel_xbox.c
+@@ -10,8 +10,20 @@
+  */
+ 
+ #include "kernel.h"
++#include <stdlib.h>
+ #include <string.h>
+ 
++int xbox_VideoWidescreen(void)
++{
++    static int ws = -1;
++
++    if (ws < 0) {
++        const char *e = getenv("RECOMP_WIDESCREEN");
++        ws = !(e && *e == '0');
++    }
++    return ws;
++}
++
+ /* ============================================================================
+  * Exported Data Objects
+  *
+@@ -145,9 +157,15 @@ NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
+         break;
+ 
+     case XC_VIDEO:
+-        /* NTSC with widescreen and HDTV support enabled */
++        /* Widescreen with 480p allowed (a 16:9 TV on component), or nothing
++         * set (4:3). The flags live in the high word: this used to answer
++         * WIDESCREEN | HDTV in the low bits, which XGetVideoFlags shifts
++         * away, so titles saw a plain 4:3 TV. */
+         if (ValueLength >= sizeof(ULONG)) {
+-            *(PULONG)Value = XC_VIDEO_FLAGS_WIDESCREEN | XC_VIDEO_FLAGS_HDTV;
++            *(PULONG)Value = xbox_VideoWidescreen()
++                ? (ULONG)(XC_VIDEO_FLAGS_WIDESCREEN | XC_VIDEO_FLAGS_HDTV_480p)
++                      << XC_VIDEO_FLAGS_SHIFT
++                : 0;
+             if (Type) *Type = 4; /* REG_DWORD */
+             if (ResultLength) *ResultLength = sizeof(ULONG);
+         }
 diff --git a/src/kernel/nv2a_backend.h b/src/kernel/nv2a_backend.h
 index 327f01d..b509c37 100644
 --- a/src/kernel/nv2a_backend.h
@@ -2739,10 +2992,10 @@ index 4e86a08..67d708c 100644
      # The framebuffer window on POSIX hosts: SDL2, on the process main thread
      # (fb_present_sdl.c), which then also pumps the events the game
 diff --git a/src/video/fb_present.c b/src/video/fb_present.c
-index b26edfe..ce39f95 100644
+index b26edfe..ec5857e 100644
 --- a/src/video/fb_present.c
 +++ b/src/video/fb_present.c
-@@ -30,6 +30,7 @@
+@@ -30,12 +30,20 @@
   * is the thing that receives the keys, so that is what has to remember
   * them. */
  #include "keyboard.h"   /* src/input */
@@ -2750,7 +3003,47 @@ index b26edfe..ce39f95 100644
  
  extern ptrdiff_t xbox_GetMemoryOffset(void);
  
-@@ -69,6 +70,19 @@ void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch)
+ static volatile LONG s_fb_running;
+-static uint32_t      s_fb_va, s_fb_pitch, s_fb_width = 640, s_fb_height = 480;
++static uint32_t      s_fb_va, s_fb_pitch;
++static volatile uint32_t s_fb_width = 640, s_fb_height = 480;
+ static uint32_t     *s_rgb;           /* converted 32-bit copy for GDI */
++/* The largest display mode an Xbox title can set (1080i). The buffers are
++ * that big from the start, so a later mode change needs no reallocation. */
++#define FB_MAX_W 1920
++#define FB_MAX_H 1080
++/* The shape of the TV the display mode is meant for (see SetMode). */
++static volatile uint32_t s_fb_aspect_w = 4, s_fb_aspect_h = 3;
+ 
+ /* A finished frame, taken at the flip and shown until the next one.
+  *
+@@ -64,11 +72,45 @@ void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch)
+         s_fb_pitch = pitch;
+ }
+ 
++/* The display mode the title set (AvSetDisplayMode): its size, and whether
++ * it is meant for a 16:9 TV. Xbox pixels are not square -- 640x480 and
++ * 720x480 both fill a 4:3 TV, and a widescreen title fills a 16:9 one with
++ * the same 720x480 -- so the window letterboxes to the TV's shape, never to
++ * width:height. */
++void xbox_FramebufferWindowSetMode(uint32_t width, uint32_t height, int widescreen)
++{
++    if (width && height && width <= FB_MAX_W && height <= FB_MAX_H) {
++        s_fb_width = width;
++        s_fb_height = height;
++    }
++    s_fb_aspect_w = widescreen ? 16 : 4;
++    s_fb_aspect_h = widescreen ? 9 : 3;
++}
++
++void xbox_FramebufferWindowDisplayAspect(uint32_t *aw, uint32_t *ah)
++{
++    *aw = s_fb_aspect_w;
++    *ah = s_fb_aspect_h;
++}
++
+ /* Vertical anti-aliasing factor of the surface being shown: 2 for 2x2, where
+  * the surface has twice the rows as well as twice the columns, and 1 for
   * everything else (2x1 included). Only the pushbuffer executor knows it. */
  static uint32_t s_fb_aa_sy = 1;
  
@@ -2770,7 +3063,17 @@ index b26edfe..ce39f95 100644
  void xbox_FramebufferWindowSetAA(uint32_t sy)
  {
      s_fb_aa_sy = sy ? sy : 1;
-@@ -145,16 +159,84 @@ void xbox_FramebufferWindowFrameStats(uint32_t draws)
+@@ -87,8 +129,7 @@ void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
+         return;                       /* pinned: leave the old path alone */
+     next = (s_present_idx == 0) ? 1 : 0;
+     if (!s_present[next]) {
+-        s_present[next] = (uint32_t *)calloc((size_t)s_fb_width * s_fb_height,
+-                                             4);
++        s_present[next] = (uint32_t *)calloc((size_t)FB_MAX_W * FB_MAX_H, 4);
+         if (!s_present[next])
+             return;
+     }
+@@ -145,16 +186,86 @@ void xbox_FramebufferWindowFrameStats(uint32_t draws)
      InterlockedExchange(&s_frame_draws, (LONG)draws);
  }
  
@@ -2798,12 +3101,14 @@ index b26edfe..ce39f95 100644
 +    }
 +}
 +
-+/* Draw the frame scaled to the client area at the title's 4:3 aspect, with
-+ * black bars, so the window can be resized or made fullscreen. */
++/* Draw the frame scaled to the client area at the display mode's TV shape
++ * (4:3 or 16:9), with black bars, so the window can be resized or made
++ * fullscreen. */
 +static void fb_blit(HWND hwnd, HDC hdc, const BITMAPINFO *bi, const uint32_t *px)
 +{
 +    RECT c;
 +    int cw, ch, dw, dh, dx, dy;
++    uint32_t aw = s_fb_aspect_w, ah = s_fb_aspect_h;
 +
 +    GetClientRect(hwnd, &c);
 +    cw = c.right - c.left;
@@ -2811,10 +3116,10 @@ index b26edfe..ce39f95 100644
 +    if (cw <= 0 || ch <= 0)
 +        return;
 +    dw = cw;
-+    dh = (int)((long long)cw * s_fb_height / s_fb_width);
++    dh = (int)((long long)cw * ah / aw);
 +    if (dh > ch) {
 +        dh = ch;
-+        dw = (int)((long long)ch * s_fb_width / s_fb_height);
++        dw = (int)((long long)ch * aw / ah);
 +    }
 +    dx = (cw - dw) / 2;
 +    dy = (ch - dh) / 2;
@@ -2855,7 +3160,7 @@ index b26edfe..ce39f95 100644
          xbox_InputKeySet((int)w, 1);
          /* RECOMP_KEY_TRACE: each key as it arrives, edge-triggered.
           *
-@@ -286,7 +368,25 @@ static DWORD WINAPI fb_thread(LPVOID unused)
+@@ -286,7 +397,27 @@ static DWORD WINAPI fb_thread(LPVOID unused)
          wc.lpszClassName = "XboxRecompFramebuffer";
          RegisterClassA(&wc);
      }
@@ -2865,24 +3170,26 @@ index b26edfe..ce39f95 100644
 +        const char *e = getenv("RECOMP_WINDOW_SCALE");
 +        double sc = e ? atof(e) : 2.0;
 +        RECT wa;
++        /* The mode's lines, at its TV shape: 640x480 4:3, 853x480 16:9. */
++        double vw = (double)s_fb_height * s_fb_aspect_w / s_fb_aspect_h;
 +        if (sc < 1.0) sc = 1.0;
 +        if (sc > 6.0) sc = 6.0;
 +        /* Shrink to fit the desktop's work area (a 2x window does not fit a
 +         * 1080p screen once the title bar is counted). */
 +        if (SystemParametersInfoA(SPI_GETWORKAREA, 0, &wa, 0)) {
 +            double fit_h = (wa.bottom - wa.top - 64) / (double)s_fb_height;
-+            double fit_w = (wa.right - wa.left - 32) / (double)s_fb_width;
++            double fit_w = (wa.right - wa.left - 32) / vw;
 +            double fit = fit_h < fit_w ? fit_h : fit_w;
 +            if (fit >= 1.0 && sc > fit)
 +                sc = fit;
 +        }
 +        r.left = 0; r.top = 0;
-+        r.right = (LONG)(s_fb_width * sc); r.bottom = (LONG)(s_fb_height * sc);
++        r.right = (LONG)(vw * sc); r.bottom = (LONG)(s_fb_height * sc);
 +    }
      AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
      hwnd = CreateWindowExA(0, "XboxRecompFramebuffer", "Xbox Recomp - Framebuffer",
                             WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-@@ -298,6 +398,14 @@ static DWORD WINAPI fb_thread(LPVOID unused)
+@@ -298,6 +429,14 @@ static DWORD WINAPI fb_thread(LPVOID unused)
          return 0;
      }
      hdc = GetDC(hwnd);
@@ -2897,18 +3204,35 @@ index b26edfe..ce39f95 100644
  
      memset(&bi, 0, sizeof(bi));
      bi.bmiHeader.biSize        = sizeof(bi.bmiHeader);
-@@ -318,7 +426,9 @@ static DWORD WINAPI fb_thread(LPVOID unused)
+@@ -307,10 +446,10 @@ static DWORD WINAPI fb_thread(LPVOID unused)
+     bi.bmiHeader.biBitCount    = 32;
+     bi.bmiHeader.biCompression = BI_RGB;
+ 
+-    s_rgb = (uint32_t *)calloc((size_t)s_fb_width * s_fb_height, 4);
++    s_rgb = (uint32_t *)calloc((size_t)FB_MAX_W * FB_MAX_H, 4);
+ 
+-    fprintf(stderr, "  [FBWIN] framebuffer window open (%ux%u)\n",
+-            s_fb_width, s_fb_height);
++    fprintf(stderr, "  [FBWIN] framebuffer window open (%ux%u, %u:%u)\n",
++            s_fb_width, s_fb_height, s_fb_aspect_w, s_fb_aspect_h);
+ 
+     while (InterlockedCompareExchange(&s_fb_running, 1, 1)) {
+         MSG msg;
+@@ -318,7 +457,12 @@ static DWORD WINAPI fb_thread(LPVOID unused)
              TranslateMessage(&msg);
              DispatchMessageA(&msg);
          }
 -        if (s_present_idx >= 0 && s_rgb) {
++        /* The display mode can change under us (SetMode). */
++        bi.bmiHeader.biWidth  = (LONG)s_fb_width;
++        bi.bmiHeader.biHeight = -(LONG)s_fb_height;
 +        if (s_gpu_present) {
 +            /* The back end draws this window itself. */
 +        } else if (s_present_idx >= 0 && s_rgb) {
              /* A finished frame, published by the flip. Copied into s_rgb so
               * the dump path and GDI see one consistent image even if the
               * next flip lands mid-blit. */
-@@ -326,18 +436,14 @@ static DWORD WINAPI fb_thread(LPVOID unused)
+@@ -326,18 +470,14 @@ static DWORD WINAPI fb_thread(LPVOID unused)
              if (s_present[idx])
                  memcpy(s_rgb, s_present[idx],
                         (size_t)s_fb_width * s_fb_height * 4);
@@ -2929,7 +3253,7 @@ index b26edfe..ce39f95 100644
          }
          {
              /* One dump a few seconds in, so the title has had time to render
-@@ -369,9 +475,12 @@ static DWORD WINAPI fb_thread(LPVOID unused)
+@@ -369,9 +509,12 @@ static DWORD WINAPI fb_thread(LPVOID unused)
              if (now - t0 >= 1000) {
                  LONG f = s_flips;
                  wchar_t tb[128];
@@ -2944,12 +3268,30 @@ index b26edfe..ce39f95 100644
                  tb[127] = 0;
                  SetWindowTextW(hwnd, tb);
                  t0 = now; f0 = f;
+diff --git a/src/video/fb_present_sdl.c b/src/video/fb_present_sdl.c
+index 87b7ef7..e6c21cc 100644
+--- a/src/video/fb_present_sdl.c
++++ b/src/video/fb_present_sdl.c
+@@ -101,6 +101,13 @@ void xbox_FramebufferWindowSetAA(uint32_t sy) { (void)sy; }
+ /* The window is opened by xbox_HostWindowMain, on the main thread. */
+ void xbox_FramebufferWindowStart(void) {}
+ 
++/* ponytail: the SDL window shows the surface at its own pixel size; the
++ * display mode's TV shape (16:9 for a widescreen title) is not applied yet. */
++void xbox_FramebufferWindowSetMode(uint32_t width, uint32_t height, int widescreen)
++{
++    (void)width; (void)height; (void)widescreen;
++}
++
+ /* The back slot is filled: make it the ready one. An unshown ready frame is
+  * overwritten (dropped), never waited for. */
+ static void publish(uint32_t bpp)
 diff --git a/src/video/nv2a_d3d11.c b/src/video/nv2a_d3d11.c
 new file mode 100644
-index 0000000..cc7934d
+index 0000000..7540b35
 --- /dev/null
 +++ b/src/video/nv2a_d3d11.c
-@@ -0,0 +1,2788 @@
+@@ -0,0 +1,2793 @@
 +/*
 + * nv2a_d3d11.c -- a Direct3D 11 render back end for the pushbuffer executor.
 + *
@@ -3983,6 +4325,7 @@ index 0000000..cc7934d
 +extern HWND xbox_FramebufferWindowHwnd(void);
 +extern void xbox_FramebufferWindowGpuPresent(int on);
 +extern void xbox_FramebufferWindowDisplaySize(uint32_t *w, uint32_t *h);
++extern void xbox_FramebufferWindowDisplayAspect(uint32_t *aw, uint32_t *ah);
 +
 +static const char s_hlsl_blit[] =
 +"Texture2D BT : register(t0); SamplerState BS : register(s0);\n"
@@ -5531,12 +5874,16 @@ index 0000000..cc7934d
 +    {
 +        static const float black[4] = { 0, 0, 0, 1 };
 +        float sx, sy, vw, vh, ax, ay;
++        uint32_t aw = 4, ah = 3;
 +        xbox_FramebufferWindowDisplaySize(&dw, &dh);
++        xbox_FramebufferWindowDisplayAspect(&aw, &ah);
 +        if (!dw || !dh) { dw = 640; dh = 480; }
-+        /* The display mode's shape, letterboxed into the client area. */
++        /* The display mode's TV shape (4:3, or 16:9 for a widescreen
++         * title's 720x480), letterboxed into the client area. Not dw:dh:
++         * Xbox pixels are not square. */
 +        vw = (float)cw;
-+        vh = vw * dh / dw;
-+        if (vh > ch) { vh = (float)ch; vw = vh * dw / dh; }
++        vh = vw * ah / aw;
++        if (vh > ch) { vh = (float)ch; vw = vh * aw / ah; }
 +        ax = (cw - vw) * 0.5f;
 +        ay = (ch - vh) * 0.5f;
 +        sx = (float)(dw * t->aa_sx) / (float)t->width;
