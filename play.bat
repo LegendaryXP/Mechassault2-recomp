@@ -9,7 +9,7 @@ rem   Wheel / Q = cycle weapons     Middle click / Z = zoom (tank)
 rem   E = action    F = enter/exit vehicle    G / R = drop cargo (VTOL)
 rem   1-4 = cycle cargo (VTOL)      Tab = scoreboard / tutorial text
 rem   Menus: arrows move, Enter selects, Backspace goes back, Esc pauses
-rem   Click the game window to use the mouse; F9 or Esc gives it back
+rem   F9 locks the mouse to the game (camera control); F9 or Esc frees it
 rem   F11 or Alt+Enter = borderless fullscreen on/off
 rem   close the window to quit
 rem
