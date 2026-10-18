@@ -108,3 +108,12 @@
   - Fix (toolkit, committed on ma2-bringup): AvailablePages = 64 MB - 2 MB kernel - image - live heap (xbox_HeapInUseBytes) - contiguous in use. RECOMP_MM_HOST_STATS=1 = old behaviour.
   - Run 40 (420 s, START/A script): contiguous use levels off at ~46 MB; title -> menu -> Campaign -> mission 1 loads and PLAYS: mech in city level, HUD/radar/weapon panel, tutorial prompts ("Pull the Right trigger to fire lasers", mortar hints), pause menu (Resume Game/Controls/Volume/Video Settings/Restart Mission/Quit, "Xbox Live: Sign-in Failed"). ~1.5 fps in-mission with BMP frame dumps on (analysis/fb_run40/sheet_end.png).
   - Idle-fence fallback fires a handful of times per run (4 in run 40).
+- 2026-10-17: LIVE WINDOW + PERFORMANCE (round 1)
+  - Profiler: MA2_PROFILE=1 (src/ma2_profile.c, samples every thread's RIP each 1 ms; MA2_PROFILE_DELAY/SECS/OUT) + /MAP + scripts/profile_map.py. scripts/threads.ps1 = per-thread CPU.
+  - Finding: game code is cheap; main thread ~75% blocked on the emulated GPU. Executor thread did vertex shading (nv2a_vsh_run ~18%) and nearly all pixel work (xf_rows + combiners + sample_tex) alone; 11 raster threads idle (pool only took triangles >= 8192 px).
+  - Toolkit (ma2-bringup branch): vertex cache per batch, parallel unique-vertex transform, batch-deferred rasterisation on the pool (rows interleaved by thread, draw order kept). Gameplay ~1 -> ~3.2 fps (with BMP dumps), ~3.7 fps with the window and no dumps.
+  - Tried and reverted: /arch:AVX2 /fp:fast /Ob3 on xbox_kernel (~9% slower). timeBeginPeriod(1) kept (harmless, no measurable change). Fence wrapper now spin-yields before sleeping.
+  - Debug traces (--trace-functions) were costly: regenerated with an empty trace list for play builds.
+  - Remaining cost: ~1.1 us per pixel (interpreted register combiners, 4x overdraw, ~1.26 M px/frame). Next real step = GPU back end (combiners -> D3D11 pixel shaders) or specialised software combiners.
+  - Window: RECOMP_FB_WINDOW=1, scale to fit, letterboxed resize, F11 fullscreen, RECOMP_FB_WINDOW_EXIT=1. Title bar shows FPS.
+  - play.bat (+ C:\Mechassault2\Play MechAssault 2.bat) launches with all required switches; logs to logs\.

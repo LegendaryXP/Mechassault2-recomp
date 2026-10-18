@@ -155,6 +155,15 @@ void sub_0040F510(void)
             /* Wait here rather than in the lifted loop, which never looks
              * again once the executor has gone idle: up to 2 s, forcing the
              * fence once the GPU has had nothing to do for 20 ms. */
+            /* Most waits end within microseconds once the executor reaches
+             * the release, so spin briefly before paying for a sleep. */
+            {
+                int spin;
+                for (spin = 0; spin < 2000 && !ma2_fence_done(dev, sem, fence); spin++)
+                    YieldProcessor();
+                for (spin = 0; spin < 200 && !ma2_fence_done(dev, sem, fence); spin++)
+                    SwitchToThread();
+            }
             for (ms = 0; ms < 2000 && !ma2_fence_done(dev, sem, fence); ms++) {
                 idle_ms = (put && get && *put == *get) ? idle_ms + 1 : 0;
                 if (idle_ms >= 20)

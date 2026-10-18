@@ -303,6 +303,282 @@ index e66e3de..df01bde 100644
  
      return STATUS_SUCCESS;
  }
+diff --git a/src/kernel/nv2a_pb_exec.c b/src/kernel/nv2a_pb_exec.c
+index 1280565..ec7bde5 100644
+--- a/src/kernel/nv2a_pb_exec.c
++++ b/src/kernel/nv2a_pb_exec.c
+@@ -2388,12 +2388,65 @@ static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
+ #define NV_RASTER_MAX_THREADS 16
+ #define NV_RASTER_MT_MIN_PIXELS 8192
+ 
++/* Batch-level rasterisation.
++ *
++ * Splitting one triangle's rows across threads only pays for big triangles,
++ * and a 3D scene is thousands of small ones: in MechAssault 2's first mission
++ * the executor thread did nearly all the pixel work itself while eleven pool
++ * threads sat idle, and the title ran at about one frame a second waiting for
++ * it. So a program batch queues its triangles instead (each with its own
++ * copy of the three vertices, since clipping hands over temporaries) and the
++ * whole queue is rasterised at the end of the batch, every thread taking the
++ * rows y == k (mod n) of every triangle in submission order. A pixel is still
++ * written by exactly one thread, in the order the title drew it, so the image
++ * is the same as the one-thread result. Render state cannot change inside a
++ * batch, so deferring to its end is safe. RECOMP_NO_BATCH_RASTER=1 turns it
++ * off. */
++#define NV_DEFER_MAX 2048
++static XfTri *s_dq;
++static Nv2aVshOutput *s_dv;
++static int s_dq_n, s_defer_on;
++static long long s_dq_px;
++
++/* Parallel vertex transform (see raster_batch_program). */
++static Nv2aVshOutput *s_xf;
++static int transform_vertex(uint32_t index, Nv2aVshOutput *out);
++static uint32_t *s_vuniq;                   /* batch positions to transform */
++static uint32_t s_vuniq_n;
++static volatile int s_vfail;
++
++static void xf_transform_range(int k, int n)
++{
++    uint32_t per = (s_vuniq_n + (uint32_t)n - 1) / (uint32_t)n;
++    uint32_t lo = (uint32_t)k * per, hi = lo + per, j;
++    if (hi > s_vuniq_n) hi = s_vuniq_n;
++    for (j = lo; j < hi; j++) {
++        uint32_t i = s_vuniq[j];
++        if (!transform_vertex(s_gpu.idx[i], &s_xf[i])) {
++            s_vfail = 1;
++            return;
++        }
++    }
++}
++
++static void xf_queue_rows(int k, int n, XfCount *cnt)
++{
++    int t;
++    for (t = 0; t < s_dq_n; t++) {
++        const XfTri *T = &s_dq[t];
++        int y0 = T->miny + (((k - T->miny) % n) + n) % n;
++        if (y0 < T->maxy)
++            xf_rows(T, y0, n, cnt);
++    }
++}
++
+ #if defined(_WIN32)
+ static struct {
+     int n;                                  /* threads incl. the caller */
+     HANDLE start[NV_RASTER_MAX_THREADS], done;
+     volatile LONG pending;
+     const XfTri *tri;
++    int queue;                              /* 1: rasterise s_dq, 2: transform s_vuniq */
+     XfCount cnt[NV_RASTER_MAX_THREADS];
+ } s_pool;
+ 
+@@ -2403,7 +2456,12 @@ static DWORD WINAPI raster_worker(LPVOID arg)
+     for (;;) {
+         WaitForSingleObject(s_pool.start[k], INFINITE);
+         memset(&s_pool.cnt[k], 0, sizeof s_pool.cnt[k]);
+-        xf_rows(s_pool.tri, s_pool.tri->miny + k, s_pool.n, &s_pool.cnt[k]);
++        if (s_pool.queue == 2)
++            xf_transform_range(k, s_pool.n);
++        else if (s_pool.queue)
++            xf_queue_rows(k, s_pool.n, &s_pool.cnt[k]);
++        else
++            xf_rows(s_pool.tri, s_pool.tri->miny + k, s_pool.n, &s_pool.cnt[k]);
+         if (InterlockedDecrement(&s_pool.pending) == 0)
+             SetEvent(s_pool.done);
+     }
+@@ -2462,11 +2520,83 @@ static void xf_rows_parallel(const XfTri *T, XfCount *total)
+         total->zpass += s_pool.cnt[k].zpass;
+     }
+ }
++/* Rasterise and empty the batch queue. */
++static void xf_defer_flush(void)
++{
++    XfCount total = {0, 0, 0};
++    int n = raster_pool_size(), k, t;
++
++    if (!s_dq_n)
++        return;
++    if (n <= 1 || s_dq_px < NV_RASTER_MT_MIN_PIXELS) {
++        for (t = 0; t < s_dq_n; t++)
++            xf_rows(&s_dq[t], s_dq[t].miny, 1, &total);
++    } else {
++        XfCount mine = {0, 0, 0};
++        s_pool.queue = 1;
++        s_pool.pending = n - 1;
++        for (k = 0; k < n - 1; k++)
++            SetEvent(s_pool.start[k]);
++        xf_queue_rows(n - 1, n, &mine);
++        WaitForSingleObject(s_pool.done, INFINITE);
++        s_pool.queue = 0;
++        total = mine;
++        for (k = 0; k < n - 1; k++) {
++            total.depth_fail += s_pool.cnt[k].depth_fail;
++            total.pixels += s_pool.cnt[k].pixels;
++            total.zpass += s_pool.cnt[k].zpass;
++        }
++    }
++    s_gpu.xf_depth_fail += total.depth_fail;
++    s_gpu.xf_pixels += total.pixels;
++    s_gpu.zpass_count += total.zpass;
++    s_dq_n = 0;
++    s_dq_px = 0;
++}
++/* Transform s_vuniq; 0 if any vertex had no program to run. */
++static int xf_transform_all(void)
++{
++    int n = raster_pool_size(), k;
++
++    s_vfail = 0;
++    if (n <= 1 || s_vuniq_n < 256) {
++        xf_transform_range(0, 1);
++    } else {
++        s_pool.queue = 2;
++        s_pool.pending = n - 1;
++        for (k = 0; k < n - 1; k++)
++            SetEvent(s_pool.start[k]);
++        xf_transform_range(n - 1, n);
++        WaitForSingleObject(s_pool.done, INFINITE);
++        s_pool.queue = 0;
++    }
++    return !s_vfail;
++}
+ #else
+ static void xf_rows_parallel(const XfTri *T, XfCount *total)
+ {
+     xf_rows(T, T->miny, 1, total);
+ }
++
++static int xf_transform_all(void)
++{
++    s_vfail = 0;
++    xf_transform_range(0, 1);
++    return !s_vfail;
++}
++
++static void xf_defer_flush(void)
++{
++    XfCount total = {0, 0, 0};
++    int t;
++    for (t = 0; t < s_dq_n; t++)
++        xf_rows(&s_dq[t], s_dq[t].miny, 1, &total);
++    s_gpu.xf_depth_fail += total.depth_fail;
++    s_gpu.xf_pixels += total.pixels;
++    s_gpu.zpass_count += total.zpass;
++    s_dq_n = 0;
++    s_dq_px = 0;
++}
+ #endif
+ 
+ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
+@@ -2564,6 +2694,20 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
+     s_gpu.xf_drawn++;
+     T.inv_area = 1.0f / area;
+ 
++    if (s_defer_on) {
++        Nv2aVshOutput *dv;
++        if (s_dq_n == NV_DEFER_MAX)
++            xf_defer_flush();
++        dv = &s_dv[s_dq_n * 3];
++        dv[0] = *va; dv[1] = *vb; dv[2] = *vc;
++        T.va = &dv[0]; T.vb = &dv[1]; T.vc = &dv[2];
++        T.a = dv[0].pos; T.b = dv[1].pos; T.c = dv[2].pos;
++        s_dq_px += (long long)(T.maxx - T.minx) * (T.maxy - T.miny);
++        s_dq[s_dq_n++] = T;
++        s_gpu.tris_drawn++;
++        note_drawn();
++        return;
++    }
+     xf_rows_parallel(&T, &cnt);
+     s_gpu.xf_depth_fail += cnt.depth_fail;
+     s_gpu.xf_pixels += cnt.pixels;
+@@ -2664,8 +2808,6 @@ static void raster_xf_clipped(const Nv2aVshOutput *a, const Nv2aVshOutput *b,
+ 
+ /* About 7 MB, so allocated by the first batch that transforms rather than
+  * carried in every build that never turns the executor on. */
+-static Nv2aVshOutput *s_xf;
+-
+ /* Does this batch run the title's vertex program? RECOMP_NO_VSH turns the
+  * interpreter off (the batch then falls to the screen-space heuristics). */
+ static int batch_uses_program(void)
+@@ -2724,12 +2866,49 @@ static void xf_set_viewport(void)
+ static void raster_batch_program(void)
+ {
+     uint32_t i, n = s_gpu.idx_count;
+-
++    /* Indexed lists and strips name the same vertex several times, and each
++     * name used to run the whole vertex program again. The result depends
++     * only on the index within a batch (attributes, constants and the
++     * program cannot change mid-batch), so a repeat copies the first
++     * result. RECOMP_NO_VCACHE=1 transforms every index. */
++    enum { VC_BITS = 12, VC_SIZE = 1 << VC_BITS };
++    static uint32_t vc_idx[VC_SIZE], vc_pos[VC_SIZE], vc_gen[VC_SIZE], gen;
++    static int no_vcache = -1, no_defer = -1;
++    static uint32_t *s_vfirst;
++
++    if (no_vcache < 0) {
++        no_vcache = getenv("RECOMP_NO_VCACHE") != NULL;
++        no_defer = getenv("RECOMP_NO_BATCH_RASTER") != NULL;
++    }
+     if (!s_xf && !(s_xf = (Nv2aVshOutput *)calloc(NV_MAX_INDICES, sizeof *s_xf)))
+         return;
++    if (++gen == 0) {                                  /* wrapped: forget all */
++        memset(vc_gen, 0, sizeof vc_gen);
++        gen = 1;
++    }
++    if (!s_vuniq && !(s_vuniq = (uint32_t *)malloc(NV_MAX_INDICES * sizeof *s_vuniq)))
++        return;
++    if (!s_vfirst && !(s_vfirst = (uint32_t *)malloc(NV_MAX_INDICES * sizeof *s_vfirst)))
++        return;
++    /* Unique vertices first (on the pool when there are enough of them),
++     * then the repeats copied from their first occurrence. */
++    s_vuniq_n = 0;
++    for (i = 0; i < n; i++) {
++        uint32_t idx = s_gpu.idx[i];
++        uint32_t h = (idx * 2654435761u) >> (32 - VC_BITS);
++        if (!no_vcache && vc_gen[h] == gen && vc_idx[h] == idx) {
++            s_vfirst[i] = vc_pos[h];
++            continue;
++        }
++        vc_gen[h] = gen; vc_idx[h] = idx; vc_pos[h] = i;
++        s_vfirst[i] = i;
++        s_vuniq[s_vuniq_n++] = i;
++    }
++    if (!xf_transform_all())
++        return;                                        /* no program loaded */
+     for (i = 0; i < n; i++)
+-        if (!transform_vertex(s_gpu.idx[i], &s_xf[i]))
+-            return;                                    /* no program loaded */
++        if (s_vfirst[i] != i)
++            s_xf[i] = s_xf[s_vfirst[i]];
+     xf_set_viewport();
+     {
+         const VertexAttr *tc = texcoord_attr();
+@@ -2828,6 +3007,13 @@ static void raster_batch_program(void)
+     if (s_gpu.texs[0].valid)
+         note_texture_use();
+ 
++    if (!no_defer && !backend_draws()) {
++        if (!s_dq)
++            s_dq = (XfTri *)malloc(NV_DEFER_MAX * sizeof *s_dq);
++        if (!s_dv)
++            s_dv = (Nv2aVshOutput *)malloc(NV_DEFER_MAX * 3 * sizeof *s_dv);
++        s_defer_on = s_dq && s_dv;
++    }
+     switch (s_gpu.prim) {
+     case NV_PRIM_TRIANGLES:
+         for (i = 0; i + 2 < n; i += 3)
+@@ -2857,6 +3043,10 @@ static void raster_batch_program(void)
+     default:
+         break;
+     }
++    if (s_defer_on) {
++        xf_defer_flush();
++        s_defer_on = 0;
++    }
+     if (backend_draws())
+         backend_flush(!s_xf_no_tex);
+ }
 diff --git a/src/kernel/xbox_memory_layout.c b/src/kernel/xbox_memory_layout.c
 index 362cefe..903a466 100644
 --- a/src/kernel/xbox_memory_layout.c
@@ -328,6 +604,141 @@ index 362cefe..903a466 100644
  void xbox_HeapFree(uint32_t xbox_va)
  {
      static int frees = 0, matched = 0;
+diff --git a/src/video/fb_present.c b/src/video/fb_present.c
+index b26edfe..dea7f9e 100644
+--- a/src/video/fb_present.c
++++ b/src/video/fb_present.c
+@@ -145,16 +145,82 @@ void xbox_FramebufferWindowFrameStats(uint32_t draws)
+     InterlockedExchange(&s_frame_draws, (LONG)draws);
+ }
+ 
++/* F11: borderless fullscreen on the window's monitor, and back. */
++static void fb_toggle_fullscreen(HWND h)
++{
++    static WINDOWPLACEMENT prev = { sizeof(prev) };
++    LONG style = GetWindowLongA(h, GWL_STYLE);
++
++    if (style & WS_OVERLAPPEDWINDOW) {
++        MONITORINFO mi = { sizeof(mi) };
++        if (GetWindowPlacement(h, &prev) &&
++            GetMonitorInfoA(MonitorFromWindow(h, MONITOR_DEFAULTTOPRIMARY), &mi)) {
++            SetWindowLongA(h, GWL_STYLE, style & ~WS_OVERLAPPEDWINDOW);
++            SetWindowPos(h, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top,
++                         mi.rcMonitor.right - mi.rcMonitor.left,
++                         mi.rcMonitor.bottom - mi.rcMonitor.top,
++                         SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
++        }
++    } else {
++        SetWindowLongA(h, GWL_STYLE, style | WS_OVERLAPPEDWINDOW);
++        SetWindowPlacement(h, &prev);
++        SetWindowPos(h, NULL, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER |
++                     SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
++    }
++}
++
++/* Draw the frame scaled to the client area at the title's 4:3 aspect, with
++ * black bars, so the window can be resized or made fullscreen. */
++static void fb_blit(HWND hwnd, HDC hdc, const BITMAPINFO *bi, const uint32_t *px)
++{
++    RECT c;
++    int cw, ch, dw, dh, dx, dy;
++
++    GetClientRect(hwnd, &c);
++    cw = c.right - c.left;
++    ch = c.bottom - c.top;
++    if (cw <= 0 || ch <= 0)
++        return;
++    dw = cw;
++    dh = (int)((long long)cw * s_fb_height / s_fb_width);
++    if (dh > ch) {
++        dh = ch;
++        dw = (int)((long long)ch * s_fb_width / s_fb_height);
++    }
++    dx = (cw - dw) / 2;
++    dy = (ch - dh) / 2;
++    SetStretchBltMode(hdc, COLORONCOLOR);
++    if (dy > 0) {
++        PatBlt(hdc, 0, 0, cw, dy, BLACKNESS);
++        PatBlt(hdc, 0, dy + dh, cw, ch - dy - dh, BLACKNESS);
++    }
++    if (dx > 0) {
++        PatBlt(hdc, 0, 0, dx, ch, BLACKNESS);
++        PatBlt(hdc, dx + dw, 0, cw - dx - dw, ch, BLACKNESS);
++    }
++    StretchDIBits(hdc, dx, dy, dw, dh, 0, 0, (int)s_fb_width, (int)s_fb_height,
++                  px, bi, DIB_RGB_COLORS, SRCCOPY);
++}
++
+ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
+ {
+     switch (m) {
+     case WM_CLOSE:
+     case WM_DESTROY:
+         InterlockedExchange(&s_fb_running, 0);
++        /* RECOMP_FB_WINDOW_EXIT=1: the window is the game, so closing it
++         * quits. Without it the title keeps running headless, which is
++         * what a scripted test run wants. */
++        if (getenv("RECOMP_FB_WINDOW_EXIT"))
++            ExitProcess(0);
+         return 0;
+ 
+     case WM_KEYDOWN:
+     case WM_SYSKEYDOWN:
++        if (w == VK_F11 && !(l & 0x40000000)) {    /* not auto-repeat */
++            fb_toggle_fullscreen(h);
++            return 0;
++        }
+         xbox_InputKeySet((int)w, 1);
+         /* RECOMP_KEY_TRACE: each key as it arrives, edge-triggered.
+          *
+@@ -286,7 +352,25 @@ static DWORD WINAPI fb_thread(LPVOID unused)
+         wc.lpszClassName = "XboxRecompFramebuffer";
+         RegisterClassA(&wc);
+     }
+-    r.left = 0; r.top = 0; r.right = (LONG)s_fb_width; r.bottom = (LONG)s_fb_height;
++    {
++        /* RECOMP_WINDOW_SCALE=<n>: initial size, as for the SDL window. */
++        const char *e = getenv("RECOMP_WINDOW_SCALE");
++        double sc = e ? atof(e) : 2.0;
++        RECT wa;
++        if (sc < 1.0) sc = 1.0;
++        if (sc > 6.0) sc = 6.0;
++        /* Shrink to fit the desktop's work area (a 2x window does not fit a
++         * 1080p screen once the title bar is counted). */
++        if (SystemParametersInfoA(SPI_GETWORKAREA, 0, &wa, 0)) {
++            double fit_h = (wa.bottom - wa.top - 64) / (double)s_fb_height;
++            double fit_w = (wa.right - wa.left - 32) / (double)s_fb_width;
++            double fit = fit_h < fit_w ? fit_h : fit_w;
++            if (fit >= 1.0 && sc > fit)
++                sc = fit;
++        }
++        r.left = 0; r.top = 0;
++        r.right = (LONG)(s_fb_width * sc); r.bottom = (LONG)(s_fb_height * sc);
++    }
+     AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
+     hwnd = CreateWindowExA(0, "XboxRecompFramebuffer", "Xbox Recomp - Framebuffer",
+                            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+@@ -326,18 +410,14 @@ static DWORD WINAPI fb_thread(LPVOID unused)
+             if (s_present[idx])
+                 memcpy(s_rgb, s_present[idx],
+                        (size_t)s_fb_width * s_fb_height * 4);
+-            StretchDIBits(hdc, 0, 0, (int)s_fb_width, (int)s_fb_height,
+-                          0, 0, (int)s_fb_width, (int)s_fb_height,
+-                          s_rgb, &bi, DIB_RGB_COLORS, SRCCOPY);
++            fb_blit(hwnd, hdc, &bi, s_rgb);
+         } else if (s_fb_va && s_fb_pitch && s_rgb) {
+             /* No flip yet, or pinned with RECOMP_FB_VA: read guest memory as
+              * before, which is also what a title that never flips needs. */
+             const uint8_t *src =
+                 (const uint8_t *)((uintptr_t)s_fb_va + xbox_GetMemoryOffset());
+             fb_convert(src, s_fb_pitch / s_fb_width);
+-            StretchDIBits(hdc, 0, 0, (int)s_fb_width, (int)s_fb_height,
+-                          0, 0, (int)s_fb_width, (int)s_fb_height,
+-                          s_rgb, &bi, DIB_RGB_COLORS, SRCCOPY);
++            fb_blit(hwnd, hdc, &bi, s_rgb);
+         }
+         {
+             /* One dump a few seconds in, so the title has had time to render
 diff --git a/tools/recomp/lifter.py b/tools/recomp/lifter.py
 index baf1834..f96489a 100644
 --- a/tools/recomp/lifter.py

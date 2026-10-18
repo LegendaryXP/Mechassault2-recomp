@@ -33,6 +33,7 @@
 
 #include <windows.h>
 #include <dbghelp.h>
+#include <timeapi.h>   /* timeBeginPeriod */
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdbool.h>
@@ -301,6 +302,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     (void)lpCmdLine;
     (void)nCmdShow;
 
+    /* 1 ms timer resolution for the whole process. Windows' default is
+     * 15.6 ms, so every Sleep(1), timed wait and KeDelayExecutionThread the
+     * title or the runtime makes rounded up to a 64 Hz tick -- and a frame
+     * that hands work to the emulated GPU and waits for it a few times lost
+     * most of its time to that. The console's kernel times waits far more
+     * finely. */
+    timeBeginPeriod(1);
+
     /* Unbuffered output for immediate visibility during debugging */
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
@@ -420,6 +429,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
      * silently inert, and the one diagnostic that tells a hang from slowness
      * does nothing while appearing to be set. */
     xbox_WatchdogStart();
+
+    /* MA2_PROFILE=1: sampling profiler (src/ma2_profile.c). */
+    {
+        extern void ma2_ProfileStart(void);
+        ma2_ProfileStart();
+    }
 
     /* Step 7: Call the recompiled entry point */
     printf("\nStarting game...\n");

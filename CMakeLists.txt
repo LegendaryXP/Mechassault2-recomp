@@ -37,6 +37,9 @@ set(XBOXRECOMP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../xboxrecomp" CACHE PATH
 # and provides the 'xboxrecomp' umbrella target to link against.
 add_subdirectory(${XBOXRECOMP_DIR} ${CMAKE_BINARY_DIR}/xboxrecomp)
 
+# Tried: /arch:AVX2 /fp:fast /Ob3 on xbox_kernel (the software GPU). It made
+# gameplay ~9% slower (1449 vs 1584 flips by 350 s), so it stays off.
+
 # ── Recompiled game executable ──────────────────────────────────
 
 # Collect generated recompiled code.
@@ -52,6 +55,7 @@ file(GLOB RECOMP_GEN_SOURCES CONFIGURE_DEPENDS "src/recomp/gen/*.c")
 set(GAME_SOURCES
     src/main.c
     src/recomp_manual.c
+    src/ma2_profile.c
     # Add game-specific sources here, e.g.:
     # src/asset_loader.c
     # src/custom_renderer.c
@@ -94,6 +98,9 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
 if(MSVC)
     target_link_options(${PROJECT_NAME} PRIVATE
         /LARGEADDRESSAWARE
+        # Symbol map (ma2.map next to the exe): what scripts/profile_map.py
+        # resolves profiler samples against. Costs nothing at run time.
+        /MAP
     )
     # The generated code files can be very large. Increase object file section limit.
     target_compile_options(${PROJECT_NAME} PRIVATE /bigobj)
