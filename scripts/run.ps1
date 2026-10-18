@@ -27,8 +27,12 @@ if ($Frames) {
     $env:RECOMP_FB_DUMP = $null; $env:RECOMP_FB_DUMP_FLIPS = $null
 }
 $err = "$root\analysis\${Name}_stderr.txt"
-$p = Start-Process -FilePath "$root\build\Release\ma2.exe" -WorkingDirectory $root `
-    -RedirectStandardOutput "$root\analysis\${Name}_stdout.txt" -RedirectStandardError $err -PassThru
+# Redirected by cmd straight to the files, as play.bat does. Start-Process's
+# own -RedirectStandard* hands the game a pipe that PowerShell drains slowly:
+# a log write then blocked for ~7 ms, and a loading screen that logs every
+# file read ran at 2 MB/s.
+$p = Start-Process -FilePath "$env:ComSpec" -WorkingDirectory $root -WindowStyle Hidden -PassThru `
+    -ArgumentList '/c', "`"`"$root\build\Release\ma2.exe`" 1>`"$root\analysis\${Name}_stdout.txt`" 2>`"$err`"`""
 if (-not $p.WaitForExit(($Secs + 40) * 1000)) { Stop-Process -Id $p.Id -Force }
 Get-Process -Name ma2 -ErrorAction SilentlyContinue | Stop-Process -Force
 $flips = (Select-String -Path $err -Pattern '\((\d+) flips\)' | Select-Object -Last 1).Matches.Groups[1].Value

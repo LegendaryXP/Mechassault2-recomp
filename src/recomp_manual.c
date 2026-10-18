@@ -121,11 +121,49 @@ static int ma2_fence_done(uint32_t dev, uint32_t sem_va, uint32_t fence)
     return (uint32_t)(seq - fence) >= (uint32_t)(seq - MA2_MEM32(sem_va));
 }
 
+/* RECOMP_WAIT_PROF=1: time spent in D3D's fence wait, per two seconds,
+ * beside the kernel's own [WAITS] lines (this wait spins and sleeps in host
+ * code, not through a kernel call). */
+static void ma2_fence_prof(LONGLONG t0)
+{
+    static int on = -1;
+    static LARGE_INTEGER f;
+    static LONGLONG acc;
+    static uint32_t n;
+    static DWORD start;
+    LARGE_INTEGER t1;
+    DWORD now;
+
+    if (on < 0) {
+        on = getenv("RECOMP_WAIT_PROF") != NULL;
+        QueryPerformanceFrequency(&f);
+    }
+    if (!on)
+        return;
+    QueryPerformanceCounter(&t1);
+    acc += t1.QuadPart - t0;
+    n++;
+    now = GetTickCount();
+    if (!start)
+        start = now;
+    if (now - start >= 2000) {
+        fprintf(stderr, "  [WAITS] D3D fence waits (sub_0040F510): %u in %.1f s, %.1f ms\n",
+                n, (now - start) / 1000.0, (double)acc * 1000.0 / (double)f.QuadPart);
+        fflush(stderr);
+        acc = 0;
+        n = 0;
+        start = now;
+    }
+}
+
 void sub_0040F510(void)
 {
     static uint32_t armed_sem;
     static int forced;
     uint32_t dev = MA2_MEM32(MA2_D3D_DEVICE_PTR);
+    LARGE_INTEGER fence_t0;
+
+    QueryPerformanceCounter(&fence_t0);
 
     if (dev) {
         uint32_t sem = MA2_MEM32(dev + 0x30);
@@ -183,6 +221,7 @@ void sub_0040F510(void)
         }
     }
     sub_0040F510_gen();
+    ma2_fence_prof(fence_t0.QuadPart);
 }
 
 /* ── MechAssault 2: D3D write-combine flush (sub_0040F980) ──── */
