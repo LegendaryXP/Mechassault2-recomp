@@ -17,6 +17,7 @@ $env:RECOMP_WATCHDOG_SECS = "$Secs"
 $env:RECOMP_AC97_READY = '1'; $env:RECOMP_PB_EXEC = '1'; $env:RECOMP_PB_WALK = 'dma'; $env:RECOMP_ASYNC_IO = '1'; $env:RECOMP_VBLANK = '1'
 $env:RECOMP_USB = $(if ($NoUsb) { $null } else { '1' }); $env:RECOMP_USB_PADS = $(if ($NoUsb) { $null } else { '1' })
 $env:RECOMP_KEYBOARD = $(if ($NoKeyboard) { $null } else { '1' })
+$env:RECOMP_MUTE = '1'          # test runs are silent; play.bat is not
 $env:MA2_SKIP_ICALL = $Skip
 if ($Frames) {
     $fb = "$root\analysis\fb_$Name"
