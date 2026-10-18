@@ -430,6 +430,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
      * does nothing while appearing to be set. */
     xbox_WatchdogStart();
 
+    /* RECOMP_D3D11=1: rasterise on the host GPU (xboxrecomp nv2a_d3d11.c). */
+    {
+        extern void xbox_D3D11BackendInstall(void);
+        xbox_D3D11BackendInstall();
+    }
+
     /* MA2_PROFILE=1: sampling profiler (src/ma2_profile.c). */
     {
         extern void ma2_ProfileStart(void);

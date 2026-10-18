@@ -185,6 +185,40 @@ void sub_0040F510(void)
     sub_0040F510_gen();
 }
 
+/* ── MechAssault 2: D3D write-combine flush (sub_0040F980) ──── */
+
+/*
+ * XDK D3D before every kick: sfence, set bit 16 of PFB register 0x100410,
+ * spin until the hardware clears it -- a flush of the CPU's write-combining
+ * buffers, which the GPU acknowledges at once. Here guest memory is already
+ * coherent, but the bit is only cleared by the emulated GPU between
+ * pushbuffer commands, so every kick waited for the executor to catch up and
+ * the title and the GPU never overlapped (22% of the main thread spun here).
+ * Do what the original leaves behind -- eax the register base, ecx the
+ * register with the flush bit -- without the wait. Takes no arguments.
+ * MA2_SLOW_WC_FLUSH=1 runs the original.
+ */
+extern void sub_0040F980_gen(void);
+extern __declspec(thread) uint32_t g_ecx;
+
+void sub_0040F980(void)
+{
+    static int slow = -1;
+    uint32_t dev, base;
+
+    if (slow < 0)
+        slow = getenv("MA2_SLOW_WC_FLUSH") != NULL;
+    if (slow) {
+        sub_0040F980_gen();
+        return;
+    }
+    dev = MA2_MEM32(MA2_D3D_DEVICE_PTR);
+    base = dev ? MA2_MEM32(dev + 0x1C28) : 0;
+    g_eax = base;
+    g_ecx = base ? (MA2_MEM32(base + 0x100410) | 0x10000u) : 0x10000u;
+    g_esp += 4;                         /* ret */
+}
+
 /* ── MechAssault 2: XOnline "go to the Xbox Live dashboard" ─── */
 
 /*

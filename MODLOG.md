@@ -117,3 +117,16 @@
   - Remaining cost: ~1.1 us per pixel (interpreted register combiners, 4x overdraw, ~1.26 M px/frame). Next real step = GPU back end (combiners -> D3D11 pixel shaders) or specialised software combiners.
   - Window: RECOMP_FB_WINDOW=1, scale to fit, letterboxed resize, F11 fullscreen, RECOMP_FB_WINDOW_EXIT=1. Title bar shows FPS.
   - play.bat (+ C:\Mechassault2\Play MechAssault 2.bat) launches with all required switches; logs to logs\.
+- 2026-10-17: D3D11 GPU BACK END (toolkit src/video/nv2a_d3d11.c, RECOMP_D3D11=1)
+  - Interface (nv2a_backend.h) extended: vertex d0/d1/fog/tex[4][4]; batch rc (combiner state), stages[4], fog colour, clip plane mode; texture cube/face_stride/palette/normalized; render state depth_scale/zclear; surface clip_x/clip_y; nv2a_backend_texture_bytes(). flip() now runs BEFORE the window/dumps read the frame.
+  - Pixel shader = HLSL port of nv2a_combiner.c (8 stages + final combiner from a constant buffer) + rc_stage_fetch modes (2D/projective, cube, passthru, clip plane) + the screen-space texel*diffuse path + alpha test. Compiled once with D3DCompile.
+  - Render targets: one per colour surface, GPU-resident; uploaded on first use or when a guest-memory hash shows CPU writes; written back at flip (all dirty targets) or when an incompatible texture overlaps. Linear 32-bit textures at a target's address/pitch sample the target directly; sampling the target being drawn samples a GPU copy. Formats the decoder cannot read (MA2: 0x17, 0x1A) are white at once, as on the CPU path.
+  - Textures: executor decoder, cached by address/format, re-hashed once per frame, invalidated on write-back.
+  - Results (gameplay, window, no dumps): CPU path ~3.7 fps -> D3D11 ~16 fps. Per frame: ~634 draws, 143k verts, 17 target switches, 8 write-backs, 0.6 decodes. Images match the CPU path (better: bilinear everywhere, no floor seams).
+  - Bugs found on the way: presenting only the last-drawn target showed stale/blurred frames (MA2 draws effects after the scene) -> write back all dirty targets at flip; clip origin was ignored -> scissor uses clip_x/y.
+  - Seen once (run 57): guest crash in audio code (DSOUND/XACT sections, thread stack 0x007BFxxx) writing VA 0xBF574A1C. Not reproduced since; watch for it.
+  - Next stall: main thread spins in D3D's write-combine flush sub_0040F980 (22%) until the executor clears PFB 0x100410 bit 16 between commands -> override returns at once (MA2_SLOW_WC_FLUSH=1 for the original).
+  - WC flush override (sub_0040F980) in: main-thread spin gone (main now plain-waits on the executor).
+  - Flip writes back only the presented surface (nv2a_backend_present_va), DXT -> BC1/2/3 direct, swizzled/linear ARGB8 bulk decode. Per frame now: ~630 draws, 140k verts, 17 switches, 0 uploads, 2 write-backs, ~1 decode.
+  - Gameplay with window: 14-20 fps (was ~16 before these, ~3.7 on CPU raster). Images verified (analysis/fb_run61/sheet.png).
+  - Remaining hot spot on the executor thread: vertex programs (nv2a_vsh_run) and per-batch serial work; main thread mostly waits on it. Next big step: run vertex programs on the GPU too.

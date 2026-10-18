@@ -9,7 +9,8 @@ rem   W A S D = left stick (move)      I J K L = right stick (aim)
 rem   Arrow keys = D-pad   Shift / Ctrl = left / right stick click
 rem   F11 = fullscreen on/off          close the window to quit
 rem
-rem The emulated GPU runs on the CPU, so expect low frame rates for now.
+rem Drawing runs on your graphics card (Direct3D 11); the rest of the Xbox
+rem GPU (vertex shaders, command processing) is still emulated on the CPU.
 
 cd /d "%~dp0"
 if not exist "build\Release\ma2.exe" (
@@ -36,5 +37,7 @@ set RECOMP_VBLANK=1
 set RECOMP_USB=1
 set RECOMP_USB_PADS=1
 set RECOMP_KEYBOARD=1
+rem Render on the graphics card (set RECOMP_D3D11=0 for the CPU rasteriser).
+if "%RECOMP_D3D11%"=="" set RECOMP_D3D11=1
 
 start "MechAssault 2" /min cmd /c "build\Release\ma2.exe 1>logs\last_stdout.txt 2>logs\last_stderr.txt"
