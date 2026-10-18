@@ -1,3 +1,335 @@
+diff --git a/src/apu/apu_core.c b/src/apu/apu_core.c
+index 1f664a3..7f91379 100644
+--- a/src/apu/apu_core.c
++++ b/src/apu/apu_core.c
+@@ -172,6 +172,36 @@ static int apu_mmio_trace(void)
+     return on;
+ }
+ 
++/* Whether the next sample-limit crossing may raise ISTS bit 3.
++ *
++ * RECOMP_APU_SSL_IRQ=N lets the first N through and no more (0: none);
++ * unset, every crossing raises it, as before. Black's DirectSound needs the
++ * interrupt to finish its init. MechAssault 2's DirectSound (sub_003AB500)
++ * answers it with a full restart of the sequencer and both DSPs
++ * (sub_003AAD8C, which counts them at 0x3C457C): it stops the counter,
++ * reloads the GP and EP, polls XGSCNT and starts the counter again. Raised
++ * every 2048 samples, that ran ~23 times a second, the frames taken while
++ * the counter was off were silent, and three quarters of every period came
++ * out as digital zero: the "static". The bit reads like the MCPX's delta
++ * panic (a DSP that fell more than SSL samples behind the counter), which
++ * the stub DSPs here never do. */
++static int ssl_irq_allowed(void)
++{
++    static long limit = -2, raised;
++
++    if (limit == -2) {
++        const char *e = getenv("RECOMP_APU_SSL_IRQ");
++        limit = (e && *e) ? strtol(e, NULL, 0) : -1;
++        if (limit >= 0)
++            fprintf(stderr, "[APU] sample-limit interrupt: first %ld only"
++                            " (RECOMP_APU_SSL_IRQ)\n", limit);
++    }
++    if (limit >= 0 && raised >= limit)
++        return 0;
++    raised++;
++    return 1;
++}
++
+ /* The interrupt line, as the frame thread sees it. update_irq used to call
+  * pci_irq_assert, which is an empty stub here, so DirectSound's service
+  * routine never ran and no voice completion ever reached it. */
+@@ -1042,12 +1072,52 @@ static void apu_irq_stats_line(void)
+     if (now < s_irq_next_ns)
+         return;
+     if (s_irq_next_ns)
+-        fprintf(stderr, "[APU-IRQ] traps %u se_frames %u fe-trapped-frames %u underruns %u\n",
++        fprintf(stderr, "[APU-IRQ] traps %u se_frames %u fe-trapped-frames %u underruns %u"
++                " lightweight %u (last SECTL %08X FECTL %08X)\n",
+                 apu_irq_stats.traps, apu_irq_stats.se_frames,
+-                apu_irq_stats.fe_trapped_frames, xa2_underruns());
++                apu_irq_stats.fe_trapped_frames, xa2_underruns(),
++                apu_irq_stats.lw_frames, apu_irq_stats.lw_sectl, apu_irq_stats.lw_fectl);
+     s_irq_next_ns = now + 5000000000ull;
+ }
+ 
++/* The EP's "program is running" word (RECOMP_APU_EP_MARK=1).
++ *
++ * MechAssault 2's DirectSound checks, every time its work routine runs
++ * (sub_003AB03A), that EP program memory word 6 (APU +0x5A018) reads
++ * 0xCCCCCC, and otherwise takes the EP for dead and restarts both DSPs
++ * (sub_003AADFA): counter stopped, GP and EP reset and reloaded, a 10 ms
++ * KeStallExecutionProcessor. On hardware the EP's boot loads its program
++ * and the word is there. Nothing here loads DSP programs, so the word stayed
++ * 0 and the restart ran about 75 times a second, with the same silent frames
++ * as the sample-limit restarts. The GP and EP windows are plain memory
++ * (MemoryLayoutInit traps only 0x00000-0x2FFFF), so the reset register the
++ * title writes, EPRST at +0x5FFFC, is read from there: while it has the EP
++ * running, the word is put in place. */
++#define APU_EP_PMEM_MARK   0x5A018u
++#define APU_EP_MARK_VALUE  0xCCCCCCu
++
++static void ep_mark_poll(void)
++{
++    static int on = -1;
++    static volatile uint32_t *ep;
++    const uint32_t run = NV_PAPU_GPRST_GPRST | NV_PAPU_GPRST_GPDSPRST;
++
++    if (on < 0) {
++        extern ptrdiff_t xbox_GetMemoryOffset(void);
++        on = apu_env_on("RECOMP_APU_EP_MARK");
++        ep = (volatile uint32_t *)((char *)xbox_GetMemoryOffset() + 0xFE850000u);
++        if (on)
++            fprintf(stderr, "[APU] EP program marker: 0x%06X at APU +0x%05X while EPRST"
++                            " runs the EP (RECOMP_APU_EP_MARK)\n",
++                    APU_EP_MARK_VALUE, APU_EP_PMEM_MARK);
++    }
++    if (!on)
++        return;
++    if ((ep[NV_PAPU_EPRST / 4] & run) == run
++        && ep[(APU_EP_PMEM_MARK - 0x50000u) / 4] != APU_EP_MARK_VALUE)
++        ep[(APU_EP_PMEM_MARK - 0x50000u) / 4] = APU_EP_MARK_VALUE;
++}
++
+ static void *mcpx_apu_frame_thread(void *arg)
+ {
+     MCPXAPUState *d = MCPX_APU_DEVICE(arg);
+@@ -1077,6 +1147,7 @@ static void *mcpx_apu_frame_thread(void *arg)
+          * forever to post its next command: Burnout 3 stalls in
+          * sub_002F805E polling the same doorbell it was acked on at init. */
+         mcpx_apu_dsp_ack_poll(d);
++        ep_mark_poll();
+ 
+         int xcntmode = GET_MASK(qatomic_read(&d->regs[NV_PAPU_SECTL]),
+                                 NV_PAPU_SECTL_XCNTMODE);
+@@ -1113,6 +1184,9 @@ static void *mcpx_apu_frame_thread(void *arg)
+             apu_irq_stats.fe_trapped_frames++;
+         } else {
+             /* Lightweight: just monitor frame (test tone + software mixer) */
++            apu_irq_stats.lw_frames++;
++            apu_irq_stats.lw_sectl = qatomic_read(&d->regs[NV_PAPU_SECTL]);
++            apu_irq_stats.lw_fectl = fectl;
+             mcpx_apu_monitor_frame(d);
+             d->ep_frame_div++;
+         }
+@@ -1137,8 +1211,10 @@ static void *mcpx_apu_frame_thread(void *arg)
+                     && (sectl & NV_PAPU_SECTL_XCNTMODE)
+                            != NV_PAPU_SECTL_XCNTMODE_OFF) {
+                 d->sample_count -= ssl;
+-                qatomic_or(&d->regs[NV_PAPU_ISTS], NV_PAPU_ISTS_SSLINTSTS);
+-                d->set_irq = true;
++                if (ssl_irq_allowed()) {
++                    qatomic_or(&d->regs[NV_PAPU_ISTS], NV_PAPU_ISTS_SSLINTSTS);
++                    d->set_irq = true;
++                }
+             }
+         }
+ 
+diff --git a/src/apu/apu_dsp.c b/src/apu/apu_dsp.c
+index bd36f2a..e49651c 100644
+--- a/src/apu/apu_dsp.c
++++ b/src/apu/apu_dsp.c
+@@ -25,6 +25,8 @@
+ #include "apu_state.h"
+ #include "fpconv.h"
+ 
++#include <math.h>
++#include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+ 
+@@ -114,6 +116,18 @@ static int mcpx_apu_mixdown_all(void)
+     return on;
+ }
+ 
++/* RECOMP_APU_LIMITER=0 turns the output peak limiter off (hard clipping, as
++ * before). */
++static int mcpx_apu_limiter_on(void)
++{
++    static int on = -1;
++    if (on < 0) {
++        const char *e = getenv("RECOMP_APU_LIMITER");
++        on = (e && *e) ? (atoi(e) != 0) : 1;
++    }
++    return on;
++}
++
+ /* GPRST (GP region + 0xFFFC): the GP runs only with both reset bits set, as
+  * in xemu's gp_write. Nothing else models the GP, so this is kept for the
+  * =auto ack alone. Before the first write the GP counts as running: a title
+@@ -229,9 +243,54 @@ void mcpx_apu_update_dsp_preference(MCPXAPUState *d)
+     (void)d;
+ }
+ 
++/* RECOMP_APU_BINSTAT=1: every 5 s of output, each mixbin's peak and RMS and
++ * how many output samples the mixdown clipped. Tells which bins a title's
++ * loud passages come from. */
++static int binstat_on(void)
++{
++    static int on = -1;
++    if (on < 0) {
++        const char *e = getenv("RECOMP_APU_BINSTAT");
++        on = e && *e && *e != '0';
++    }
++    return on;
++}
++
++static void binstat_frame(float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME],
++                          unsigned clipped)
++{
++    static float peak[NUM_MIXBINS];
++    static double sq[NUM_MIXBINS];
++    static unsigned n, clips;
++    int b, i;
++
++    for (b = 0; b < NUM_MIXBINS; b++)
++        for (i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
++            float v = mixbins[b][i];
++            float a = v < 0 ? -v : v;
++            if (a > peak[b])
++                peak[b] = a;
++            sq[b] += (double)v * v;
++        }
++    clips += clipped;
++    n += NUM_SAMPLES_PER_FRAME;
++    if (n < 48000 * 5)
++        return;
++    fprintf(stderr, "[APU-BINSTAT] clipped %u of %u; bin peak/rms:", clips, n * 2);
++    for (b = 0; b < NUM_MIXBINS; b++)
++        if (peak[b] > 0.001f)
++            fprintf(stderr, " %d=%.2f/%.3f", b, peak[b], sqrt(sq[b] / n));
++    fprintf(stderr, "\n");
++    memset(peak, 0, sizeof peak);
++    memset(sq, 0, sizeof sq);
++    n = clips = 0;
++}
++
+ void mcpx_apu_dsp_frame(MCPXAPUState *d,
+                          float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
+ {
++    unsigned clipped = 0;
++
+     /* Bypass DSP: take mixbin 0 (front-left) and mixbin 1 (front-right)
+      * and write them directly to the monitor frame buffer as the final
+      * EP output.
+@@ -249,6 +308,8 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
+     int off = (d->ep_frame_div % 8) * NUM_SAMPLES_PER_FRAME;
+ 
+     if (d->monitor.point != MCPX_APU_DEBUG_MON_VP) {
++        float out[NUM_SAMPLES_PER_FRAME][2];
++        float peak = 0.0f;
+         for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+             /* Bins 2..31 used to be computed and then dropped on the floor.
+              * On hardware the GP and EP mix the submixes down; here they are
+@@ -273,33 +334,77 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
+              * Gating the HRTF submix override was tried first and did not fix
+              * it, so the defect is the width of this mixdown and nothing else.
+              *
+-             * Even bins left, odd bins right, which preserves the stereo
+-             * pairing the guest set up -- bins 6/7 and 8/9 arrive with matched
+-             * counts. This is not what a real EP does; it is the cheapest
+-             * mixdown that stops discarding audio. */
++             * The mixdown follows the XDK's mixbin layout (DSMIXBIN_*), as a
++             * stereo downmix would: 0/1 front L/R, 4/5 back L/R and 6-9 the
++             * crosstalk (3D) front and back L/R go to their side; 2, the
++             * centre, goes to both at -3 dB; 3, the LFE, to both at half;
++             * 10 (the I3DL2 reverb send) and 11-31 (the effect sends) are
++             * copies of voices already in the bins above, fed to GP effects
++             * there is no DSP for, so they go in quietly, at both sides.
++             *
++             * It used to be even bins left and odd bins right at full gain.
++             * That put the centre on the left only, the LFE on the right only
++             * and the reverb send in as a second dry copy; in MechAssault 2's
++             * battles the 3D pair alone peaks at 1.9, and a fifth of the
++             * output samples were clipped flat: harsh, crackling sound. */
+             float left, right;
+             if (mcpx_apu_mixdown_all()) {
+-                left = 0.0f;
+-                right = 0.0f;
+-                for (int b = 0; b < NUM_MIXBINS; ++b) {
+-                    if (b & 1) right += mixbins[b][i];
+-                    else       left  += mixbins[b][i];
+-                }
++                float sends = 0.0f;
++                for (int b = 10; b < NUM_MIXBINS; ++b)
++                    sends += mixbins[b][i];
++                left  = mixbins[0][i] + mixbins[4][i] + mixbins[6][i] + mixbins[8][i];
++                right = mixbins[1][i] + mixbins[5][i] + mixbins[7][i] + mixbins[9][i];
++                left  += 0.707f * mixbins[2][i] + 0.5f * mixbins[3][i] + 0.25f * sends;
++                right += 0.707f * mixbins[2][i] + 0.5f * mixbins[3][i] + 0.25f * sends;
+             } else {
+                 left = mixbins[0][i];
+                 right = mixbins[1][i];
+             }
+-            /* Clamp to [-1, 1] range */
+-            if (left > 1.0f) left = 1.0f;
+-            if (left < -1.0f) left = -1.0f;
+-            if (right > 1.0f) right = 1.0f;
+-            if (right < -1.0f) right = -1.0f;
++            out[i][0] = left;
++            out[i][1] = right;
++            if (fabsf(left) > peak) peak = fabsf(left);
++            if (fabsf(right) > peak) peak = fabsf(right);
++        }
+ 
+-            /* Convert to 16-bit and write (not accumulate) into frame buffer.
+-             * Each of the 8 sub-frames writes its own 32-sample slice. */
+-            d->monitor.frame_buf[off + i][0] = (int16_t)(left * 32767.0f);
+-            d->monitor.frame_buf[off + i][1] = (int16_t)(right * 32767.0f);
++        /* A peak limiter instead of flat clipping (RECOMP_APU_LIMITER=0 turns
++         * it off). The gain drops at once, for the whole frame, to what keeps
++         * this frame's peak under full scale (ramping it down across the
++         * frame left the first samples clipped), and recovers over about a
++         * quarter of a second, ramped so it does not click. */
++        {
++            static float gain = 1.0f;
++            float g0 = gain, g1 = gain;
++            if (mcpx_apu_limiter_on()) {
++                const float ceiling = 0.97f;
++                if (peak * g1 > ceiling)
++                    g0 = g1 = ceiling / peak;   /* down at once, no ramp */
++                else
++                    g1 += (1.0f - g1) * 0.0027f;   /* ~250 ms at 1500 frames/s */
++                if (g1 > 1.0f) g1 = 1.0f;
++                gain = g1;
++            } else {
++                g0 = g1 = 1.0f;
++            }
++            for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
++                float g = g0 + (g1 - g0) * (float)(i + 1) / NUM_SAMPLES_PER_FRAME;
++                float left = out[i][0] * g, right = out[i][1] * g;
++                if (left > 1.0f || left < -1.0f) clipped++;
++                if (right > 1.0f || right < -1.0f) clipped++;
++                /* Clamp to [-1, 1] range */
++                if (left > 1.0f) left = 1.0f;
++                if (left < -1.0f) left = -1.0f;
++                if (right > 1.0f) right = 1.0f;
++                if (right < -1.0f) right = -1.0f;
++
++                /* Convert to 16-bit and write (not accumulate) into frame
++                 * buffer. Each of the 8 sub-frames writes its own 32-sample
++                 * slice. */
++                d->monitor.frame_buf[off + i][0] = (int16_t)(left * 32767.0f);
++                d->monitor.frame_buf[off + i][1] = (int16_t)(right * 32767.0f);
++            }
+         }
++        if (binstat_on())
++            binstat_frame(mixbins, clipped);
+     }
+ 
+     g_dbg.gp.cycles = 0;
+diff --git a/src/apu/apu_state.h b/src/apu/apu_state.h
+index f4fca14..0a303fc 100644
+--- a/src/apu/apu_state.h
++++ b/src/apu/apu_state.h
+@@ -586,5 +586,7 @@ typedef struct {
+     unsigned traps;             /* front-end traps latched (fe_method) */
+     unsigned se_frames;         /* VP/DSP frames run (se_frame), cumulative */
+     unsigned fe_trapped_frames; /* frames that found FECTL trapped */
++    unsigned lw_frames;         /* frames that ran without the VP/DSP pipeline */
++    uint32_t lw_sectl, lw_fectl; /* the registers the last such frame saw */
+ } ApuIrqStats;
+ extern ApuIrqStats apu_irq_stats;
 diff --git a/src/apu/apu_xaudio2.c b/src/apu/apu_xaudio2.c
 index e725646..ef7947b 100644
 --- a/src/apu/apu_xaudio2.c
@@ -17,7 +349,7 @@ index e725646..ef7947b 100644
      wfx.wFormatTag      = WAVE_FORMAT_PCM;
      wfx.nChannels       = XA2_CHANNELS;
 diff --git a/src/input/mkb_input.c b/src/input/mkb_input.c
-index d6f0042..83d45c5 100644
+index d6f0042..073a666 100644
 --- a/src/input/mkb_input.c
 +++ b/src/input/mkb_input.c
 @@ -36,6 +36,127 @@
@@ -202,7 +534,7 @@ index d6f0042..83d45c5 100644
  /* ---- raw input thread -------------------------------------------------- */
  
  /* Accumulators, written by the input thread and drained by the poll.
-@@ -135,16 +282,18 @@ static void mkb_load_config(void)
+@@ -135,15 +282,48 @@ static void mkb_load_config(void)
   * with InterlockedAdd, the poll takes everything with Exchange(0). */
  static volatile LONG s_dx, s_dy;
  static volatile LONG s_wheel;        /* wheel steps since last poll   */
@@ -210,23 +542,54 @@ index d6f0042..83d45c5 100644
 +static volatile LONG s_mouse_btn;    /* 1 L, 2 R, 4 M, 8 X1, 16 X2: held */
 +static volatile LONG s_mouse_tap;    /* pressed since the last poll         */
  static volatile unsigned char s_vk_down[256];
+-
+-static volatile LONG s_active = 1;   /* F9 toggles this               */
 +static volatile unsigned char s_vk_tap[256];   /* pressed since the last poll */
 +/* RECOMP_MKB_SCRIPT drives the layer instead of the real devices, for
 + * unattended tests on a machine someone is using: real input is ignored,
 + * the cursor is left alone and the foreground check is skipped. */
 +static int s_scripted;
- 
- static volatile LONG s_active = 1;   /* F9 toggles this               */
++
++/* The mouse is the game's only after a click in its window: it starts
++ * free, a left click inside the client area takes it (that click does not
++ * fire), and F9, Esc (the game pauses as well) or leaving the window give
++ * it back. The keyboard works whenever the game's window is in front. */
++static volatile LONG s_captured;
++static volatile LONG s_swallow_click;   /* the capturing click, until released */
  static volatile LONG s_thread_up;
  
 -/* F9 is read on the input thread, so the toggle works even while the
 - * game is stalled on the poll side. */
 -#define MKB_TOGGLE_VK  VK_F9
--
++static int game_is_foreground(void);
++
++/* The pointer is inside the foreground (our) window's client area. */
++static int cursor_in_game_client(void)
++{
++    POINT p;
++    RECT r;
++    HWND fg = GetForegroundWindow();
++    if (!fg || !GetCursorPos(&p) || !ScreenToClient(fg, &p) || !GetClientRect(fg, &r))
++        return 0;
++    return p.x >= r.left && p.x < r.right && p.y >= r.top && p.y < r.bottom;
++}
++
++static void mkb_set_captured(LONG on, const char *why)
++{
++    if (InterlockedExchange(&s_captured, on) != on) {
++        fprintf(stderr, "  [MKB] mouse %s (%s)\n", on ? "captured" : "released", why);
++        fflush(stderr);
++    }
++}
++
++int mkb_mouse_captured(void)
++{
++    return mkb_enabled() && s_captured;
++}
+ 
  static void mkb_handle_raw(HRAWINPUT h)
  {
-     BYTE buf[sizeof(RAWINPUT) + 64];
-@@ -155,6 +304,8 @@ static void mkb_handle_raw(HRAWINPUT h)
+@@ -155,6 +335,8 @@ static void mkb_handle_raw(HRAWINPUT h)
              == (UINT)-1)
          return;
  
@@ -235,10 +598,20 @@ index d6f0042..83d45c5 100644
      if (ri->header.dwType == RIM_TYPEMOUSE) {
          const RAWMOUSE *m = &ri->data.mouse;
  
-@@ -162,6 +313,16 @@ static void mkb_handle_raw(HRAWINPUT h)
+@@ -162,6 +344,26 @@ static void mkb_handle_raw(HRAWINPUT h)
              if (m->lLastX) InterlockedAdd(&s_dx, m->lLastX);
              if (m->lLastY) InterlockedAdd(&s_dy, m->lLastY);
          }
++        if ((m->usButtonFlags & RI_MOUSE_LEFT_BUTTON_DOWN) && !s_captured
++            && game_is_foreground() && cursor_in_game_client()) {
++            mkb_set_captured(1, "click in the window");
++            InterlockedExchange(&s_swallow_click, 1);
++        }
++        if ((m->usButtonFlags & RI_MOUSE_LEFT_BUTTON_UP) && s_swallow_click) {
++            InterlockedExchange(&s_swallow_click, 0);
++            InterlockedAnd(&s_mouse_btn, ~1);
++            return;
++        }
 +        {   /* a click that starts and ends between two polls still counts */
 +            LONG down = 0;
 +            if (m->usButtonFlags & RI_MOUSE_LEFT_BUTTON_DOWN)   down |= 1;
@@ -252,7 +625,7 @@ index d6f0042..83d45c5 100644
          if (m->usButtonFlags & RI_MOUSE_LEFT_BUTTON_DOWN)
              InterlockedOr(&s_mouse_btn, 1);
          if (m->usButtonFlags & RI_MOUSE_LEFT_BUTTON_UP)
-@@ -190,6 +351,15 @@ static void mkb_handle_raw(HRAWINPUT h)
+@@ -190,20 +392,33 @@ static void mkb_handle_raw(HRAWINPUT h)
          const RAWKEYBOARD *k = &ri->data.keyboard;
          UINT vk = k->VKey;
  
@@ -266,11 +639,23 @@ index d6f0042..83d45c5 100644
 +            vk = (k->Flags & RI_KEY_E0) ? VK_RMENU : VK_LMENU;
 +
          if (vk == MKB_TOGGLE_VK) {
-             if (k->Message == WM_KEYDOWN && !s_vk_down[vk & 0xFF]) {
-                 LONG now = !s_active;
-@@ -200,10 +370,12 @@ static void mkb_handle_raw(HRAWINPUT h)
-             }
+-            if (k->Message == WM_KEYDOWN && !s_vk_down[vk & 0xFF]) {
+-                LONG now = !s_active;
+-                InterlockedExchange(&s_active, now);
+-                fprintf(stderr, "  [MKB] %s\n", now ? "captured"
+-                                                    : "released (F9)");
+-                fflush(stderr);
+-            }
++            if (k->Message == WM_KEYDOWN && !s_vk_down[vk & 0xFF]
++                && (s_captured || game_is_foreground()))
++                mkb_set_captured(!s_captured, "F9");
          }
++        /* Esc pauses the game and hands the pointer back with it. */
++        if (vk == VK_ESCAPE && k->Message == WM_KEYDOWN && s_captured)
++            mkb_set_captured(0, "Esc");
++        /* Alt+Enter is the window's fullscreen toggle, not a menu press. */
++        if (vk == VK_RETURN && (s_vk_down[VK_LMENU] || s_vk_down[VK_RMENU]))
++            return;
          if (vk && vk < 256) {
 -            if (k->Message == WM_KEYDOWN || k->Message == WM_SYSKEYDOWN)
 +            if (k->Message == WM_KEYDOWN || k->Message == WM_SYSKEYDOWN) {
@@ -283,7 +668,7 @@ index d6f0042..83d45c5 100644
          }
      }
  }
-@@ -256,9 +428,16 @@ static DWORD WINAPI mkb_thread(LPVOID unused)
+@@ -256,9 +471,17 @@ static DWORD WINAPI mkb_thread(LPVOID unused)
      }
  
      InterlockedExchange(&s_thread_up, 1);
@@ -294,16 +679,17 @@ index d6f0042..83d45c5 100644
 +        int n = 0, i;
 +        for (i = 0; i < IN_MAX; i++)
 +            n += s_bind[i].kind != ACT_NONE;
-+        fprintf(stderr, "  [MKB] mouse+keyboard %s (F9 releases; sens=%.2f dz=%.2f"
++        fprintf(stderr, "  [MKB] mouse+keyboard %s (click the window to capture the"
++                " mouse, F9/Esc releases; sens=%.2f dz=%.2f"
 +                " full=%ld; %d bindings, %s)\n",
-+                s_scripted ? "scripted (real devices ignored)" : "captured",
++                s_scripted ? "scripted (real devices ignored)" : "ready",
 +                s_cfg.sens, s_cfg.dz, s_cfg.full, n,
 +                s_bind_custom ? "from the layout file" : "built-in layout");
 +    }
      fflush(stderr);
  
      while (GetMessageA(&msg, NULL, 0, 0) > 0) {
-@@ -281,7 +460,9 @@ int mkb_enabled(void)
+@@ -281,7 +504,9 @@ int mkb_enabled(void)
          const char *v = getenv("RECOMP_MKB");
          on = v && *v && *v != '0';
          if (on) {
@@ -313,7 +699,7 @@ index d6f0042..83d45c5 100644
              if (InterlockedCompareExchange(&s_thread_up, 0, 0) == 0) {
                  static LONG started = 0;
                  if (InterlockedCompareExchange(&started, 1, 0) == 0)
-@@ -323,8 +504,15 @@ static void mkb_manage_cursor(int capture)
+@@ -323,8 +548,15 @@ static void mkb_manage_cursor(int capture)
      if (capture) {
          RECT r;
          HWND fg = GetForegroundWindow();
@@ -330,7 +716,7 @@ index d6f0042..83d45c5 100644
          if (hidden < 5) { ShowCursor(FALSE); hidden++; }
      } else {
          if (hidden > 0) { ShowCursor(TRUE); hidden--; }
-@@ -356,87 +544,207 @@ static void mkb_aim_vector(double ax, double ay, SHORT *out_x, SHORT *out_y)
+@@ -356,87 +588,214 @@ static void mkb_aim_vector(double ax, double ay, SHORT *out_x, SHORT *out_y)
  
  #define MK_VK(k)  ((unsigned)(k) < 256 && s_vk_down[(k)])
  
@@ -472,13 +858,11 @@ index d6f0042..83d45c5 100644
 +    t = now - t0;
 +
 +    if (!s_scripted) {
-+        if (!s_active) {
-+            mkb_manage_cursor(0);
-+            return 0;
-+        }
-+        /* Foreground gate: while the user is elsewhere the mouse belongs
-+         * to whoever has it, and the game should read a pad at rest. */
++        /* Foreground gate: while the user is elsewhere the mouse and keys
++         * belong to whoever has them, and the game reads a pad at rest. */
 +        if (!game_is_foreground()) {
++            if (s_captured)
++                mkb_set_captured(0, "window left");
 +            mkb_manage_cursor(0);
 +            InterlockedExchange(&s_dx, 0);
 +            InterlockedExchange(&s_dy, 0);
@@ -487,7 +871,14 @@ index d6f0042..83d45c5 100644
 +            memset((void *)s_vk_tap, 0, sizeof s_vk_tap);
 +            return 0;
 +        }
-+        mkb_manage_cursor(1);
++        mkb_manage_cursor(s_captured);
++        if (!s_captured) {                  /* keys yes, the mouse no */
++            InterlockedExchange(&s_dx, 0);
++            InterlockedExchange(&s_dy, 0);
++            InterlockedExchange(&s_wheel, 0);
++            InterlockedExchange(&s_mouse_tap, 0);
++            InterlockedExchange(&s_mouse_btn, 0);
++        }
      }
 -    mkb_manage_cursor(1);
  
@@ -498,6 +889,8 @@ index d6f0042..83d45c5 100644
 +    /* Held buttons stay held; a click shorter than the poll still lands. */
 +    btn   = InterlockedCompareExchange(&s_mouse_btn, 0, 0)
 +          | InterlockedExchange(&s_mouse_tap, 0);
++    if (s_swallow_click)
++        btn &= ~1;                          /* the click that captured */
 +
 +    /* Everything held this poll, as one table indexed like s_bind. */
 +    for (i = 0; i < 256; i++) {
@@ -594,10 +987,10 @@ index d6f0042..83d45c5 100644
      if (b)        { pState->Gamepad.wButtons |= b; any = 1; }
      for (i = 0; i < 8; i++) {
 diff --git a/src/input/mkb_input.h b/src/input/mkb_input.h
-index 664efad..657d465 100644
+index 664efad..a05246c 100644
 --- a/src/input/mkb_input.h
 +++ b/src/input/mkb_input.h
-@@ -18,7 +18,18 @@
+@@ -18,11 +18,22 @@
   *   RECOMP_MKB_DZ=f       assumed game deadzone    (default 0.18)
   *   RECOMP_MKB_ACC=f      aim acceleration         (default 1.0 = off)
   *   RECOMP_MKB_INVERT_Y=1 invert vertical aim      (default off)
@@ -607,18 +1000,36 @@ index 664efad..657d465 100644
 + *   RECOMP_MKB_SCRIPT=... scripted input for unattended tests, instead of
 + *                         the real devices: "<ms>:<KEY>[:<hold>]" and
 + *                         "<ms>:mouse:<dx>:<dy>[:<ms>]", comma separated
-+ *
+  *
+- * F9 toggles mouse/keyboard capture at runtime. Capture is only
+- * applied while the recompiled game's process has the foreground
+- * window, so the mouse keeps working normally in other apps.
 + * Bindings: "bind.<KEY> = <CONTROL>" in the file. KEY is a letter, digit,
 + * F1-F12, a named key (SPACE ENTER ESC TAB LSHIFT RCTRL UP ... see
 + * k_inputs), MOUSE1-MOUSE5 or WHEELUP/WHEELDOWN; CONTROL is a pad button
 + * (A B X Y BLACK WHITE LT RT START BACK LTHUMB RTHUMB DPAD_*), a stick
 + * direction (MOVE_FORWARD/BACK/LEFT/RIGHT, LOOK_UP/DOWN/LEFT/RIGHT) or
 + * NONE. The first binding replaces the built-in layout.
-  *
-  * F9 toggles mouse/keyboard capture at runtime. Capture is only
-  * applied while the recompiled game's process has the foreground
++ *
++ * The mouse starts free: a left click in the game window captures it
++ * (that click is not passed on), F9 toggles, Esc and leaving the window
++ * release it. The keyboard works whenever the game's window is in front.
+  */
+ 
+ #ifndef XBOXRECOMP_MKB_INPUT_H
+@@ -51,6 +62,10 @@ int mkb_enabled(void);
+  */
+ int mkb_merge(DWORD dwPort, XBOX_INPUT_STATE *pState);
+ 
++/* The mouse is captured (a click in the game window took it; F9, Esc or
++ * leaving the window gives it back). For the window's title bar. */
++int mkb_mouse_captured(void);
++
+ #ifdef __cplusplus
+ }
+ #endif
 diff --git a/src/kernel/kernel_bridge.c b/src/kernel/kernel_bridge.c
-index 965dd08..16a0ec1 100644
+index 965dd08..d51377c 100644
 --- a/src/kernel/kernel_bridge.c
 +++ b/src/kernel/kernel_bridge.c
 @@ -44,6 +44,9 @@
@@ -767,7 +1178,23 @@ index 965dd08..16a0ec1 100644
      xbox_HalReturnToFirmware(routine);
  }
  
-@@ -2698,6 +2811,30 @@ static int kernel_raise_interrupt(uint32_t vector)
+@@ -2308,6 +2421,15 @@ static void bridge_MmSetAddressProtect(void)
+     uint32_t size = STACK_ARG(1);
+     uint32_t prot = STACK_ARG(2);
+ 
++    {   /* Which protections a title actually asks for, a few times. */
++        static int shown;
++        if ((prot & 0xFF) != 0x04 && shown < 16) {
++            shown++;
++            fprintf(stderr, "  [MEM] MmSetAddressProtect(0x%08X, %u, 0x%X) from 0x%08X\n",
++                    addr, size, prot, g_xbox_kernel_caller);
++            fflush(stderr);
++        }
++    }
+     xbox_MmSetAddressProtect(XBOX_TO_NATIVE(addr), size, prot);
+     g_eax = 0;
+ }
+@@ -2698,6 +2820,30 @@ static int kernel_raise_interrupt(uint32_t vector)
  
  static volatile LONG g_vblank_total;
  
@@ -798,7 +1225,7 @@ index 965dd08..16a0ec1 100644
  uint32_t xbox_VblankCount(void)
  {
      return (uint32_t)g_vblank_total;
-@@ -2706,18 +2843,26 @@ uint32_t xbox_VblankCount(void)
+@@ -2706,18 +2852,26 @@ uint32_t xbox_VblankCount(void)
  static void kernel_vblank_tick(void)
  {
      static int enabled = -1;
@@ -829,7 +1256,7 @@ index 965dd08..16a0ec1 100644
      InterlockedIncrement(&g_vblank_total);
  
      if (!xbox_GetConnectedInterrupt(NV2A_VECTOR))
-@@ -3023,10 +3168,14 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
+@@ -3023,10 +3177,14 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
          long long now;
          int i;
  
@@ -846,7 +1273,7 @@ index 965dd08..16a0ec1 100644
  
          for (i = 0; i < XBOX_MAX_TIMERS; i++) {
              uint32_t dpc, fired_va;
-@@ -3083,7 +3232,7 @@ static void kernel_set_timer(uint32_t timer_va, long long due_100ns,
+@@ -3083,7 +3241,7 @@ static void kernel_set_timer(uint32_t timer_va, long long due_100ns,
      if (free_slot >= 0) {
          g_timers[free_slot].timer_va  = timer_va;
          g_timers[free_slot].dpc_va    = dpc_va;
@@ -855,7 +1282,7 @@ index 965dd08..16a0ec1 100644
          g_timers[free_slot].period_ms = period_ms;
      }
      LeaveCriticalSection(&g_timer_lock);
-@@ -3923,6 +4072,9 @@ static int bridge_handle_is_async(uint32_t token)
+@@ -3923,6 +4081,9 @@ static int bridge_handle_is_async(uint32_t token)
      return 0;
  }
  
@@ -865,7 +1292,7 @@ index 965dd08..16a0ec1 100644
  /* Off unless RECOMP_ASYNC_IO is set, so the two behaviours stay comparable
   * rather than one being swapped in blind. */
  static int bridge_async_io_enabled(void)
-@@ -3951,6 +4103,8 @@ static void bridge_NtReadFile(void)
+@@ -3951,6 +4112,8 @@ static void bridge_NtReadFile(void)
          g_eax = 0xC0000005u;                 /* STATUS_ACCESS_VIOLATION */
          return;
      }
@@ -874,7 +1301,7 @@ index 965dd08..16a0ec1 100644
      if (offset_va) {
          off.LowPart  = BRIDGE_MEM32(offset_va);
          off.HighPart = (LONG)BRIDGE_MEM32(offset_va + 4);
-@@ -3958,11 +4112,19 @@ static void bridge_NtReadFile(void)
+@@ -3958,11 +4121,19 @@ static void bridge_NtReadFile(void)
      }
      g_eax = (uint32_t)xbox_NtReadFile(handle, NULL, NULL, NULL, &ios,
                  XBOX_TO_NATIVE(buffer_va), length, poff);
@@ -896,7 +1323,7 @@ index 965dd08..16a0ec1 100644
          const uint8_t *p = (const uint8_t *)XBOX_TO_NATIVE(buffer_va);
          uint32_t got = (uint32_t)ios.Information;
          /* The offset matters as much as the length. A title streaming a pack
-@@ -3985,9 +4147,35 @@ static void bridge_NtReadFile(void)
+@@ -3985,9 +4156,35 @@ static void bridge_NtReadFile(void)
                      got > 2 ? p[2] : 0, got > 3 ? p[3] : 0);
          fflush(stderr);
      }
@@ -932,7 +1359,7 @@ index 965dd08..16a0ec1 100644
  
      /* An asynchronous request returns STATUS_PENDING, even when the data was
       * already there.
-@@ -4036,6 +4224,20 @@ static void bridge_NtWriteFile(void)
+@@ -4036,6 +4233,20 @@ static void bridge_NtWriteFile(void)
      bridge_write_iostatus(iostatus, ios.Status, (uint32_t)ios.Information);
      bridge_complete_file_io(STACK_ARG(1), STACK_ARG(2), STACK_ARG(3),
                              iostatus);
@@ -953,7 +1380,7 @@ index 965dd08..16a0ec1 100644
  }
  
  /* ── NtQueryInformationFile (ordinal 211, 5 args = 20 bytes) */
-@@ -10041,6 +10243,91 @@ static void kernel_thunk_dispatch(void)
+@@ -10041,6 +10252,91 @@ static void kernel_thunk_dispatch(void)
      (void)held;
  }
  
@@ -1045,7 +1472,7 @@ index 965dd08..16a0ec1 100644
  static void kernel_thunk_dispatch_body(void)
  {
      int slot = g_kernel_dispatch_slot;
-@@ -10147,7 +10434,19 @@ static void kernel_thunk_dispatch_body(void)
+@@ -10147,7 +10443,19 @@ static void kernel_thunk_dispatch_body(void)
          }
      }
  
@@ -2118,10 +2545,27 @@ index 8acb0af..2ce01a1 100644
 +
  #endif
 diff --git a/src/kernel/xbox_memory_layout.c b/src/kernel/xbox_memory_layout.c
-index 362cefe..903a466 100644
+index 362cefe..d1434f5 100644
 --- a/src/kernel/xbox_memory_layout.c
 +++ b/src/kernel/xbox_memory_layout.c
-@@ -4459,6 +4459,20 @@ uint32_t xbox_HeapBlockSize(uint32_t xbox_va)
+@@ -4175,6 +4175,16 @@ int xbox_ContiguousFree(uint32_t va)
+     g_contig_frees++;
+     contig_report("free", va, n);
+     contig_unlock();
++    /* Back to read/write. A title protects some of its blocks
++     * (MmSetAddressProtect, XPhysicalProtect) and the protection is the
++     * page's, not the block's: the next allocation over these pages got it
++     * too, and MechAssault 2 died reading its cache file into a buffer
++     * that had been read-only in its previous life. */
++    {
++        DWORD old;
++        VirtualProtect((void *)((uintptr_t)va + g_memory_offset),
++                       (SIZE_T)n * CONTIG_PAGE, PAGE_READWRITE, &old);
++    }
+     return 1;
+ }
+ 
+@@ -4459,6 +4469,20 @@ uint32_t xbox_HeapBlockSize(uint32_t xbox_va)
      return r;
  }
  
@@ -2279,7 +2723,7 @@ index bd00f3f..bde1eb7 100644
          return;
      for (i = 0; i < s_script_len; i++) {
 diff --git a/src/video/CMakeLists.txt b/src/video/CMakeLists.txt
-index 4e86a08..5f97418 100644
+index 4e86a08..67d708c 100644
 --- a/src/video/CMakeLists.txt
 +++ b/src/video/CMakeLists.txt
 @@ -11,7 +11,10 @@ target_include_directories(xbox_video PUBLIC
@@ -2290,15 +2734,43 @@ index 4e86a08..5f97418 100644
 +    # Direct3D 11 render back end for the pushbuffer executor (RECOMP_D3D11).
 +    target_sources(xbox_video PRIVATE nv2a_d3d11.c)
 +    target_link_libraries(xbox_video PUBLIC mfplat mfreadwrite mfuuid mf ole32
-+                          d3d11 d3dcompiler dxguid)
++                          d3d11 d3dcompiler dxguid dxgi)
  else()
      # The framebuffer window on POSIX hosts: SDL2, on the process main thread
      # (fb_present_sdl.c), which then also pumps the events the game
 diff --git a/src/video/fb_present.c b/src/video/fb_present.c
-index b26edfe..dea7f9e 100644
+index b26edfe..ce39f95 100644
 --- a/src/video/fb_present.c
 +++ b/src/video/fb_present.c
-@@ -145,16 +145,82 @@ void xbox_FramebufferWindowFrameStats(uint32_t draws)
+@@ -30,6 +30,7 @@
+  * is the thing that receives the keys, so that is what has to remember
+  * them. */
+ #include "keyboard.h"   /* src/input */
++#include "mkb_input.h"  /* src/input: mouse capture state for the title bar */
+ 
+ extern ptrdiff_t xbox_GetMemoryOffset(void);
+ 
+@@ -69,6 +70,19 @@ void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch)
+  * everything else (2x1 included). Only the pushbuffer executor knows it. */
+ static uint32_t s_fb_aa_sy = 1;
+ 
++/* The window, for a back end that presents to it with a swap chain; while
++ * one does (s_gpu_present), the GDI blits below stand aside. */
++static HWND s_fb_hwnd;
++static volatile LONG s_gpu_present;
++
++HWND xbox_FramebufferWindowHwnd(void) { return s_fb_hwnd; }
++void xbox_FramebufferWindowGpuPresent(int on) { InterlockedExchange(&s_gpu_present, on); }
++void xbox_FramebufferWindowDisplaySize(uint32_t *w, uint32_t *h)
++{
++    *w = s_fb_width;
++    *h = s_fb_height;
++}
++
+ void xbox_FramebufferWindowSetAA(uint32_t sy)
+ {
+     s_fb_aa_sy = sy ? sy : 1;
+@@ -145,16 +159,84 @@ void xbox_FramebufferWindowFrameStats(uint32_t draws)
      InterlockedExchange(&s_frame_draws, (LONG)draws);
  }
  
@@ -2374,14 +2846,16 @@ index b26edfe..dea7f9e 100644
  
      case WM_KEYDOWN:
      case WM_SYSKEYDOWN:
-+        if (w == VK_F11 && !(l & 0x40000000)) {    /* not auto-repeat */
++        /* F11 or Alt+Enter: borderless fullscreen and back. */
++        if (!(l & 0x40000000)                       /* not auto-repeat */
++            && (w == VK_F11 || (w == VK_RETURN && (l & (1 << 29))))) {
 +            fb_toggle_fullscreen(h);
 +            return 0;
 +        }
          xbox_InputKeySet((int)w, 1);
          /* RECOMP_KEY_TRACE: each key as it arrives, edge-triggered.
           *
-@@ -286,7 +352,25 @@ static DWORD WINAPI fb_thread(LPVOID unused)
+@@ -286,7 +368,25 @@ static DWORD WINAPI fb_thread(LPVOID unused)
          wc.lpszClassName = "XboxRecompFramebuffer";
          RegisterClassA(&wc);
      }
@@ -2408,7 +2882,33 @@ index b26edfe..dea7f9e 100644
      AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
      hwnd = CreateWindowExA(0, "XboxRecompFramebuffer", "Xbox Recomp - Framebuffer",
                             WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-@@ -326,18 +410,14 @@ static DWORD WINAPI fb_thread(LPVOID unused)
+@@ -298,6 +398,14 @@ static DWORD WINAPI fb_thread(LPVOID unused)
+         return 0;
+     }
+     hdc = GetDC(hwnd);
++    s_fb_hwnd = hwnd;
++    /* RECOMP_FULLSCREEN=1: start borderless fullscreen (F11 / Alt+Enter
++     * toggle either way). */
++    {
++        const char *fs = getenv("RECOMP_FULLSCREEN");
++        if (fs && *fs && *fs != '0')
++            fb_toggle_fullscreen(hwnd);
++    }
+ 
+     memset(&bi, 0, sizeof(bi));
+     bi.bmiHeader.biSize        = sizeof(bi.bmiHeader);
+@@ -318,7 +426,9 @@ static DWORD WINAPI fb_thread(LPVOID unused)
+             TranslateMessage(&msg);
+             DispatchMessageA(&msg);
+         }
+-        if (s_present_idx >= 0 && s_rgb) {
++        if (s_gpu_present) {
++            /* The back end draws this window itself. */
++        } else if (s_present_idx >= 0 && s_rgb) {
+             /* A finished frame, published by the flip. Copied into s_rgb so
+              * the dump path and GDI see one consistent image even if the
+              * next flip lands mid-blit. */
+@@ -326,18 +436,14 @@ static DWORD WINAPI fb_thread(LPVOID unused)
              if (s_present[idx])
                  memcpy(s_rgb, s_present[idx],
                         (size_t)s_fb_width * s_fb_height * 4);
@@ -2429,12 +2929,27 @@ index b26edfe..dea7f9e 100644
          }
          {
              /* One dump a few seconds in, so the title has had time to render
+@@ -369,9 +475,12 @@ static DWORD WINAPI fb_thread(LPVOID unused)
+             if (now - t0 >= 1000) {
+                 LONG f = s_flips;
+                 wchar_t tb[128];
+-                _snwprintf(tb, 127, L"%ls | FPS: %.1f | draws: %ld", s_title,
++                _snwprintf(tb, 127, L"%ls | FPS: %.1f | draws: %ld%ls", s_title,
+                            t0 ? (f - f0) * 1000.0 / (now - t0) : 0.0,
+-                           (long)s_frame_draws);
++                           (long)s_frame_draws,
++                           !mkb_enabled() ? L""
++                           : mkb_mouse_captured() ? L" | mouse captured (F9 / Esc frees it)"
++                                                  : L" | click to use the mouse");
+                 tb[127] = 0;
+                 SetWindowTextW(hwnd, tb);
+                 t0 = now; f0 = f;
 diff --git a/src/video/nv2a_d3d11.c b/src/video/nv2a_d3d11.c
 new file mode 100644
-index 0000000..e33c617
+index 0000000..cc7934d
 --- /dev/null
 +++ b/src/video/nv2a_d3d11.c
-@@ -0,0 +1,2411 @@
+@@ -0,0 +1,2788 @@
 +/*
 + * nv2a_d3d11.c -- a Direct3D 11 render back end for the pushbuffer executor.
 + *
@@ -2502,6 +3017,7 @@ index 0000000..e33c617
 +
 +#include "kernel/nv2a_backend.h"
 +#include "d3d/d3d8_swizzle.h"
++#include <dxgi1_2.h>
 +
 +#include <stddef.h>
 +extern ptrdiff_t xbox_GetMemoryOffset(void);
@@ -2898,6 +3414,7 @@ index 0000000..e33c617
 + * their depth test. Fog likewise: the factor is clamped per pixel, after
 + * the clipper has interpolated it. */
 +static int s_failed;
++static float s_scale = 1.0f;          /* RECOMP_RENDER_SCALE, see below */
 +static uint32_t s_frame = 1;
 +static GV *s_gv;
 +static UINT s_gv_cap;
@@ -3115,6 +3632,11 @@ index 0000000..e33c617
 +    hr = ID3D11Device_CreateRasterizerState(s_dev, &rd, &s_rs);
 +    if (FAILED(hr)) { d3d_log("CreateRasterizerState", hr); return 0; }
 +
++    {
++        const char *e = getenv("RECOMP_RENDER_SCALE");
++        float f = e ? (float)atof(e) : 1.0f;
++        s_scale = f >= 1.0f && f <= 4.0f ? f : 1.0f;
++    }
 +    s_white2d = make_white(0);
 +    s_whitecube = make_white(1);
 +    s_failed = 0;
@@ -3409,6 +3931,13 @@ index 0000000..e33c617
 +     * so the BGRA target holds them in blue and green and a pixel's low
 +     * 16 bits are the guest's. */
 +    int g8b8;
++    /* RECOMP_RENDER_SCALE: tex is sw x sh; `lo` is a guest-sized
++     * go-between for uploads and write-backs. aa_* is the surface's
++     * anti-aliasing factor, for presenting the right part of it. */
++    uint32_t sw, sh, aa_sx, aa_sy;
++    ID3D11Texture2D *lo;
++    ID3D11RenderTargetView *lo_rtv;
++    ID3D11ShaderResourceView *lo_srv;
 +} Target;
 +
 +typedef struct {
@@ -3434,6 +3963,161 @@ index 0000000..e33c617
 +    return s_conv;
 +}
 +
++
++/* ---- scaled rendering and presenting ------------------------------------ *
++ *
++ * RECOMP_RENDER_SCALE=<f> (1 to 4) draws every render target f times the
++ * guest's resolution: 2.25 turns MechAssault 2's 640x480 into 1440x1080.
++ * Vertex positions stay in guest pixels (the clip-space mapping divides by
++ * the guest size), and the viewport, scissor and clears are scaled, so the
++ * title sees nothing different. Where pixels cross between guest memory and
++ * a target -- the CPU wrote a surface, or something reads one back -- a
++ * guest-sized texture sits in between and a blit scales them.
++ *
++ * The finished frame goes to the window straight from the GPU, through a
++ * swap chain on the framebuffer window (letterboxed to the display mode's
++ * shape), instead of being read back for the window to draw with GDI; that
++ * keeps the resolution, and saves the read-back. RECOMP_D3D11_PRESENT=0
++ * goes back to the GDI window, RECOMP_VSYNC=1 waits for the display.
++ */
++extern HWND xbox_FramebufferWindowHwnd(void);
++extern void xbox_FramebufferWindowGpuPresent(int on);
++extern void xbox_FramebufferWindowDisplaySize(uint32_t *w, uint32_t *h);
++
++static const char s_hlsl_blit[] =
++"Texture2D BT : register(t0); SamplerState BS : register(s0);\n"
++"cbuffer BC : register(b0) { float4 g_uv; };\n"
++"struct BV { float4 pos : SV_Position; float2 uv : TEXCOORD0; };\n"
++"BV vs_blit(uint id : SV_VertexID) {\n"
++"  BV o; float2 p = float2((id << 1) & 2, id & 2);\n"
++"  o.pos = float4(p * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0);\n"
++"  o.uv = lerp(g_uv.xy, g_uv.zw, p); return o;\n"
++"}\n"
++"float4 ps_blit(BV i) : SV_Target { return BT.SampleLevel(BS, i.uv, 0); }\n";
++
++static ID3D11VertexShader *s_vs_blit;
++static ID3D11PixelShader *s_ps_blit;
++static ID3D11Buffer *s_cb_blit;
++static ID3D11SamplerState *s_smp_lin;
++static ID3D11RasterizerState *s_rs_blit;
++static ID3D11BlendState *s_bs_blit;
++static ID3D11DepthStencilState *s_dss_blit;
++
++static int blit_init(void)
++{
++    static int done;
++    ID3DBlob *vb = NULL, *pb = NULL, *err = NULL;
++    D3D11_BUFFER_DESC bd;
++    D3D11_SAMPLER_DESC sd;
++    D3D11_RASTERIZER_DESC rd;
++    D3D11_BLEND_DESC bld;
++    D3D11_DEPTH_STENCIL_DESC dd;
++
++    if (done)
++        return done > 0;
++    done = -1;
++    if (FAILED(D3DCompile(s_hlsl_blit, sizeof s_hlsl_blit - 1, "blit", NULL, NULL, "vs_blit",
++                          "vs_5_0", 0, 0, &vb, &err))
++        || FAILED(D3DCompile(s_hlsl_blit, sizeof s_hlsl_blit - 1, "blit", NULL, NULL, "ps_blit",
++                             "ps_5_0", 0, 0, &pb, &err))) {
++        fprintf(stderr, "  [D3D11] blit shader: %s\n",
++                err ? (const char *)ID3D10Blob_GetBufferPointer(err) : "?");
++        return 0;
++    }
++    ID3D11Device_CreateVertexShader(s_dev, ID3D10Blob_GetBufferPointer(vb),
++                                    ID3D10Blob_GetBufferSize(vb), NULL, &s_vs_blit);
++    ID3D11Device_CreatePixelShader(s_dev, ID3D10Blob_GetBufferPointer(pb),
++                                   ID3D10Blob_GetBufferSize(pb), NULL, &s_ps_blit);
++    ID3D10Blob_Release(vb);
++    ID3D10Blob_Release(pb);
++    memset(&bd, 0, sizeof bd);
++    bd.ByteWidth = 16;
++    bd.Usage = D3D11_USAGE_DYNAMIC;
++    bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
++    bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
++    ID3D11Device_CreateBuffer(s_dev, &bd, NULL, &s_cb_blit);
++    memset(&sd, 0, sizeof sd);
++    sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
++    sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
++    sd.MaxLOD = D3D11_FLOAT32_MAX;
++    ID3D11Device_CreateSamplerState(s_dev, &sd, &s_smp_lin);
++    memset(&rd, 0, sizeof rd);
++    rd.FillMode = D3D11_FILL_SOLID;
++    rd.CullMode = D3D11_CULL_NONE;
++    rd.DepthClipEnable = TRUE;
++    ID3D11Device_CreateRasterizerState(s_dev, &rd, &s_rs_blit);
++    memset(&bld, 0, sizeof bld);
++    bld.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
++    bld.RenderTarget[0].SrcBlend = bld.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
++    bld.RenderTarget[0].DestBlend = bld.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ZERO;
++    bld.RenderTarget[0].BlendOp = bld.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
++    ID3D11Device_CreateBlendState(s_dev, &bld, &s_bs_blit);
++    memset(&dd, 0, sizeof dd);
++    ID3D11Device_CreateDepthStencilState(s_dev, &dd, &s_dss_blit);
++    done = s_vs_blit && s_ps_blit && s_cb_blit && s_smp_lin && s_rs_blit
++        && s_bs_blit && s_dss_blit ? 1 : -1;
++    return done > 0;
++}
++
++/* Draw `src` (texture coordinates u0,v0..u1,v1) into the rectangle
++ * x,y,w,h of `dst`. Leaves the output merger, viewport and scissor as it
++ * found them: blits happen in the middle of setting up a draw (a texture
++ * read that needs a target written back). */
++static void blit(ID3D11ShaderResourceView *src, ID3D11RenderTargetView *dst,
++                 float x, float y, float w, float h,
++                 float u0, float v0, float u1, float v1)
++{
++    ID3D11RenderTargetView *old_rtv = NULL;
++    ID3D11DepthStencilView *old_dsv = NULL;
++    D3D11_VIEWPORT old_vp, vp;
++    D3D11_RECT old_sc;
++    UINT nvp = 1, nsc = 1, zero = 0;
++    D3D11_MAPPED_SUBRESOURCE m;
++    ID3D11ShaderResourceView *none = NULL;
++
++    if (!blit_init())
++        return;
++    ID3D11DeviceContext_OMGetRenderTargets(s_ctx, 1, &old_rtv, &old_dsv);
++    ID3D11DeviceContext_RSGetViewports(s_ctx, &nvp, &old_vp);
++    ID3D11DeviceContext_RSGetScissorRects(s_ctx, &nsc, &old_sc);
++
++    if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_cb_blit, 0,
++                                          D3D11_MAP_WRITE_DISCARD, 0, &m))) {
++        float *f = (float *)m.pData;
++        f[0] = u0; f[1] = v0; f[2] = u1; f[3] = v1;
++        ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_cb_blit, 0);
++    }
++    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &none);
++    ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &dst, NULL);
++    vp.TopLeftX = x; vp.TopLeftY = y; vp.Width = w; vp.Height = h;
++    vp.MinDepth = 0.0f; vp.MaxDepth = 1.0f;
++    ID3D11DeviceContext_RSSetViewports(s_ctx, 1, &vp);
++    ID3D11DeviceContext_RSSetState(s_ctx, s_rs_blit);
++    ID3D11DeviceContext_OMSetBlendState(s_ctx, s_bs_blit, NULL, 0xFFFFFFFFu);
++    ID3D11DeviceContext_OMSetDepthStencilState(s_ctx, s_dss_blit, 0);
++    ID3D11DeviceContext_IASetInputLayout(s_ctx, NULL);
++    ID3D11DeviceContext_IASetPrimitiveTopology(s_ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
++    ID3D11DeviceContext_VSSetShader(s_ctx, s_vs_blit, NULL, 0);
++    ID3D11DeviceContext_VSSetConstantBuffers(s_ctx, 0, 1, &s_cb_blit);
++    ID3D11DeviceContext_PSSetShader(s_ctx, s_ps_blit, NULL, 0);
++    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &src);
++    ID3D11DeviceContext_PSSetSamplers(s_ctx, 0, 1, &s_smp_lin);
++    ID3D11DeviceContext_Draw(s_ctx, 3, 0);
++    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &none);
++
++    ID3D11DeviceContext_OMSetRenderTargets(s_ctx, old_rtv ? 1 : 0, &old_rtv, old_dsv);
++    if (nvp) ID3D11DeviceContext_RSSetViewports(s_ctx, 1, &old_vp);
++    if (nsc) ID3D11DeviceContext_RSSetScissorRects(s_ctx, 1, &old_sc);
++    if (old_rtv) ID3D11RenderTargetView_Release(old_rtv);
++    if (old_dsv) ID3D11DepthStencilView_Release(old_dsv);
++    (void)zero;
++}
++
++static UINT scaled(uint32_t v)
++{
++    return (UINT)(v * s_scale + 0.5f);
++}
++
 +/* Guest pixels -> render target. 32-bit surfaces are B8G8R8A8 already;
 + * 16-bit ones are widened as R5G6B5, or as G8B8 into blue and green. */
 +static void rt_upload(Target *t)
@@ -3443,8 +4127,8 @@ index 0000000..e33c617
 +    t->gpu_valid = 1;
 +    t->guest_hash = hash_bytes(mem, (size_t)t->pitch * t->height);
 +    if (t->bpp == 4) {
-+        ID3D11DeviceContext_UpdateSubresource(s_ctx, (ID3D11Resource *)t->tex, 0,
-+                                              NULL, mem, t->pitch, 0);
++        ID3D11DeviceContext_UpdateSubresource(s_ctx,
++                (ID3D11Resource *)(t->lo ? t->lo : t->tex), 0, NULL, mem, t->pitch, 0);
 +    } else {
 +        uint32_t *c = conv_buf((size_t)t->width * t->height), x, y;
 +        if (!c) return;
@@ -3464,9 +4148,12 @@ index 0000000..e33c617
 +                d[x] = 0xFF000000u | (r << 16) | (g << 8) | b;
 +            }
 +        }
-+        ID3D11DeviceContext_UpdateSubresource(s_ctx, (ID3D11Resource *)t->tex, 0,
-+                                              NULL, c, t->width * 4, 0);
++        ID3D11DeviceContext_UpdateSubresource(s_ctx,
++                (ID3D11Resource *)(t->lo ? t->lo : t->tex), 0, NULL, c, t->width * 4, 0);
 +    }
++    if (t->lo)                               /* scaled: guest size -> target */
++        blit(t->lo_srv, t->rtv, 0.0f, 0.0f, (float)t->sw, (float)t->sh,
++             0.0f, 0.0f, 1.0f, 1.0f);
 +}
 +
 +/* Render target -> guest pixels. */
@@ -3480,8 +4167,15 @@ index 0000000..e33c617
 +        return;
 +    t->dirty = 0;
 +    s_st.writebacks++;
-+    ID3D11DeviceContext_CopyResource(s_ctx, (ID3D11Resource *)t->staging,
-+                                     (ID3D11Resource *)t->tex);
++    if (t->lo) {                             /* scaled: target -> guest size */
++        blit(t->srv, t->lo_rtv, 0.0f, 0.0f, (float)t->width, (float)t->height,
++             0.0f, 0.0f, 1.0f, 1.0f);
++        ID3D11DeviceContext_CopyResource(s_ctx, (ID3D11Resource *)t->staging,
++                                         (ID3D11Resource *)t->lo);
++    } else {
++        ID3D11DeviceContext_CopyResource(s_ctx, (ID3D11Resource *)t->staging,
++                                         (ID3D11Resource *)t->tex);
++    }
 +    {
 +        LARGE_INTEGER a, b, f;
 +        HRESULT hr;
@@ -3526,6 +4220,9 @@ index 0000000..e33c617
 +    if (t->copy) ID3D11Texture2D_Release(t->copy);
 +    if (t->tex) ID3D11Texture2D_Release(t->tex);
 +    if (t->staging) ID3D11Texture2D_Release(t->staging);
++    if (t->lo_rtv) ID3D11RenderTargetView_Release(t->lo_rtv);
++    if (t->lo_srv) ID3D11ShaderResourceView_Release(t->lo_srv);
++    if (t->lo) ID3D11Texture2D_Release(t->lo);
 +    memset(t, 0, sizeof *t);
 +}
 +
@@ -3555,8 +4252,8 @@ index 0000000..e33c617
 +        rt_release(t);
 +    }
 +    memset(&td, 0, sizeof td);
-+    td.Width = w;
-+    td.Height = h;
++    td.Width = scaled(w);
++    td.Height = scaled(h);
 +    td.MipLevels = 1;
 +    td.ArraySize = 1;
 +    td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
@@ -3565,6 +4262,18 @@ index 0000000..e33c617
 +    td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
 +    if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &t->tex)))
 +        return NULL;
++    t->sw = td.Width;
++    t->sh = td.Height;
++    td.Width = w;
++    td.Height = h;
++    if (s_scale != 1.0f) {
++        if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &t->lo))) {
++            rt_release(t);
++            return NULL;
++        }
++        ID3D11Device_CreateRenderTargetView(s_dev, (ID3D11Resource *)t->lo, NULL, &t->lo_rtv);
++        ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)t->lo, NULL, &t->lo_srv);
++    }
 +    td.Usage = D3D11_USAGE_STAGING;
 +    td.BindFlags = 0;
 +    td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
@@ -3580,6 +4289,8 @@ index 0000000..e33c617
 +    t->width = w;
 +    t->height = h;
 +    t->g8b8 = bpp == 2 && s->color_format == 0xA;
++    t->aa_sx = s->aa_sx ? s->aa_sx : 1;
++    t->aa_sy = s->aa_sy ? s->aa_sy : 1;
 +    return t;
 +}
 +
@@ -3656,7 +4367,7 @@ index 0000000..e33c617
 +        }
 +        s_cur = t;
 +    }
-+    dsv = rs ? ds_get(rs->zeta_va, t->width, t->height) : NULL;
++    dsv = rs ? ds_get(rs->zeta_va, t->sw, t->sh) : NULL;
 +    ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &t->rtv, dsv);
 +    return t;
 +}
@@ -3934,17 +4645,17 @@ index 0000000..e33c617
 +    D3D11_RECT sc;
 +    vp.TopLeftX = 0;
 +    vp.TopLeftY = 0;
-+    vp.Width = (float)t->width;
-+    vp.Height = (float)t->height;
++    vp.Width = (float)t->sw;
++    vp.Height = (float)t->sh;
 +    vp.MinDepth = 0.0f;
 +    vp.MaxDepth = 1.0f;
 +    ID3D11DeviceContext_RSSetViewports(s_ctx, 1, &vp);
 +    /* The executor clips to SET_SURFACE_CLIP; s->width/height are its size
-+     * at the origin the executor already applied. */
-+    sc.left = (LONG)s->clip_x;
-+    sc.top = (LONG)s->clip_y;
-+    sc.right = (LONG)(s->clip_x + s->width < t->width ? s->clip_x + s->width : t->width);
-+    sc.bottom = (LONG)(s->clip_y + s->height < t->height ? s->clip_y + s->height : t->height);
++     * at the origin the executor already applied. In target pixels. */
++    sc.left = (LONG)scaled(s->clip_x);
++    sc.top = (LONG)scaled(s->clip_y);
++    sc.right = (LONG)scaled(s->clip_x + s->width < t->width ? s->clip_x + s->width : t->width);
++    sc.bottom = (LONG)scaled(s->clip_y + s->height < t->height ? s->clip_y + s->height : t->height);
 +    ID3D11DeviceContext_RSSetScissorRects(s_ctx, 1, &sc);
 +}
 +
@@ -3961,17 +4672,17 @@ index 0000000..e33c617
 +        float c[4];
 +        D3D11_RECT r;
 +        unpack(argb, c);
-+        r.left = (LONG)s->clip_x;
-+        r.top = (LONG)s->clip_y;
-+        r.right = (LONG)(s->clip_x + s->width < t->width ? s->clip_x + s->width : t->width);
-+        r.bottom = (LONG)(s->clip_y + s->height < t->height ? s->clip_y + s->height : t->height);
++        r.left = (LONG)scaled(s->clip_x);
++        r.top = (LONG)scaled(s->clip_y);
++        r.right = (LONG)scaled(s->clip_x + s->width < t->width ? s->clip_x + s->width : t->width);
++        r.bottom = (LONG)scaled(s->clip_y + s->height < t->height ? s->clip_y + s->height : t->height);
 +        if (s_ctx1)
 +            ID3D11DeviceContext1_ClearView(s_ctx1, (ID3D11View *)t->rtv, c, &r, 1);
 +        else
 +            ID3D11DeviceContext_ClearRenderTargetView(s_ctx, t->rtv, c);
 +        t->dirty = 1;
 +    }
-+    dsv = ds_get(rs->zeta_va, t->width, t->height);
++    dsv = ds_get(rs->zeta_va, t->sw, t->sh);
 +    if (dsv && (flags & 3)) {
 +        float z = rs->depth_scale > 0.0f ? rs->zclear / rs->depth_scale : 1.0f;
 +        UINT what = ((flags & 1) ? D3D11_CLEAR_DEPTH : 0)
@@ -4728,10 +5439,187 @@ index 0000000..e33c617
 +    return 1;
 +}
 +
++
++/* The finished frame, straight to the window. Returns 1 if it was shown. */
++static IDXGISwapChain1 *s_swap;
++static ID3D11RenderTargetView *s_bb_rtv;
++static UINT s_bb_w, s_bb_h;
++
++static int present_to_window(uint32_t pva)
++{
++    static int mode = -1, vsync;
++    HWND hwnd;
++    RECT cr;
++    UINT cw, ch;
++    uint32_t dw = 640, dh = 480;
++    Target *t = NULL;
++    int i;
++
++    if (mode < 0) {
++        const char *e = getenv("RECOMP_D3D11_PRESENT"), *v = getenv("RECOMP_VSYNC");
++        mode = !(e && *e == '0');
++        vsync = v && *v && *v != '0';
++    }
++    if (!mode || !pva || !(hwnd = xbox_FramebufferWindowHwnd()))
++        return 0;
++    for (i = 0; i < RT_MAX; i++)
++        if (s_rt[i].tex && s_rt[i].va == pva) { t = &s_rt[i]; break; }
++    if (!t || !t->gpu_valid || !blit_init())
++        return 0;
++    if (!GetClientRect(hwnd, &cr) || cr.right <= 0 || cr.bottom <= 0)
++        return 0;                               /* minimised */
++    cw = (UINT)cr.right;
++    ch = (UINT)cr.bottom;
++
++    if (!s_swap) {
++        IDXGIDevice *dxd = NULL;
++        IDXGIAdapter *ad = NULL;
++        IDXGIFactory2 *fac = NULL;
++        DXGI_SWAP_CHAIN_DESC1 sd;
++        HRESULT hr = ID3D11Device_QueryInterface(s_dev, &IID_IDXGIDevice, (void **)&dxd);
++        if (SUCCEEDED(hr)) hr = IDXGIDevice_GetAdapter(dxd, &ad);
++        if (SUCCEEDED(hr)) hr = IDXGIAdapter_GetParent(ad, &IID_IDXGIFactory2, (void **)&fac);
++        if (SUCCEEDED(hr)) {
++            memset(&sd, 0, sizeof sd);
++            sd.Width = cw;
++            sd.Height = ch;
++            sd.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
++            sd.SampleDesc.Count = 1;
++            sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
++            sd.BufferCount = 2;
++            sd.Scaling = DXGI_SCALING_STRETCH;
++            sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
++            sd.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
++            hr = IDXGIFactory2_CreateSwapChainForHwnd(fac, (IUnknown *)s_dev, hwnd, &sd,
++                                                      NULL, NULL, &s_swap);
++            if (SUCCEEDED(hr))  /* the window does its own F11 / Alt+Enter */
++                IDXGIFactory2_MakeWindowAssociation(fac, hwnd,
++                        DXGI_MWA_NO_ALT_ENTER | DXGI_MWA_NO_WINDOW_CHANGES);
++        }
++        if (fac) IDXGIFactory2_Release(fac);
++        if (ad) IDXGIAdapter_Release(ad);
++        if (dxd) IDXGIDevice_Release(dxd);
++        if (FAILED(hr) || !s_swap) {
++            d3d_log("CreateSwapChainForHwnd (falling back to the GDI window)", hr);
++            mode = 0;
++            return 0;
++        }
++        s_bb_w = cw;
++        s_bb_h = ch;
++        xbox_FramebufferWindowGpuPresent(1);
++        fprintf(stderr, "  [D3D11] presenting straight to the window (render scale %.2f%s)\n",
++                s_scale, vsync ? ", vsync" : "");
++        fflush(stderr);
++    }
++    if (cw != s_bb_w || ch != s_bb_h) {             /* resized, fullscreen */
++        if (s_bb_rtv) { ID3D11RenderTargetView_Release(s_bb_rtv); s_bb_rtv = NULL; }
++        ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 0, NULL, NULL);
++        if (FAILED(IDXGISwapChain1_ResizeBuffers(s_swap, 0, cw, ch, DXGI_FORMAT_UNKNOWN, 0)))
++            return 0;
++        s_bb_w = cw;
++        s_bb_h = ch;
++    }
++    if (!s_bb_rtv) {
++        ID3D11Texture2D *bb = NULL;
++        if (FAILED(IDXGISwapChain1_GetBuffer(s_swap, 0, &IID_ID3D11Texture2D, (void **)&bb)))
++            return 0;
++        ID3D11Device_CreateRenderTargetView(s_dev, (ID3D11Resource *)bb, NULL, &s_bb_rtv);
++        ID3D11Texture2D_Release(bb);
++        if (!s_bb_rtv)
++            return 0;
++    }
++    {
++        static const float black[4] = { 0, 0, 0, 1 };
++        float sx, sy, vw, vh, ax, ay;
++        xbox_FramebufferWindowDisplaySize(&dw, &dh);
++        if (!dw || !dh) { dw = 640; dh = 480; }
++        /* The display mode's shape, letterboxed into the client area. */
++        vw = (float)cw;
++        vh = vw * dh / dw;
++        if (vh > ch) { vh = (float)ch; vw = vh * dw / dh; }
++        ax = (cw - vw) * 0.5f;
++        ay = (ch - vh) * 0.5f;
++        sx = (float)(dw * t->aa_sx) / (float)t->width;
++        sy = (float)(dh * t->aa_sy) / (float)t->height;
++        if (sx > 1.0f) sx = 1.0f;
++        if (sy > 1.0f) sy = 1.0f;
++        ID3D11DeviceContext_ClearRenderTargetView(s_ctx, s_bb_rtv, black);
++        blit(t->srv, s_bb_rtv, ax, ay, vw, vh, 0.0f, 0.0f, sx, sy);
++    }
++    /* RECOMP_PRESENT_DUMP=<file.bmp>[:<n>]: the n-th presented frame
++     * (default 600), as the window shows it -- the check that scaled
++     * rendering reaches the screen. */
++    {
++        static int dump_at = -1, presents;
++        static char dump_path[MAX_PATH];
++        if (dump_at < 0) {
++            const char *e = getenv("RECOMP_PRESENT_DUMP");
++            dump_at = 0;
++            if (e && *e) {
++                const char *c = strrchr(e, ':');
++                snprintf(dump_path, sizeof dump_path, "%s", e);
++                dump_at = 600;
++                if (c && c > e + 2 && c[1] >= '0' && c[1] <= '9') {
++                    dump_path[c - e] = 0;
++                    dump_at = atoi(c + 1);
++                }
++            }
++        }
++        if (dump_at && ++presents == dump_at) {
++            ID3D11Texture2D *bb = NULL, *st = NULL;
++            D3D11_TEXTURE2D_DESC td;
++            D3D11_MAPPED_SUBRESOURCE m;
++            if (SUCCEEDED(IDXGISwapChain1_GetBuffer(s_swap, 0, &IID_ID3D11Texture2D, (void **)&bb))) {
++                ID3D11Texture2D_GetDesc(bb, &td);
++                td.Usage = D3D11_USAGE_STAGING;
++                td.BindFlags = 0;
++                td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
++                td.MiscFlags = 0;
++                if (SUCCEEDED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &st))) {
++                    ID3D11DeviceContext_CopyResource(s_ctx, (ID3D11Resource *)st, (ID3D11Resource *)bb);
++                    if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)st, 0,
++                                                          D3D11_MAP_READ, 0, &m))) {
++                        FILE *f = fopen(dump_path, "wb");
++                        if (f) {
++                            uint32_t row = td.Width * 4, img = row * td.Height, total = 54 + img, y;
++                            int32_t hh = -(int32_t)td.Height;
++                            uint8_t hdr[54];
++                            memset(hdr, 0, sizeof hdr);
++                            hdr[0] = 'B'; hdr[1] = 'M';
++                            memcpy(hdr + 2, &total, 4);
++                            hdr[10] = 54; hdr[14] = 40;
++                            memcpy(hdr + 18, &td.Width, 4);
++                            memcpy(hdr + 22, &hh, 4);
++                            hdr[26] = 1; hdr[28] = 32;
++                            memcpy(hdr + 34, &img, 4);
++                            fwrite(hdr, 1, 54, f);
++                            for (y = 0; y < td.Height; y++)
++                                fwrite((const uint8_t *)m.pData + (size_t)y * m.RowPitch, 1, row, f);
++                            fclose(f);
++                            fprintf(stderr, "  [D3D11] presented frame %d (%ux%u) -> %s\n",
++                                    presents, td.Width, td.Height, dump_path);
++                        }
++                        ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)st, 0);
++                    }
++                    ID3D11Texture2D_Release(st);
++                }
++                ID3D11Texture2D_Release(bb);
++            }
++        }
++    }
++    IDXGISwapChain1_Present(s_swap, vsync ? 1 : 0, 0);
++    return 1;
++}
++
 +static void d3d_flip(void)
 +{
++    static int dumping = -1;
++    int presented;
 +    if (!s_dev)
 +        return;
++    if (dumping < 0)
++        dumping = getenv("RECOMP_FB_DUMP") != NULL;
++    presented = present_to_window(nv2a_backend_present_va());
 +    /* Write back every target drawn this frame: the window and the dumps
 +     * read the finished frame from guest memory, and the one being shown is
 +     * not always the one drawn last (MA2 draws effects into offscreen
@@ -4747,6 +5635,10 @@ index 0000000..e33c617
 +            /* Only the presented surface; offscreen targets stay on the GPU
 +             * (anything that reads one as ordinary memory syncs it first). */
 +            if (pva && !(r->va <= pva && pva < r->va + r->pitch * r->height))
++                continue;
++            /* Shown from the GPU already: guest memory catches up only when
++             * something reads it (or frame dumps want it). */
++            if (presented && !dumping)
 +                continue;
 +            rt_writeback(r);
 +        }
