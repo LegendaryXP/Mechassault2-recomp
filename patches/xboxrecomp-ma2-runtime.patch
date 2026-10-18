@@ -244,6 +244,90 @@ index 3a09ca8..028893b 100644
  /* =========================================================================
   * x86 port I/O
   *
+diff --git a/src/kernel/kernel_memory.c b/src/kernel/kernel_memory.c
+index e66e3de..df01bde 100644
+--- a/src/kernel/kernel_memory.c
++++ b/src/kernel/kernel_memory.c
+@@ -10,6 +10,7 @@
+  */
+ 
+ #include "kernel.h"
++#include <stdlib.h>
+ #include "xbox_memory_layout.h"   /* xbox_PhysNoteRamName */
+ #if defined(_WIN32)
+ /* _aligned_malloc/_aligned_free; POSIX gets them from win32_compat.h */
+@@ -139,12 +140,42 @@ NTSTATUS __stdcall xbox_MmQueryStatistics(PXBOX_MM_STATISTICS MemoryStatistics)
+     memset(MemoryStatistics, 0, sizeof(XBOX_MM_STATISTICS));
+     MemoryStatistics->Length = sizeof(XBOX_MM_STATISTICS);
+ 
+-    /* Xbox has 64MB RAM. Report plausible values. */
++    /* The console's budget, not the host's.
++     *
++     * This used to report the host's free memory clamped to half of 64 MB, a
++     * constant 32 MB "available" however much the title had allocated. A title
++     * that sizes its caches from GlobalMemoryStatus (which reads this) then
++     * never sees memory shrink and never evicts: MechAssault 2's allocator
++     * (sub_0001C9F0 and friends, through XAPI's sub_002B82C7) kept loading
++     * until the 64 MB contiguous arena was exhausted during its first mission
++     * load. On hardware every allocation -- the image, the heap, contiguous
++     * memory -- comes out of the same 64 MB, so subtract all of them.
++     * RECOMP_MM_HOST_STATS=1 restores the old behaviour. */
+     ULONG page_size = 4096;
+     MemoryStatistics->TotalPhysicalPages = 64 * 1024 * 1024 / page_size; /* 16384 pages */
+-    MemoryStatistics->AvailablePages = (ULONG)(ms.ullAvailPhys / page_size);
+-    if (MemoryStatistics->AvailablePages > MemoryStatistics->TotalPhysicalPages)
+-        MemoryStatistics->AvailablePages = MemoryStatistics->TotalPhysicalPages / 2;
++    if (getenv("RECOMP_MM_HOST_STATS")) {
++        MemoryStatistics->AvailablePages = (ULONG)(ms.ullAvailPhys / page_size);
++        if (MemoryStatistics->AvailablePages > MemoryStatistics->TotalPhysicalPages)
++            MemoryStatistics->AvailablePages = MemoryStatistics->TotalPhysicalPages / 2;
++    } else {
++        extern uint32_t xbox_HeapInUseBytes(void);
++        extern uint32_t xbox_ContiguousInUseBytes(void);
++        extern uint32_t g_xbox_image_lo, g_xbox_image_hi;
++        const uint64_t total = 64ull * 1024 * 1024;
++        const uint64_t kernel = 2ull * 1024 * 1024;   /* kernel + XAPI reserve */
++        uint64_t image = (g_xbox_image_hi > g_xbox_image_lo)
++                       ? (uint64_t)(g_xbox_image_hi - g_xbox_image_lo) : 0;
++        uint64_t heap = xbox_HeapInUseBytes();
++        uint64_t contig = xbox_ContiguousInUseBytes();
++        uint64_t used = kernel + image + heap + contig;
++
++        MemoryStatistics->AvailablePages =
++            used >= total ? 0 : (ULONG)((total - used) / page_size);
++        MemoryStatistics->VirtualMemoryBytesCommitted = (ULONG)heap;
++        MemoryStatistics->VirtualMemoryBytesReserved = (ULONG)heap;
++        MemoryStatistics->ImagePagesCommitted = (ULONG)(image / page_size);
++        MemoryStatistics->CachePagesCommitted = (ULONG)(contig / page_size);
++    }
+ 
+     return STATUS_SUCCESS;
+ }
+diff --git a/src/kernel/xbox_memory_layout.c b/src/kernel/xbox_memory_layout.c
+index 362cefe..903a466 100644
+--- a/src/kernel/xbox_memory_layout.c
++++ b/src/kernel/xbox_memory_layout.c
+@@ -4459,6 +4459,20 @@ uint32_t xbox_HeapBlockSize(uint32_t xbox_va)
+     return r;
+ }
+ 
++/* Bytes in live heap blocks: what MmQueryStatistics subtracts from the
++ * console's 64 MB along with the contiguous arena. */
++uint32_t xbox_HeapInUseBytes(void)
++{
++    uint64_t sum = 0;
++
++    AcquireSRWLockShared(&g_heap_lock);
++    for (int i = 0; i < g_heap_block_count; i++)
++        if (!g_heap_blocks[i].free)
++            sum += g_heap_blocks[i].size;
++    ReleaseSRWLockShared(&g_heap_lock);
++    return sum > 0xFFFFFFFFull ? 0xFFFFFFFFu : (uint32_t)sum;
++}
++
+ void xbox_HeapFree(uint32_t xbox_va)
+ {
+     static int frees = 0, matched = 0;
 diff --git a/tools/recomp/lifter.py b/tools/recomp/lifter.py
 index baf1834..f96489a 100644
 --- a/tools/recomp/lifter.py

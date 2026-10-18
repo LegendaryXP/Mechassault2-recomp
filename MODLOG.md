@@ -101,3 +101,10 @@
   - Run 38 (300 s, RECOMP_PAD_SCRIPT START every 3 s from 150 s, A every 4 s from 236 s): 1040 flips. Title screen -> MAIN MENU (CAMPAIGN carousel, "Player Options", "A Select") over the 3D hangar -> A selects Campaign -> LOADING bar fills -> black frame -> stall (analysis/fb_run38/sheet_end.png).
   - Next stall: D3D KickOff sub_0040F220 -> sub_0040F7D0 -> sub_0040F980 (probably pushbuffer ring make-space wait), reached from sub_004094F0 <- sub_00065BA0 <- sub_00060840 <- sub_00037100 (campaign load / first mission).
   - Timing: intro+title ~150 s at current speed; title appears ~frame 850.
+- 2026-10-17: MILESTONE COMMITTED (project 54f3cb9, toolkit branch ma2-bringup a502d60)
+- 2026-10-17: POST-LOAD STALL -> memory budget -> GAMEPLAY
+  - Run 39 crashed instead: "[CONTIG] arena exhausted (64380 of 65408 KB in use)" during the campaign load; 1479 contiguous allocs, 0 frees for the whole run.
+  - Cause: MmQueryStatistics reported host free memory clamped to 32 MB, constant. XAPI GlobalMemoryStatus = sub_002B82C7, called by the game's allocator (sub_000121C0 init, sub_0001C000, sub_0001C9F0, sub_0001CB40, sub_0001E100) -> never saw memory shrink -> never evicted.
+  - Fix (toolkit, committed on ma2-bringup): AvailablePages = 64 MB - 2 MB kernel - image - live heap (xbox_HeapInUseBytes) - contiguous in use. RECOMP_MM_HOST_STATS=1 = old behaviour.
+  - Run 40 (420 s, START/A script): contiguous use levels off at ~46 MB; title -> menu -> Campaign -> mission 1 loads and PLAYS: mech in city level, HUD/radar/weapon panel, tutorial prompts ("Pull the Right trigger to fire lasers", mortar hints), pause menu (Resume Game/Controls/Volume/Video Settings/Restart Mission/Quit, "Xbox Live: Sign-in Failed"). ~1.5 fps in-mission with BMP frame dumps on (analysis/fb_run40/sheet_end.png).
+  - Idle-fence fallback fires a handful of times per run (4 in run 40).
