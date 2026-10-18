@@ -17,9 +17,8 @@ $env:RECOMP_WATCHDOG_SECS = "$Secs"
 $env:RECOMP_AC97_READY = '1'; $env:RECOMP_PB_EXEC = '1'; $env:RECOMP_PB_WALK = 'dma'; $env:RECOMP_ASYNC_IO = '1'; $env:RECOMP_VBLANK = '1'; $env:RECOMP_HEAP_RECLAIM = '1'
 $env:RECOMP_USB = $(if ($NoUsb) { $null } else { '1' }); $env:RECOMP_USB_PADS = $(if ($NoUsb) { $null } else { '1' })
 $env:RECOMP_KEYBOARD = $(if ($NoKeyboard) { $null } else { '1' })
-# As play.bat: DirectSound's APU restarts off (audio), 4:3 until 16:9 boots.
+# As play.bat: DirectSound's APU restarts off (audio).
 $env:RECOMP_APU_SSL_IRQ = '0'; $env:RECOMP_APU_EP_MARK = '1'
-if (-not $env:RECOMP_WIDESCREEN) { $env:RECOMP_WIDESCREEN = '0' }
 $env:RECOMP_MUTE = '1'          # test runs are silent; play.bat is not
 $env:MA2_SKIP_ICALL = $Skip
 if ($Frames) {

@@ -49,7 +49,8 @@ if "%RECOMP_MKB%"=="" set RECOMP_MKB=1
 if "%RECOMP_MKB_INI%"=="" set RECOMP_MKB_INI=%~dp0mkb.ini
 rem Render on the graphics card (set RECOMP_D3D11=0 for the CPU rasteriser).
 if "%RECOMP_D3D11%"=="" set RECOMP_D3D11=1
-rem Render at 2.25x the Xbox's 640x480, i.e. 1440x1080, for a 1080p screen.
+rem Render at 2.25x the Xbox's 480 lines (1620x1080 in 16:9, 1440x1080 in
+rem 4:3), for a 1080p screen.
 rem Battle runs 60-100 fps at this size on the test PC; RECOMP_RENDER_SCALE=1
 rem is the original resolution, 1.5 is 720p.
 if "%RECOMP_RENDER_SCALE%"=="" set RECOMP_RENDER_SCALE=2.25
@@ -58,7 +59,7 @@ rem Audio: without these DirectSound kept restarting the sound chip, and
 rem three quarters of the sound came out as silence (the static).
 set RECOMP_APU_SSL_IRQ=0
 set RECOMP_APU_EP_MARK=1
-rem The 16:9 mode is still being brought up and does not boot yet.
-if "%RECOMP_WIDESCREEN%"=="" set RECOMP_WIDESCREEN=0
+rem 16:9: the console is set up for a widescreen TV, so the game draws its
+rem widescreen mode and the window is 16:9. RECOMP_WIDESCREEN=0 = 4:3 TV.
 
 start "MechAssault 2" /min cmd /c "build\Release\ma2.exe 1>logs\last_stdout.txt 2>logs\last_stderr.txt"
