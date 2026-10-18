@@ -467,7 +467,7 @@ index 327f01d..54c7e3c 100644
   * of the semaphore the title reads GPU progress from (for XDK D3D, the
   * pointer at device+0x30). The executor writes each release there once it
 diff --git a/src/kernel/nv2a_pb_exec.c b/src/kernel/nv2a_pb_exec.c
-index 1280565..66b88a5 100644
+index 1280565..ef7d61c 100644
 --- a/src/kernel/nv2a_pb_exec.c
 +++ b/src/kernel/nv2a_pb_exec.c
 @@ -767,6 +767,11 @@ void nv2a_backend_register(const Nv2aBackend *backend)
@@ -482,12 +482,29 @@ index 1280565..66b88a5 100644
  static int backend_draws(void)
  {
      return s_backend && s_backend->draw;
-@@ -781,6 +786,21 @@ static void current_surface(Nv2aSurface *out)
+@@ -781,6 +786,38 @@ static void current_surface(Nv2aSurface *out)
      out->bytes_per_pixel = surface_bpp();
      out->aa_sx           = s_gpu.aa_sx > 1.5f ? 2 : 1;
      out->aa_sy           = s_gpu.aa_sy > 1.5f ? 2 : 1;
 +    out->clip_x          = s_gpu.clip_x;
 +    out->clip_y          = s_gpu.clip_y;
++    /* Which 16-bit layout each 2-byte surface really is, once per address.
++     * A back end only gets bytes_per_pixel and treats every such surface as
++     * R5G6B5, which is wrong for X1R5G5B5 (0x1/0x2) and G8B8 (0xA). MA2
++     * samples two 256x256 2-byte targets as LIN_G8B8; this says whether they
++     * were drawn as G8B8 or as R5G6B5 reinterpreted. */
++    if (out->bytes_per_pixel == 2) {
++        static uint32_t seen[8];
++        static int n;
++        int i;
++        for (i = 0; i < n && seen[i] != out->color_va; i++)
++            ;
++        if (i == n && n < 8) {
++            seen[n++] = out->color_va;
++            fprintf(stderr, "  [GPU] 16-bit surface 0x%08X pitch %u: colour format 0x%X\n",
++                    out->color_va, out->pitch, s_gpu.format & 0xF);
++        }
++    }
 +}
 +
 +static float zclear_value(void);
@@ -504,7 +521,7 @@ index 1280565..66b88a5 100644
  }
  
  /* Render state in the NV2A's own values, gathered from what the executor
-@@ -814,6 +834,8 @@ static void current_render_state(Nv2aRenderState *r)
+@@ -814,6 +851,8 @@ static void current_render_state(Nv2aRenderState *r)
      r->stencil_fail      = s_reg[0x0370 / 4];        /* SET_STENCIL_OP_FAIL */
      r->stencil_zfail     = s_reg[0x0374 / 4];        /* SET_STENCIL_OP_ZFAIL */
      r->stencil_zpass     = s_reg[0x0378 / 4];        /* SET_STENCIL_OP_ZPASS */
@@ -513,7 +530,7 @@ index 1280565..66b88a5 100644
  }
  
  static int sample_texture(uint32_t u, uint32_t v, uint32_t *argb);
-@@ -831,7 +853,7 @@ int nv2a_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out)
+@@ -831,7 +870,7 @@ int nv2a_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out)
      s_gpu.texs[0].color  = tex->color;
      s_gpu.texs[0].addr_u = 3;
      s_gpu.texs[0].addr_v = 3;
@@ -522,7 +539,7 @@ index 1280565..66b88a5 100644
      s_gpu.texs[0].levels = 1;
      s_gpu.texs[0].filter = 0;
      s_gpu.texs[0].cube   = 0;
-@@ -846,6 +868,18 @@ int nv2a_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out)
+@@ -846,6 +885,18 @@ int nv2a_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out)
      return ok;
  }
  
@@ -541,7 +558,42 @@ index 1280565..66b88a5 100644
  static void clear_surface(uint32_t param)
  {
      uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
-@@ -1920,37 +1954,80 @@ static void backend_from_xf(const Nv2aVshOutput *v, Nv2aVertex *o)
+@@ -1064,6 +1115,8 @@ static uint32_t linear_twin(uint32_t fmt)
+     case 0x06: return 0x12;                /* A8R8G8B8  -> LIN_A8R8G8B8  */
+     case 0x07: return 0x1E;                /* X8R8G8B8  -> LIN_X8R8G8B8  */
+     case 0x19: return 0x1F;                /* A8        -> LIN_A8        */
++    case 0x1A: return 0x20;                /* A8L8      -> LIN_A8L8      */
++    case 0x28: return 0x17;                /* G8B8      -> LIN_G8B8      */
+     default:   return fmt;                 /* already linear, or unhandled */
+     }
+ }
+@@ -1200,6 +1253,25 @@ static int sample_tex(const Texture *t, uint32_t face_offset,
+         return 1;
+     }
+ 
++    /* 16-bit, two 8-bit channels. NV097 names them from the top byte down,
++     * so G8B8 is B in the low byte and G in the high one, and A8Y8 is
++     * luminance low, alpha high. What a sample returns in the channels the
++     * name leaves out is xemu's table (pgraph/gl/constants.h), and
++     * Cxbx-Reloaded's converters agree: G8B8 reads (R,G,B,A) = (B,G,B,G);
++     * A8Y8 reads (Y,Y,Y,A).
++     * BUMPENVMAP takes its du/dv from B and G, which is why B is the low
++     * byte -- D3D's V8U8 (LIN_V8U8 is this same code) puts U there. */
++    case 0x17: {                                    /* LIN_G8B8 */
++        uint32_t t = ((const uint16_t *)p)[u], lo = t & 0xFFu, hi = t >> 8;
++        *argb = (hi << 24) | (lo << 16) | (hi << 8) | lo;
++        return 1;
++    }
++    case 0x20: {                                    /* LIN_A8L8 (A8Y8) */
++        uint32_t t = ((const uint16_t *)p)[u], lo = t & 0xFFu;
++        *argb = ((t >> 8) << 24) | (lo << 16) | (lo << 8) | lo;
++        return 1;
++    }
++
+     /* 8-bit. */
+     case 0x13: {                                    /* LIN_L8 */
+         uint32_t t = p[u];
+@@ -1920,37 +1992,80 @@ static void backend_from_xf(const Nv2aVshOutput *v, Nv2aVertex *o)
      o->diffuse = pack_color(v->d0);
      o->u = v->tex[0][0] * su;
      o->v = v->tex[0][1] * sv;
@@ -640,7 +692,7 @@ index 1280565..66b88a5 100644
      s_backend->draw(&surf, &batch);
      s_gpu.tris_drawn += s_bcount / 3;
      s_bcount = 0;
-@@ -1995,7 +2072,12 @@ static void raster_indexed(uint32_t i0, uint32_t i1, uint32_t i2, uint32_t argb)
+@@ -1995,7 +2110,12 @@ static void raster_indexed(uint32_t i0, uint32_t i1, uint32_t i2, uint32_t argb)
              o[k].diffuse = vertex_color(ix[k]);
              o[k].u = textured ? uv[k][0] : 0.0f;
              o[k].v = textured ? uv[k][1] : 0.0f;
@@ -653,7 +705,16 @@ index 1280565..66b88a5 100644
          s_bcount += 3;
          return;
      }
-@@ -2388,12 +2470,65 @@ static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
+@@ -2106,7 +2226,7 @@ static uint32_t tex_texel_bytes(uint32_t fmt)
+     case 0x00: case 0x01: case 0x0B: case 0x13: case 0x19: case 0x1F:
+         return 1;
+     case 0x02: case 0x03: case 0x04: case 0x05: case 0x10: case 0x11:
+-    case 0x1C: case 0x1D:
++    case 0x17: case 0x1A: case 0x1C: case 0x1D: case 0x20: case 0x28:
+         return 2;
+     default:
+         return 4;
+@@ -2388,12 +2508,65 @@ static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
  #define NV_RASTER_MAX_THREADS 16
  #define NV_RASTER_MT_MIN_PIXELS 8192
  
@@ -719,7 +780,7 @@ index 1280565..66b88a5 100644
      XfCount cnt[NV_RASTER_MAX_THREADS];
  } s_pool;
  
-@@ -2403,7 +2538,12 @@ static DWORD WINAPI raster_worker(LPVOID arg)
+@@ -2403,7 +2576,12 @@ static DWORD WINAPI raster_worker(LPVOID arg)
      for (;;) {
          WaitForSingleObject(s_pool.start[k], INFINITE);
          memset(&s_pool.cnt[k], 0, sizeof s_pool.cnt[k]);
@@ -733,7 +794,7 @@ index 1280565..66b88a5 100644
          if (InterlockedDecrement(&s_pool.pending) == 0)
              SetEvent(s_pool.done);
      }
-@@ -2462,11 +2602,83 @@ static void xf_rows_parallel(const XfTri *T, XfCount *total)
+@@ -2462,11 +2640,83 @@ static void xf_rows_parallel(const XfTri *T, XfCount *total)
          total->zpass += s_pool.cnt[k].zpass;
      }
  }
@@ -817,7 +878,7 @@ index 1280565..66b88a5 100644
  #endif
  
  static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
-@@ -2564,6 +2776,20 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
+@@ -2564,6 +2814,20 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
      s_gpu.xf_drawn++;
      T.inv_area = 1.0f / area;
  
@@ -838,7 +899,7 @@ index 1280565..66b88a5 100644
      xf_rows_parallel(&T, &cnt);
      s_gpu.xf_depth_fail += cnt.depth_fail;
      s_gpu.xf_pixels += cnt.pixels;
-@@ -2664,8 +2890,6 @@ static void raster_xf_clipped(const Nv2aVshOutput *a, const Nv2aVshOutput *b,
+@@ -2664,8 +2928,6 @@ static void raster_xf_clipped(const Nv2aVshOutput *a, const Nv2aVshOutput *b,
  
  /* About 7 MB, so allocated by the first batch that transforms rather than
   * carried in every build that never turns the executor on. */
@@ -847,7 +908,7 @@ index 1280565..66b88a5 100644
  /* Does this batch run the title's vertex program? RECOMP_NO_VSH turns the
   * interpreter off (the batch then falls to the screen-space heuristics). */
  static int batch_uses_program(void)
-@@ -2721,15 +2945,172 @@ static void xf_set_viewport(void)
+@@ -2721,15 +2983,172 @@ static void xf_set_viewport(void)
      s_xf_o[2] = of[2];
  }
  
@@ -1023,7 +1084,7 @@ index 1280565..66b88a5 100644
      xf_set_viewport();
      {
          const VertexAttr *tc = texcoord_attr();
-@@ -2828,6 +3209,19 @@ static void raster_batch_program(void)
+@@ -2828,6 +3247,19 @@ static void raster_batch_program(void)
      if (s_gpu.texs[0].valid)
          note_texture_use();
  
@@ -1043,7 +1104,7 @@ index 1280565..66b88a5 100644
      switch (s_gpu.prim) {
      case NV_PRIM_TRIANGLES:
          for (i = 0; i + 2 < n; i += 3)
-@@ -2857,6 +3251,10 @@ static void raster_batch_program(void)
+@@ -2857,6 +3289,10 @@ static void raster_batch_program(void)
      default:
          break;
      }
@@ -1054,7 +1115,7 @@ index 1280565..66b88a5 100644
      if (backend_draws())
          backend_flush(!s_xf_no_tex);
  }
-@@ -3747,6 +4145,10 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -3747,6 +4183,10 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
          /* The stall ends when the buffer being read is the one just finished.
           * There is no scanout here to wait for, so that is now. */
          s_gpu.flip_read = s_gpu.flip_write;
@@ -1065,7 +1126,7 @@ index 1280565..66b88a5 100644
          /* And this is a completed swap, which is what a title's own swap
           * counter counts -- see xbox_Nv2aFrameCounterFlip. */
          xbox_Nv2aFrameCounterFlip();
-@@ -3762,6 +4164,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -3762,6 +4202,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
              extern void xbox_FramebufferWindowFrameStats(uint32_t);
              static uint32_t draws_at_flip;
              xbox_FramebufferWindowFrameStats(s_gpu.draws - draws_at_flip);
@@ -1073,7 +1134,7 @@ index 1280565..66b88a5 100644
              draws_at_flip = s_gpu.draws;
          }
          if (s_gpu.pitch) {
-@@ -3798,8 +4201,6 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -3798,8 +4239,6 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
              }
          }
          s_gpu.drawn_stale = 1;
@@ -1424,10 +1485,10 @@ index b26edfe..dea7f9e 100644
              /* One dump a few seconds in, so the title has had time to render
 diff --git a/src/video/nv2a_d3d11.c b/src/video/nv2a_d3d11.c
 new file mode 100644
-index 0000000..df11d3f
+index 0000000..ded45dc
 --- /dev/null
 +++ b/src/video/nv2a_d3d11.c
-@@ -0,0 +1,2333 @@
+@@ -0,0 +1,2364 @@
 +/*
 + * nv2a_d3d11.c -- a Direct3D 11 render back end for the pushbuffer executor.
 + *
@@ -2227,6 +2288,28 @@ index 0000000..df11d3f
 +            }
 +            continue;
 +        }
++        /* Two 8-bit channels in 16 bits, widened in place from the top down
++         * so no texel is overwritten before it is read. Same channel mapping
++         * as the executor's decoder: G8B8 reads (B,G,B,G), A8Y8 (Y,Y,Y,A). */
++        if ((t->color == 0x17 && t->pitch >= t->width * 2)          /* LIN_G8B8 */
++            || (t->color == 0x1A && pow2)) {                        /* SZ_A8Y8 */
++            uint16_t *s16 = (uint16_t *)dst;
++            size_t k;
++            if (t->color == 0x1A)
++                xbox_unswizzle_rect(dst, src, t->width, t->height, 2);
++            else {
++                uint32_t y;
++                for (y = 0; y < t->height; y++)
++                    memcpy(s16 + (size_t)y * t->width, src + (size_t)y * t->pitch,
++                           (size_t)t->width * 2);
++            }
++            for (k = texels; k-- > 0; ) {
++                uint32_t v = s16[k], lo = v & 0xFFu, hi = v >> 8;
++                dst[k] = t->color == 0x17 ? (hi << 24) | (lo << 16) | (hi << 8) | lo
++                                          : (hi << 24) | (lo * 0x010101u);
++            }
++            continue;
++        }
 +        if (!nv2a_backend_decode_texture(&one, dst)) {
 +            s_fmt_bad[t->color & 0xFF] = 1;
 +            fprintf(stderr, "  [D3D11] texture format 0x%X not decodable: sampled as white\n",
@@ -2264,14 +2347,14 @@ index 0000000..df11d3f
 +static ID3D11ShaderResourceView *rt_alias(const Nv2aTexture *t, float *w, float *h);
 +static void rt_sync_overlap(uint32_t va, uint32_t n);
 +static ID3D11ShaderResourceView *tex_get_decoded(const Nv2aTexture *t);
++int d3d_rt_overlaps(uint32_t va, uint32_t n);
 +
 +/* The view a stage samples, and the size its texel coordinates divide by:
 + * a render target the title draws into and then samples is used where it
 + * is, on the GPU; anything else comes from guest memory, decoded. */
 +/* Colour formats the executor's decoder cannot read. The CPU rasteriser
 + * samples white for them; so does this, without hashing or writing anything
-+ * back first (MA2 samples two 16-bit render targets as format 0x17 every
-+ * frame, and syncing them cost more than the rest of the frame). */
++ * back first. */
 +static ID3D11ShaderResourceView *tex_get(const Nv2aTexture *t, float *w, float *h)
 +{
 +    ID3D11ShaderResourceView *a;
@@ -2282,6 +2365,15 @@ index 0000000..df11d3f
 +    a = rt_alias(t, w, h);
 +    if (a)
 +        return a;
++    /* LIN_G8B8 over a render target the GPU holds newer pixels for stays
++     * white, as it did before 0x17 had a decoder. MA2 samples two 16-bit
++     * targets this way every frame; writing them back cost more than the
++     * rest of the frame, and the write-back packs every 16-bit target as
++     * R5G6B5, which is right only if the title drew it as R5G6B5 and not
++     * as a G8B8 surface. Doing it properly means sampling the target on the
++     * GPU with a channel remap. */
++    if (t->color == 0x17 && d3d_rt_overlaps(t->offset, tex_span(t)))
++        return NULL;
 +    /* Memory a render target has drawn newer pixels into must be written
 +     * back before it can be read as an ordinary texture. */
 +    s_sync_tex = t;
@@ -3762,7 +3854,7 @@ index 0000000..df11d3f
 +
 +#endif
 diff --git a/tools/recomp/lifter.py b/tools/recomp/lifter.py
-index baf1834..f96489a 100644
+index baf1834..b13ffe0 100644
 --- a/tools/recomp/lifter.py
 +++ b/tools/recomp/lifter.py
 @@ -1724,6 +1724,26 @@ class Lifter:
@@ -3792,3 +3884,70 @@ index baf1834..f96489a 100644
          # ── Port I/O ──
          #
          # `in`/`out` reach the MCPX's I/O space: the ACPI block at 0x8000,
+@@ -1898,7 +1918,13 @@ class Lifter:
+             r = ops[1].reg
+             if r in ("al", "bl", "cl", "dl", "ah", "bh", "ch", "dh"):
+                 src = f"SX8({src})"
+-            elif r in ("ax", "bx", "cx", "dx", "si", "di"):
++            # All eight 16-bit registers, as movzx above. bp and sp used to be
++            # missing, so `movsx ebp, bp` fell through to the bare read,
++            # LO16(ebp) -- a zero extension. MechAssault 2's Bink intra IDCT
++            # loads row 6 of each column that way (0x0039BA9C), and every
++            # negative coefficient there became 65536 + c: the block noise
++            # over every Bink movie.
++            elif r in ("ax", "bx", "cx", "dx", "si", "di", "bp", "sp"):
+                 src = f"SX16({src})"
+         return [_fmt_operand_write(ops[0], src)]
+ 
+diff --git a/tools/recomp/test_lifter_movsx.py b/tools/recomp/test_lifter_movsx.py
+new file mode 100644
+index 0000000..2054a93
+--- /dev/null
++++ b/tools/recomp/test_lifter_movsx.py
+@@ -0,0 +1,46 @@
++"""movsx from a register sign-extends, whichever register it is.
++
++`_lift_movsx` named ax/bx/cx/dx/si/di as the 16-bit sources and left out bp
++and sp, so `movsx ebp, bp` fell through to the plain operand read, LO16(ebp),
++which is a zero extension. MechAssault 2's Bink intra-block IDCT
++(sub_0039B9F0, at 0x0039BA9C) fetches row 6 of each column with
++`mov bp, [ebx+0x60]` / `movsx ebp, bp`; every negative coefficient there
++came out as 65536 + c, and the 8x8 block decoded to noise -- the random
++coloured rectangles over the intro and attract movies, identical on both
++renderers because the decoded frames themselves were wrong.
++"""
++
++import pytest
++
++from .disasm import Instruction, Operand
++from .lifter import Lifter
++
++REG16 = ["ax", "bx", "cx", "dx", "si", "di", "bp", "sp"]
++REG8 = ["al", "bl", "cl", "dl", "ah", "bh", "ch", "dh"]
++
++
++def _lift(mnemonic, dst, src):
++    insn = Instruction(0, 3, mnemonic, "", "00")
++    insn.operands = [Operand(type="reg", reg=dst), Operand(type="reg", reg=src)]
++    return Lifter().lift_instruction(insn)
++
++
++@pytest.mark.parametrize("src", REG16)
++def test_movsx_r32_from_every_r16_sign_extends(src):
++    assert _lift("movsx", "ebp", src) == [f"ebp = SX16(LO16(e{src}));"]
++
++
++@pytest.mark.parametrize("src", REG8)
++def test_movsx_r32_from_every_r8_sign_extends(src):
++    lifted = _lift("movsx", "eax", src)
++    assert len(lifted) == 1 and lifted[0].startswith("eax = SX8("), lifted
++
++
++@pytest.mark.parametrize("src", REG16 + REG8)
++def test_movsx_and_movzx_extend_the_same_register_set(src):
++    # The two lists drifted apart once; a source movzx widens explicitly
++    # must not reach movsx as a bare, zero-extended read.
++    sx = _lift("movsx", "ecx", src)[0]
++    zx = _lift("movzx", "ecx", src)[0]
++    assert ("SX16(" in sx) == ("ZX16(" in zx)
++    assert ("SX8(" in sx) == ("ZX8(" in zx)
