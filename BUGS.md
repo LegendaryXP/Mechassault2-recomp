@@ -5,8 +5,6 @@ have one. Fixed bugs move to MODLOG.md.
 
 ## Open
 
-- **No dynamic shadow under the mech.** The player's mech casts no shadow
-  (2026-10-18).
 - **Mouse camera doesn't work in the first mech you get** (red, jump jets;
   screenshot 2026-10-18). The mouse look works in the tutorial walker only, so
   this mech's pilot or turning code must take a path the hooks don't watch
