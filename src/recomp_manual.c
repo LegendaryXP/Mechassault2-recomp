@@ -326,6 +326,29 @@ void sub_0006C790(void)
     ma2_mouse_look_rate_set(ret, comp, rate);
 }
 
+/* ── MechAssault 2: the mouse tilting the camera (sub_00120EBD) ──────── */
+
+/*
+ * sub_00120EBD(input), thiscall, ret 4: a walker's look pitch, integrated:
+ * this+0x144 += input * this+0x140 * dt, then clamped to [this+0x13C,
+ * this+0x138]. The human pilot's call (returns to 0x00175CEF) feeds it the
+ * smoothed Look y; afterwards the mouse tilts the pitch itself
+ * (src/ma2_mouse_look.c).
+ */
+extern void sub_00120EBD_gen(void);
+void ma2_mouse_look_pitch(uint32_t ret, uint32_t walker, float input);
+
+void sub_00120EBD(void)
+{
+    uint32_t walker = g_ecx;
+    uint32_t ret = MA2_MEM32(g_esp);
+    uint32_t iv = MA2_MEM32(g_esp + 4);
+    float input;
+    memcpy(&input, &iv, sizeof input);
+    sub_00120EBD_gen();
+    ma2_mouse_look_pitch(ret, walker, input);
+}
+
 /* ── Bring-up switch: MA2_SKIP_ICALL ───────────────────────── */
 
 /*
