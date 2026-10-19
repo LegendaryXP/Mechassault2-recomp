@@ -407,6 +407,42 @@ void sub_0008DF50(void)
     ma2_ground_ray_leave(grid, query, result, g_eax & 0xFF);
 }
 
+/* ── MechAssault 2: mission music actions (sub_0014D9CC) ──────────────── */
+
+/*
+ * sub_0014D9CC, thiscall: a mission script's "Action - Music"
+ * (MAActionMusic) firing. this+0x68 is its MusicEvent, this+0x60 its
+ * MusicCue, this+0x6C its IntensityLevel; the six dwords at 0x0050C91C are
+ * the music state every music action shares (current and fallback track).
+ * Bring-up: MA2_MUSIC_TRACE=1 logs each one, with that state before and
+ * after.
+ */
+extern void sub_0014D9CC_gen(void);
+
+static void ma2_music_state(const char *tag, uint32_t self)
+{
+    uint32_t k;
+    fprintf(stderr, "[MUSIC] %lu %s action %08X event %u cue %08X level %u sound %08X state",
+            (unsigned long)GetTickCount(), tag, self, MA2_MEM32(self + 0x68),
+            MA2_MEM32(self + 0x60), MA2_MEM32(self + 0x6C), MA2_MEM32(self + 0x74));
+    for (k = 0; k < 6; k++)
+        fprintf(stderr, " %08X", MA2_MEM32(0x0050C91Cu + 4 * k));
+    fprintf(stderr, "\n");
+}
+
+void sub_0014D9CC(void)
+{
+    static int on = -1;
+    uint32_t self = g_ecx;
+    if (on < 0)
+        on = getenv("MA2_MUSIC_TRACE") != NULL;
+    if (on)
+        ma2_music_state("fire ", self);
+    sub_0014D9CC_gen();
+    if (on)
+        ma2_music_state("after", self);
+}
+
 /* ── Bring-up switch: MA2_SKIP_ICALL ───────────────────────── */
 
 /*
