@@ -162,6 +162,8 @@ static void look_cam_dump(int moving)
 /* The pilot's body, as its stick turns last saw it (0 = not yet). */
 static uint32_t s_body;
 
+uint32_t ma2_player_body(void) { return s_body; }
+
 /* sub_0006C790 wrapper: the pilot's two stick turns name the body. */
 static void look_poslog(uint32_t walker);
 
@@ -231,8 +233,98 @@ static void look_turn(uint32_t walker, float yaw, int dbg)
  * named a body at this walker, and the walker's scene node (the camera's
  * pivot) always. */
 int mkb_take_mark(void);
+/* MA2_TELEPORT=<ms>:<x>:<y>:<z>,... (bring-up): put the player's body there
+ * (position and last frame's, so it arrives at rest), <ms> after the first
+ * frame its body is known -- the mission start, whatever the boot took --
+ * and hold it there for 150 ms. For standing a test where a bug was
+ * reported; the heap moves with the frame rate, so fixed-address pokes
+ * cannot do it. */
+static void look_teleport(uint32_t walker)
+{
+    static int init, n;
+    static struct { DWORD at; float x, y, z; } tp[32];
+    static DWORD t0;
+    DWORD now = GetTickCount();
+    int k;
+    if (!init) {
+        const char *e = getenv("MA2_TELEPORT");
+        char *end;
+        init = 1;
+        while (e && *e && n < 32) {
+            tp[n].at = strtoul(e, &end, 10);
+            if (*end != ':') break;
+            tp[n].x = (float)strtod(end + 1, &end);
+            if (*end != ':') break;
+            tp[n].y = (float)strtod(end + 1, &end);
+            if (*end != ':') break;
+            tp[n].z = (float)strtod(end + 1, &end);
+            n++;
+            e = *end == ',' ? end + 1 : NULL;
+        }
+    }
+    if (!n || !body_is_walkers(s_body, walker))
+        return;
+    if (!t0)
+        t0 = now;
+    /* MA2_BODY_DUMP=<ms>:<frames>: the body's first 0x200 bytes as floats,
+     * one line a call, from <ms> after the mission start. */
+    {
+        static int left = -1;
+        static DWORD from;
+        if (left < 0) {
+            const char *bd = getenv("MA2_BODY_DUMP");
+            char *end;
+            left = 0;
+            if (bd && *bd) {
+                from = strtoul(bd, &end, 10);
+                left = *end == ':' ? atoi(end + 1) : 60;
+            }
+        }
+        if (left > 0 && now - t0 >= from) {
+            char line[0x200 / 4 * 14 + 48];
+            int at = snprintf(line, sizeof line, "[BODY] %lu", (unsigned long)(now - t0));
+            uint32_t k2;
+            for (k2 = 0; k2 < 0x200 && at < (int)sizeof line - 16; k2 += 4)
+                at += snprintf(line + at, sizeof line - at, " %g", LOOK_MEMF(s_body + k2));
+            snprintf(line + at, sizeof line - at, "\n");
+            fputs(line, stderr);
+            left--;
+        }
+    }
+    /* MA2_WATCH_BODY=<ms>:<offset>: arm the write watch on that field of the
+     * player's body, that long after the mission start (the body's address
+     * changes from run to run). */
+    {
+        static int armed;
+        const char *wb = getenv("MA2_WATCH_BODY");
+        if (wb && !armed) {
+            char *end;
+            DWORD at = strtoul(wb, &end, 10);
+            uint32_t off = *end == ':' ? (uint32_t)strtoul(end + 1, NULL, 16) : 0x48;
+            if (now - t0 >= at) {
+                extern int xbox_WatchArmAt(uint32_t va);
+                armed = 1;
+                fprintf(stderr, "[LOOK] watching body %08X+0x%X\n", s_body, off);
+                xbox_WatchArmAt(s_body + off);
+            }
+        }
+    }
+    for (k = 0; k < n; k++) {
+        DWORD rel = now - t0;
+        if (rel < tp[k].at || rel > tp[k].at + 150)
+            continue;
+        LOOK_MEMF(s_body + MA2_BODY_POS) = tp[k].x;
+        LOOK_MEMF(s_body + MA2_BODY_POS + 4) = tp[k].y;
+        LOOK_MEMF(s_body + MA2_BODY_POS + 8) = tp[k].z;
+        LOOK_MEMF(s_body + 0x08) = tp[k].x;      /* last frame's position */
+        LOOK_MEMF(s_body + 0x0C) = tp[k].y;
+        LOOK_MEMF(s_body + 0x10) = tp[k].z;
+    }
+}
+
 static void look_poslog(uint32_t walker)
 {
+    look_teleport(walker);
     if (walker < 0x10000u || walker >= 0x04000000u)
         return;
     static int every = -1;

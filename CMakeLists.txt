@@ -57,6 +57,7 @@ set(GAME_SOURCES
     src/recomp_manual.c
     src/ma2_profile.c
     src/ma2_mouse_look.c
+    src/ma2_ground.c
     # Add game-specific sources here, e.g.:
     # src/asset_loader.c
     # src/custom_renderer.c

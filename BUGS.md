@@ -5,10 +5,6 @@ have one. Fixed bugs move to MODLOG.md.
 
 ## Open
 
-- **Falling through the road at a ledge.** First city mission: the mech sinks
-  through one stretch of road by a curb (screenshot, 2026-10-18).
-- **Sliding off rooftops.** The player's mech can't stand on top of buildings
-  and slides off (2026-10-18). Not checked against the Xbox original.
 - **No dynamic shadow under the mech.** The player's mech casts no shadow
   (2026-10-18).
 - **Mouse camera doesn't work in the first mech you get** (red, jump jets;

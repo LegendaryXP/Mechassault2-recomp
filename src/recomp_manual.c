@@ -349,6 +349,64 @@ void sub_00120EBD(void)
     ma2_mouse_look_pitch(ret, walker, input);
 }
 
+/* ── MechAssault 2: the walker's ground probe (sub_001760E1) ─────────── */
+
+/*
+ * sub_001760E1(pos, reset, out), thiscall, ret 0xC: a walker's ground height
+ * under pos, max(terrain, a downward ray against the level's objects), on the
+ * FPU stack. The ray is sub_0008DF50(grid, query, result), stdcall, al = hit.
+ * Bring-up: MA2_GROUND_TRACE logs the player's (src/ma2_ground.c).
+ */
+extern __declspec(thread) double g_fp_stack[8];
+extern __declspec(thread) int g_fp_top;
+extern void sub_001760E1_gen(void);
+extern void sub_0008DF50_gen(void);
+void ma2_ground_probe_enter(uint32_t body, uint32_t pos);
+void ma2_ground_probe_leave(uint32_t body, double h);
+void ma2_ground_ray_leave(uint32_t grid, uint32_t query, uint32_t result, int hit);
+
+void sub_001760E1(void)
+{
+    uint32_t body = g_ecx;
+    ma2_ground_probe_enter(body, MA2_MEM32(g_esp + 4));
+    sub_001760E1_gen();
+    ma2_ground_probe_leave(body, g_fp_stack[g_fp_top & 7]);
+}
+
+/* The ray's walk down a candidate's scene graph: sub_00083070 (vt+0x68,
+ * thiscall node, query, result) recurses into the children; sub_000831E0
+ * (ecx node, ebx query, [esp+4] -> "descend" byte) tests the node itself. */
+extern __declspec(thread) uint32_t g_ebx;
+extern void sub_00083070_gen(void);
+extern void sub_000831E0_gen(void);
+void ma2_ground_node(int leave, int test, uint32_t node, uint32_t query, uint32_t result,
+                     int hit, int descend);
+
+void sub_00083070(void)
+{
+    uint32_t node = g_ecx, query = MA2_MEM32(g_esp + 4), result = MA2_MEM32(g_esp + 8);
+    ma2_ground_node(0, 0, node, query, result, 0, 0);
+    sub_00083070_gen();
+    ma2_ground_node(1, 0, node, query, result, g_eax & 0xFF, 0);
+}
+
+void sub_000831E0(void)
+{
+    uint32_t node = g_ecx, query = g_ebx, out = MA2_MEM32(g_esp + 4);
+    ma2_ground_node(0, 1, node, query, g_eax, 0, 0);
+    sub_000831E0_gen();
+    ma2_ground_node(1, 1, node, query, 0, g_eax & 0xFF, MA2_MEM32(out) & 0xFF);
+}
+
+void sub_0008DF50(void)
+{
+    uint32_t grid = MA2_MEM32(g_esp + 4);
+    uint32_t query = MA2_MEM32(g_esp + 8);
+    uint32_t result = MA2_MEM32(g_esp + 0xC);
+    sub_0008DF50_gen();
+    ma2_ground_ray_leave(grid, query, result, g_eax & 0xFF);
+}
+
 /* ── Bring-up switch: MA2_SKIP_ICALL ───────────────────────── */
 
 /*
