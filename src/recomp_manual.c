@@ -349,6 +349,23 @@ void sub_00120EBD(void)
     ma2_mouse_look_pitch(ret, walker, input);
 }
 
+/*
+ * sub_00172E96, thiscall: the mech pilot's update (vtable 0x00477410
+ * +0xE8), every frame the player drives a mech. It names the mech whose
+ * bodies the mouse turns, and when the pitch call above goes silent (the
+ * game's Look y switched off, or no third-person camera) the mouse goes in
+ * from here (src/ma2_mouse_look.c).
+ */
+extern void sub_00172E96_gen(void);
+void ma2_mouse_look_update(uint32_t pilot);
+
+void sub_00172E96(void)
+{
+    uint32_t pilot = g_ecx;
+    sub_00172E96_gen();
+    ma2_mouse_look_update(pilot);
+}
+
 /* ── MechAssault 2: the walker's ground probe (sub_001760E1) ─────────── */
 
 /*

@@ -24,9 +24,10 @@
  * So the mouse turns all three at once, from the pitch hook below, which the
  * pilot runs every frame however it moves: mkb_mouse_look_take() hands over
  * the degrees the mouse moved since the last frame (look_deg per count, times
- * sens, from mkb.ini); aim, camera yaw and heading (the body named by the
- * last stick turn, when it stands at this walker) each get them, so nothing
- * chases and the legs keep their angle to the aim. While this keeps asking,
+ * sens, from mkb.ini); aim, camera yaw and the headings of the bodies the
+ * stick turns (the mech's [mech+0x8C], and its second body at mech+0x2B8 on
+ * mechs that have one -- look_bodies) each get them, so nothing chases and
+ * the legs keep their angle to the aim. While this keeps asking,
  * mouse movement no longer moves the Look stick -- the rates the game sets
  * come from the pad alone.
  *
@@ -44,6 +45,10 @@
  * camera's geometry, not exactly 1:1: about 1.2 degrees of view per degree
  * near level, 0.9 looking far down (50 degrees of pitch tilt the view 50,
  * -54 tilt it 60).
+ *
+ * The pitch call is gated by the game: the pilot's enable for Look y and a
+ * third-person camera. When it is silent the mech pilot's update stands in
+ * (ma2_mouse_look_update, below) and logs why, once per change.
  *
  * Outside the walker (menus, vehicles, on foot) nothing asks, and after half
  * a second the mouse drives the stick on both axes again.
@@ -208,20 +213,102 @@ static int body_is_walkers(uint32_t body, uint32_t walker)
  *  - walker+0x130, the camera's yaw, which chases the aim at ~400 deg/s.
  *  - body+0x64, the heading (legs), so the legs keep their angle to the aim.
  * Turned together there is no gap for either to chase. */
+/* The player's mech, as the pilot's update (ma2_mouse_look_update) last saw
+ * it: the camera entity [pilot+8] and the vehicle [pilot+0xC]. Read every
+ * frame, so the bodies to turn are known whichever way the mech moves. */
+static uint32_t s_pilot_cam, s_pilot_mech;
+
+#define MA2_MECH_BODY       0x8Cu     /* [mech+0x8C]: the body the legs stand on */
+#define MA2_MECH_FLAGS_HI   0x26Cu    /* bit 30: stick turns the second body */
+#define MA2_MECH_BODY2_ON   0x400u    /* nonzero: the mech has the second body */
+#define MA2_MECH_BODY2      0x2B8u    /* mech+0x2B8: second body, same layout */
+
+static int look_va_ok(uint32_t va) { return va >= 0x10000u && va < 0x04000000u; }
+
+/* The headings the Look stick can turn. sub_00172E96 turns the body at
+ * [mech+0x8C] (through sub_001002A3 standing, inline walking), and through
+ * the mech's vtable +0x270 (sub_00100228) a second body embedded at
+ * mech+0x2B8, when mech+0x400 is set; a per-mech flag (mech+0x26C bit 30)
+ * sends the stick to the second one only. Both get the mouse's turn, so
+ * neither lags behind the aim, whichever the flag picks. In play the second
+ * body's heading read as the torso's twist from the legs (body + second =
+ * aim, held at +-45), which the game keeps up itself. Before the pilot's
+ * update has named the mech, the body the stick-turn wrapper saw last is
+ * used, while it stands at this camera. */
+static int look_bodies(uint32_t walker, uint32_t *a, uint32_t *b, int *flag)
+{
+    uint32_t mech = walker == s_pilot_cam ? s_pilot_mech : 0;
+    *a = *b = 0;
+    *flag = 0;
+    if (look_va_ok(mech)) {
+        uint32_t body = LOOK_MEM32(mech + MA2_MECH_BODY);
+        if (look_va_ok(body))
+            *a = body;
+        if (LOOK_MEM32(mech + MA2_MECH_BODY2_ON))
+            *b = mech + MA2_MECH_BODY2;
+        if (*b == *a)
+            *b = 0;
+        *flag = (int)((LOOK_MEM32(mech + MA2_MECH_FLAGS_HI) >> 30) & 1u);
+    } else if (body_is_walkers(s_body, walker)) {
+        *a = s_body;
+    }
+    return *a || *b;
+}
+
+/* The sideways mouse turn, once a frame from the pitch hook below (which the
+ * pilot runs in every way of moving; the stick turns above are skipped when
+ * strafing or moving diagonally). These move together:
+ *  - walker+0x12C, the aim: where the mech looks and the camera points.
+ *    Standing or walking ahead it is a copy of the body's heading; strafing
+ *    or on a diagonal the body's legs turn toward the way it moves (the
+ *    heading is the aim plus that angle, 90 strafing) and the aim is its own.
+ *  - walker+0x130, the camera's yaw, which chases the aim at ~400 deg/s.
+ *  - the headings, body+0x64, of the bodies the stick turns (look_bodies),
+ *    so the legs keep their angle to the aim.
+ * Turned together there is no gap for either to chase.
+ *
+ * Each new mech is logged once, and while turning, twice a second for the
+ * first minute of each mech, its headings before the turn next to where the
+ * last turn left them: a heading the game puts back shows there. */
 static void look_turn(uint32_t walker, float yaw, int dbg)
 {
-    static int shown;
+    static int shown, lines;
+    static uint32_t last_mech_cam;
+    static float left_a, left_b;
+    static DWORD next, first;
     float aim = LOOK_MEMF(walker + MA2_WALKER_CAM_TARGET);
-    int legs = body_is_walkers(s_body, walker);
+    uint32_t a, b;
+    int flag;
+    int known = look_bodies(walker, &a, &b, &flag);
+    DWORD now = GetTickCount();
+
+    if (walker != last_mech_cam) {
+        last_mech_cam = walker;
+        first = now;
+        if (lines++ < 200)
+            fprintf(stderr, "[LOOK] turning camera %08X: mech %08X flag %d, body %08X, second body %08X%s\n",
+                    walker, walker == s_pilot_cam ? s_pilot_mech : 0, flag, a, b,
+                    known ? "" : " (none known: aim and camera only)");
+    } else if (now - first < 60000 && (int)(now - next) >= 0 && lines < 200) {
+        lines++;
+        next = now + 500;
+        fprintf(stderr, "[LOOK] turn %+.2f: aim %.2f cam %.2f; body %.2f (left %.2f); second %.2f (left %.2f)\n",
+                yaw, aim, LOOK_MEMF(walker + MA2_WALKER_CAM_YAW),
+                a ? LOOK_MEMF(a + MA2_BODY_HEADING) : 0.0f, left_a,
+                b ? LOOK_MEMF(b + MA2_BODY_HEADING) : 0.0f, left_b);
+    }
     LOOK_MEMF(walker + MA2_WALKER_CAM_TARGET) = aim + yaw;
     LOOK_MEMF(walker + MA2_WALKER_CAM_YAW) += yaw;
-    if (legs)
-        LOOK_MEMF(s_body + MA2_BODY_HEADING) += yaw;
+    if (a)
+        left_a = LOOK_MEMF(a + MA2_BODY_HEADING) += yaw;
+    if (b)
+        left_b = LOOK_MEMF(b + MA2_BODY_HEADING) += yaw;
     if (dbg && shown < 4000) {
         shown++;
-        fprintf(stderr, "[LOOK] turn walker %08X yaw %+.3f aim %.3f heading %.3f%s\n",
-                walker, yaw, aim + yaw, legs ? LOOK_MEMF(s_body + MA2_BODY_HEADING) : 0.0f,
-                legs ? "" : " (body not known: aim only)");
+        fprintf(stderr, "[LOOK] turn walker %08X yaw %+.3f aim %.3f heading %.3f / %.3f%s\n",
+                walker, yaw, aim + yaw, a ? LOOK_MEMF(a + MA2_BODY_HEADING) : 0.0f,
+                b ? LOOK_MEMF(b + MA2_BODY_HEADING) : 0.0f,
+                known ? "" : " (body not known: aim only)");
     }
 }
 
@@ -365,31 +452,38 @@ static void look_poslog(uint32_t walker)
 #define MA2_PITCH_RATE      0x140u
 #define MA2_PITCH           0x144u
 
-void ma2_mouse_look_pitch(uint32_t ret, uint32_t walker, float input)
-{
-    static int mode = -1, dbg, shown;
-    float yaw, up, p, lo, hi;
+static int s_mode = -1, s_dbg;
 
-    if (ret != MA2_PITCH_PILOT)
-        return;
-    if (mode < 0) {
+static int look_on(void)
+{
+    if (s_mode < 0) {
         const char *e = getenv("MA2_MOUSE_LOOK");
-        mode = !(e && *e == '0');
-        dbg = getenv("MA2_LOOK_DEBUG") != NULL;
+        s_mode = !(e && *e == '0');
+        s_dbg = getenv("MA2_LOOK_DEBUG") != NULL;
     }
-    if (!mode || walker < 0x10000u || walker >= 0x04000000u)
-        return;
-    if (!mkb_mouse_look_take(&yaw, &up))
+    return s_mode;
+}
+
+/* Hand the mouse to the camera entity: the sideways turn (look_turn) and,
+ * when pitch_on, the tilt -- walker+0x144 in the game's own clamp. */
+static void look_apply(uint32_t walker, float input, int pitch_on)
+{
+    static int shown;
+    float yaw, up = 0.0f, p, lo, hi;
+
+    if (!mkb_mouse_look_take(&yaw, pitch_on ? &up : NULL))
         return;
     look_trace('y', yaw);
     look_trace('p', up);
     look_cam_dump(yaw != 0.0f);
     if (yaw != 0.0f)
-        look_turn(walker, yaw, dbg);
+        look_turn(walker, yaw, s_dbg);
+    if (!pitch_on)
+        return;
     lo = LOOK_MEMF(walker + MA2_PITCH_MIN);
     hi = LOOK_MEMF(walker + MA2_PITCH_MAX);
     p = LOOK_MEMF(walker + MA2_PITCH);
-    if (dbg && shown < 4000 && (up != 0.0f || input != 0.0f)) {
+    if (s_dbg && shown < 4000 && (up != 0.0f || input != 0.0f)) {
         shown++;
         fprintf(stderr, "[LOOK] pitch walker %08X input %g up %+.3f pitch %.4f [%g, %g] rate %g\n",
                 walker, input, up, p, lo, hi, LOOK_MEMF(walker + MA2_PITCH_RATE));
@@ -400,4 +494,87 @@ void ma2_mouse_look_pitch(uint32_t ret, uint32_t walker, float input)
     if (p < lo) p = lo;
     if (p > hi) p = hi;
     LOOK_MEMF(walker + MA2_PITCH) = p;
+}
+
+/* When the pilot's pitch call last ran (GetTickCount), and the camera it
+ * ran on: the update below stands in while it is silent. */
+static DWORD s_pitch_at;
+static uint32_t s_pitch_walker;
+
+void ma2_mouse_look_pitch(uint32_t ret, uint32_t walker, float input)
+{
+    if (ret != MA2_PITCH_PILOT)
+        return;
+    if (!look_on() || walker < 0x10000u || walker >= 0x04000000u)
+        return;
+    s_pitch_at = GetTickCount();
+    if (walker != s_pitch_walker) {
+        /* One line a camera, in every log: which path drives the mouse. */
+        static int shown;
+        s_pitch_walker = walker;
+        if (shown++ < 50)
+            fprintf(stderr, "[LOOK] mouse look on camera %08X (pilot pitch call); body %s\n",
+                    walker, body_is_walkers(s_body, walker) ? "known" : "not known yet");
+    }
+    look_apply(walker, input, 1);
+}
+
+/* The mech pilot's update, sub_00172E96 (thiscall, this = pilot), runs every
+ * frame the player drives a mech. The pitch call above sits behind more:
+ * the pilot's per-action enable for Look y (pilot+0x6A8 + 5, which the game's
+ * scripts switch off and on) and a third-person camera, [pilot+8] being an
+ * MACameraThird. When that call has been silent for 0.2 s while the pilot
+ * still updates, the mouse goes in from here instead -- the turn always, the
+ * tilt only while the game has Look y enabled -- on the same camera entity,
+ * when it is a third-person one. Each change of the reason is logged once
+ * ([LOOK] pilot update ...), so a play log says which way the mouse went. */
+#define MA2_PILOT_CAMERA    0x08u
+#define MA2_PILOT_OFF       0x6E4u    /* nonzero: the pilot is not driving */
+#define MA2_PILOT_ACTIONS   0x6A8u    /* + action id: the game's enables */
+#define MA2_ACTION_LOOK_Y   5u
+#define MA2_ENTITY_TYPE     0x28u     /* the entity's type id */
+#define MA2_TYPE_IDS        0x004EAFC0u
+static const char *const s_cam_types[] = {
+    "MACamera", "MAFreeCamera", "MACameraFirst", "MACameraThird",
+    "MACameraSpiral", "MACameraFree", "MACameraPan",
+};
+
+void ma2_mouse_look_update(uint32_t pilot)
+{
+    static uint32_t last_pilot, last_cam, last_type;
+    static int last_why = -1, shown;
+    uint32_t cam, type;
+    const char *tname = "not a camera";
+    int third, look_y, why, k;
+
+    if (!look_on() || pilot < 0x10000u || pilot >= 0x04000000u)
+        return;
+    s_pilot_cam = LOOK_MEM32(pilot + MA2_PILOT_CAMERA);
+    s_pilot_mech = LOOK_MEM32(pilot + 0x0Cu);
+    if (GetTickCount() - s_pitch_at < 200)
+        return;
+    if (*((volatile uint8_t *)g_xbox_mem_offset + pilot + MA2_PILOT_OFF))
+        return;
+    cam = LOOK_MEM32(pilot + MA2_PILOT_CAMERA);
+    if (cam < 0x10000u || cam >= 0x04000000u)
+        return;
+    type = LOOK_MEM32(cam + MA2_ENTITY_TYPE);
+    for (k = 0; k < (int)(sizeof s_cam_types / sizeof s_cam_types[0]); k++)
+        if (type == LOOK_MEM32(MA2_TYPE_IDS + 4u * (uint32_t)k))
+            tname = s_cam_types[k];
+    third = type == LOOK_MEM32(MA2_TYPE_IDS + 4u * 3u);
+    look_y = *((volatile uint8_t *)g_xbox_mem_offset + pilot + MA2_PILOT_ACTIONS
+               + MA2_ACTION_LOOK_Y) != 0;
+    why = !third ? 0 : look_y ? 1 : 2;
+    if ((why != last_why || pilot != last_pilot || cam != last_cam || type != last_type)
+            && shown++ < 50) {
+        fprintf(stderr, "[LOOK] pilot update %08X (vtable %08X): pitch call silent; camera %08X is %s"
+                        " (type %08X); look-y %s -> %s\n",
+                pilot, LOOK_MEM32(pilot), cam, tname, type, look_y ? "on" : "off",
+                why == 0 ? "mouse left to the stick" :
+                why == 1 ? "mouse turns and tilts from here" : "mouse turns from here, no tilt");
+    }
+    last_why = why; last_pilot = pilot; last_cam = cam; last_type = type;
+    if (third)
+        look_apply(cam, 0.0f, look_y);
 }

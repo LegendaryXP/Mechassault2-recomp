@@ -16,11 +16,6 @@ have one. Fixed bugs move to MODLOG.md.
   the voices"). The radio speech now plays at unity through its FX send
   (toolkit 5825f42). The game has its own volume menu (MAMenuInGameVolume,
   pause menu); try the voice slider there before changing the mix.
-- **Mouse camera doesn't work in the first mech you get** (red, jump jets;
-  screenshot 2026-10-18). The mouse look works in the tutorial walker only, so
-  this mech's pilot or turning code must take a path the hooks don't watch
-  (return addresses 0x001002FB / 0x001739C5 / 0x00175CEF, the camera-list
-  entity). Reproduce from the user's save.
 - **Jump-jet exhaust draws as a black square** under the mech, the plume's
   tail (screenshot 2026-10-18). Suspect a texture the renderer can't decode,
   or a heat-haze effect sampling the frame it is drawing into. The log names
