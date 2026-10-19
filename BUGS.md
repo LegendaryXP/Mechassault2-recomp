@@ -21,13 +21,3 @@ have one. Fixed bugs move to MODLOG.md.
   hangars, and mottled sky-like patches on the rooftops (same screenshots).
   Suspect environment/cube-map reflections: face order or orientation, or a
   reflection texture that is a render target.
-- **Music sometimes doesn't play** (2026-10-19). In the scripted runs the
-  mission's music action fires once, at the start: it plays music cue
-  0x2000D (sets it as current and fallback track, level 4000), whose wave
-  is Music.DVDxwb entry 17, a 9.6 s non-looping intro (the long tracks are
-  the looping entries). The intro streams and plays to the end, its voice
-  is freed normally, and then nothing: no further music action fires and the
-  bank is never read again, walking 117 units over 100 s. Not yet known
-  whether the mission should be quiet until combat raises the intensity, or
-  whether the track after the intro is lost. Needs: where in play music is
-  missing. MA2_MUSIC_TRACE=1 logs every music action.

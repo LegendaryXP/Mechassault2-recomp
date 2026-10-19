@@ -428,6 +428,32 @@ static void ma2_music_state(const char *tag, uint32_t self)
     for (k = 0; k < 6; k++)
         fprintf(stderr, " %08X", MA2_MEM32(0x0050C91Cu + 4 * k));
     fprintf(stderr, "\n");
+    {
+        /* The playing sound (this+0x74), raw: its vtable and fields. */
+        uint32_t snd = MA2_MEM32(self + 0x74);
+        if (snd >= 0x10000u && snd < 0x04000000u) {
+            uint32_t ci = MA2_MEM32(snd + 0x18), pl;
+            fprintf(stderr, "[MUSIC]   sound %08X:", snd);
+            for (k = 0; k < 0x40; k += 4)
+                fprintf(stderr, " %08X", MA2_MEM32(snd + k));
+            fprintf(stderr, "\n");
+            /* Its cue info (sound+0x18) and the player that runs it (cue
+             * info+0x38). */
+            if (ci >= 0x10000u && ci < 0x04000000u) {
+                fprintf(stderr, "[MUSIC]   cueinfo %08X:", ci);
+                for (k = 0; k < 0x60; k += 4)
+                    fprintf(stderr, " %08X", MA2_MEM32(ci + k));
+                fprintf(stderr, "\n");
+                pl = MA2_MEM32(ci + 0x38);
+                if (pl >= 0x10000u && pl < 0x04000000u) {
+                    fprintf(stderr, "[MUSIC]   player %08X:", pl);
+                    for (k = 0; k < 0x60; k += 4)
+                        fprintf(stderr, " %08X", MA2_MEM32(pl + k));
+                    fprintf(stderr, "\n");
+                }
+            }
+        }
+    }
 }
 
 void sub_0014D9CC(void)
@@ -441,6 +467,189 @@ void sub_0014D9CC(void)
     sub_0014D9CC_gen();
     if (on)
         ma2_music_state("after", self);
+}
+
+/* ── MechAssault 2: the XACT cue state machine (bring-up) ─────────────── */
+
+/*
+ * Three XACT engine functions an interactive cue runs on: sub_003DFCDF (eax
+ * = cue) is its per-update state machine, driven by the flags at cue+0x38;
+ * sub_003E0C44 (edi = cue) picks and starts a new variation;
+ * sub_003E0587(cue, entry, flag), stdcall, starts the sound of a variation
+ * table entry. Under MA2_MUSIC_TRACE=1 src/ma2_music.c logs them.
+ */
+extern void sub_003DFCDF_gen(void);
+extern void sub_003E0587_gen(void);
+extern void sub_003E0C44_gen(void);
+void ma2_xact_cue(int which, int leave, uint32_t cue, uint32_t a, uint32_t b, uint32_t ret);
+
+void sub_003DFCDF(void)
+{
+    uint32_t cue = g_eax;
+    ma2_xact_cue(0, 0, cue, 0, 0, 0);
+    sub_003DFCDF_gen();
+    ma2_xact_cue(0, 1, cue, 0, 0, g_eax);
+}
+
+void sub_003E0587(void)
+{
+    uint32_t cue = MA2_MEM32(g_esp + 4), entry = MA2_MEM32(g_esp + 8);
+    uint32_t flag = MA2_MEM32(g_esp + 12);
+    ma2_xact_cue(1, 0, cue, entry, flag, 0);
+    sub_003E0587_gen();
+    ma2_xact_cue(1, 1, cue, entry, flag, g_eax);
+}
+
+/* sub_003E27F2 (eax = wave instance, ecx = its sound, [esp+4] flag): XACT
+ * asking whether a playing wave has finished. A streamed one is finished
+ * once DirectSound has completed one of its two packets (status no longer
+ * 0x8000000A, XMEDIAPACKET pending; sub_003E28DB). */
+extern void sub_003E27F2_gen(void);
+void ma2_xact_wave(int leave, uint32_t wave, uint32_t sound, uint32_t ret);
+
+void sub_003E27F2(void)
+{
+    uint32_t wave = g_eax, sound = g_ecx;
+    ma2_xact_wave(0, wave, sound, 0);
+    sub_003E27F2_gen();
+    ma2_xact_wave(1, wave, sound, g_eax);
+}
+
+/* The hand-off from a transition sound to the variation after it:
+ * sub_003E1288 (ecx = sound), sub_003E007B (eax = sound, esi = cue),
+ * sub_003E3628 (eax = sound, edi -> position out; HRESULT) and
+ * sub_003E0A13 (ecx = cue, edx = slot, eax = position, [esp+4]). */
+extern void sub_003E1288_gen(void);
+extern void sub_003E007B_gen(void);
+extern void sub_003E0A13_gen(void);
+extern void sub_003E3628_gen(void);
+void ma2_xact_step(const char *fn, int leave, uint32_t a, uint32_t b, uint32_t c, uint32_t ret);
+
+void sub_003E1288(void)
+{
+    uint32_t snd = g_ecx;
+    ma2_xact_step("1288 sound-step", 0, snd, 0, 0, 0);
+    sub_003E1288_gen();
+    ma2_xact_step("1288 sound-step", 1, snd, 0, 0, g_eax);
+}
+
+void sub_003E007B(void)
+{
+    extern __declspec(thread) uint32_t g_esi;
+    uint32_t snd = g_eax, cue = g_esi;
+    ma2_xact_step("007B handoff", 0, snd, cue, 0, 0);
+    sub_003E007B_gen();
+    ma2_xact_step("007B handoff", 1, snd, cue, 0, g_eax);
+}
+
+void sub_003E3628(void)
+{
+    extern __declspec(thread) uint32_t g_edi;
+    uint32_t snd = g_eax, out = g_edi;
+    ma2_xact_step("3628 position", 0, snd, out, 0, 0);
+    sub_003E3628_gen();
+    ma2_xact_step("3628 position", 1, snd, out, out ? MA2_MEM32(out) : 0, g_eax);
+}
+
+void sub_003E0A13(void)
+{
+    extern __declspec(thread) uint32_t g_edx;
+    uint32_t cue = g_ecx, slot = g_edx, pos = g_eax;
+    ma2_xact_step("0A13 schedule", 0, cue, slot, pos, 0);
+    sub_003E0A13_gen();
+    ma2_xact_step("0A13 schedule", 1, cue, slot, pos, g_eax);
+}
+
+/* sub_003E73D1 (esi = clock owner, [esp+4] -> 64-bit out): XACT's audio
+ * clock, in 100 ns, accumulated from XGSCNT reads. */
+extern void sub_003E73D1_gen(void);
+void ma2_xact_clock(uint32_t owner, uint32_t out);
+
+void sub_003E73D1(void)
+{
+    extern __declspec(thread) uint32_t g_esi;
+    uint32_t owner = g_esi, out = MA2_MEM32(g_esp + 4);
+    sub_003E73D1_gen();
+    ma2_xact_clock(owner, out);
+}
+
+/* sub_003E7479 (eax = event; engine, sound, flag, elapsed; ret 0x10): an
+ * XACT event's due time, into event+0x18. */
+extern void sub_003E7479_gen(void);
+void ma2_xact_due(uint32_t ev, uint32_t engine, uint32_t sound, uint32_t flag, uint32_t elapsed);
+
+void sub_003E7479(void)
+{
+    uint32_t ev = g_eax, engine = MA2_MEM32(g_esp + 4), sound = MA2_MEM32(g_esp + 8);
+    uint32_t flag = MA2_MEM32(g_esp + 12), elapsed = MA2_MEM32(g_esp + 16);
+    sub_003E7479_gen();
+    ma2_xact_due(ev, engine, sound, flag, elapsed);
+}
+
+/* sub_003E133C (edi = sound, [esp+4] = 1 pause / 0 resume): XACT pausing
+ * or resuming a sound; a resume moves its queued events on by the time it
+ * spent paused (now - sound+0x50). */
+extern void sub_003E133C_gen(void);
+void ma2_xact_pause(int leave, uint32_t sound, uint32_t pause, uint32_t caller);
+
+void sub_003E133C(void)
+{
+    extern __declspec(thread) uint32_t g_edi;
+    static int fix = -1;
+    uint32_t sound = g_edi, pause = MA2_MEM32(g_esp + 4), caller = MA2_MEM32(g_esp);
+
+    /* A resume of a sound that was never paused (pause time 0) has nothing
+     * to undo, but XACT does it anyway: its guard lets a playing sound
+     * through, and it moves every queued event on by now - 0, a whole
+     * system time. MA2 resumes everything when a front-end screen closes
+     * and again when loading ends; a mission's music cue started between
+     * the two had its intro-to-track transition pushed four centuries out,
+     * and the music stopped when the intro did. MA2_XACT_RESUME_FIX=0
+     * lets the resume through as before. */
+    if (fix < 0) {
+        const char *e = getenv("MA2_XACT_RESUME_FIX");
+        fix = !(e && *e == '0');
+    }
+    if (fix && !pause && MA2_MEM32(sound + 0x50) == 0 && MA2_MEM32(sound + 0x54) == 0) {
+        g_esp += 8;           /* ret 4: the return address and the flag */
+        return;
+    }
+    ma2_xact_pause(0, sound, pause, caller);
+    sub_003E133C_gen();
+    ma2_xact_pause(1, sound, pause, caller);
+}
+
+/* sub_000BEE80 (edi = the game's audio system; category, pause; ret 8):
+ * the game asking XACT to pause or resume a category, 0xFF for all. */
+extern void sub_000BEE80_gen(void);
+
+void sub_000BEE80(void)
+{
+    static int on = -1;
+    uint32_t cat = MA2_MEM32(g_esp + 4), pause = MA2_MEM32(g_esp + 8);
+    if (on < 0)
+        on = getenv("MA2_MUSIC_TRACE") != NULL;
+    if (on) {
+        uint32_t k;
+        fprintf(stderr, "[XACT] %lu game %s category %02X, stack:", (unsigned long)GetTickCount(),
+                pause ? "pause " : "resume", cat & 0xFF);
+        for (k = 0; k < 0x60; k += 4) {
+            uint32_t v = MA2_MEM32(g_esp + k);
+            if (v >= 0x00012000u && v < 0x003279C8u)
+                fprintf(stderr, " %08X", v);
+        }
+        fprintf(stderr, "\n");
+    }
+    sub_000BEE80_gen();
+}
+
+void sub_003E0C44(void)
+{
+    extern __declspec(thread) uint32_t g_edi;
+    uint32_t cue = g_edi;
+    ma2_xact_cue(2, 0, cue, 0, 0, 0);
+    sub_003E0C44_gen();
+    ma2_xact_cue(2, 1, cue, 0, 0, g_eax);
 }
 
 /* ── Bring-up switch: MA2_SKIP_ICALL ───────────────────────── */
