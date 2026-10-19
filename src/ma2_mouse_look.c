@@ -51,6 +51,27 @@ int mkb_mouse_look_take(float *yaw_deg, float *pitch_deg);
 
 #define LOOK_MEMF(va)  (*(volatile float *)((uint8_t *)g_xbox_mem_offset + (va)))
 
+/* MA2_LOOK_TRACE=1 (bring-up): every hook call, with the time, the axis and
+ * what it applied -- the cadence the game asks at. The time is the
+ * performance counter in ms, the clock RECOMP_PRESENT_TRACE prints. */
+#include <windows.h>
+static void look_trace(char axis, float d)
+{
+    static int on = -1, n;
+    static LARGE_INTEGER f;
+    LARGE_INTEGER t;
+    if (on < 0) {
+        on = getenv("MA2_LOOK_TRACE") != NULL;
+        QueryPerformanceFrequency(&f);
+    }
+    if (!on || n >= 20000)
+        return;
+    n++;
+    QueryPerformanceCounter(&t);
+    fprintf(stderr, "[LOOKT] %c %.3f %+.4f\n", axis,
+            (double)(t.QuadPart % (f.QuadPart * 100000)) * 1000.0 / (double)f.QuadPart, d);
+}
+
 #define MA2_TURN_STANDING   0x001002FBu   /* in sub_001002A3 */
 #define MA2_TURN_WALKING    0x001739C5u   /* in sub_00172E96 */
 #define MA2_BODY_RATE_SET   0x40u         /* the setter's this, from the body */
@@ -72,7 +93,10 @@ void ma2_mouse_look_rate_set(uint32_t ret, uint32_t comp, float rate)
     body = comp - MA2_BODY_RATE_SET;
     if (!mode || body < 0x10000u || body >= 0x04000000u)
         return;
-    if (!mkb_mouse_look_take(&yaw, NULL) || yaw == 0.0f)
+    if (!mkb_mouse_look_take(&yaw, NULL))
+        return;
+    look_trace('y', yaw);
+    if (yaw == 0.0f)
         return;
     LOOK_MEMF(body + MA2_BODY_HEADING) += yaw;
     if (dbg && shown < 2000) {
@@ -105,6 +129,7 @@ void ma2_mouse_look_pitch(uint32_t ret, uint32_t walker, float input)
         return;
     if (!mkb_mouse_look_take(NULL, &up))
         return;
+    look_trace('p', up);
     lo = LOOK_MEMF(walker + MA2_PITCH_MIN);
     hi = LOOK_MEMF(walker + MA2_PITCH_MAX);
     p = LOOK_MEMF(walker + MA2_PITCH);

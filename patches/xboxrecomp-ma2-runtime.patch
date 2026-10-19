@@ -521,7 +521,7 @@ index 281b4d2..32e4d68 100644
  /**
   * Unswizzle a texture from Xbox swizzled (Z-order/Morton) layout
 diff --git a/src/input/mkb_input.c b/src/input/mkb_input.c
-index d6f0042..1dc2003 100644
+index d6f0042..6a8388b 100644
 --- a/src/input/mkb_input.c
 +++ b/src/input/mkb_input.c
 @@ -9,10 +9,14 @@
@@ -739,7 +739,7 @@ index d6f0042..1dc2003 100644
              if (!eq) continue;
              *eq = 0;
              k = line; v = eq + 1;
-@@ -128,22 +274,107 @@ static void mkb_load_config(void)
+@@ -128,22 +274,136 @@ static void mkb_load_config(void)
      fclose(f);
  }
  
@@ -821,38 +821,67 @@ index d6f0042..1dc2003 100644
 +    return mkb_enabled() && s_captured;
 +}
 +
-+/* Direct look: counts mkb_merge set aside for a title hook, which axes it
-+ * takes (bit 0 x, bit 1 y), and when it last asked (GetTickCount64 ms;
-+ * 0 = never). */
-+static volatile LONG s_look_dx, s_look_dy, s_look_live, s_look_axes;
-+static volatile ULONGLONG s_look_asked;
++/* Direct look: counts mkb_merge set aside for title hooks, which axes it is
++ * handing over (bit 0 x, bit 1 y), and when a hook last asked for each axis
++ * (GetTickCount64 ms; 0 = never). The axes are asked for separately: a
++ * title may turn and tilt in two different places, each once a frame. */
++static volatile LONG s_look_dx, s_look_dy, s_look_live;
++static volatile ULONGLONG s_look_asked[2];
++
++/* The script clock (ms since the first pad poll; 0 = not started) and the
++ * scripted mouse travel due by a time, for whoever asks first. */
++static volatile LONG s_script_t0;
++static unsigned long mkb_now_ms(void);
++static void mkb_script_mouse(unsigned long t, LONG *dx, LONG *dy);
 +
 +int mkb_mouse_look_take(float *yaw_deg, float *pitch_deg)
 +{
-+    LONG dx, dy;
++    LONG dx = 0, dy = 0, live = 0;
++    ULONGLONG now;
 +    double k;
 +
-+    *yaw_deg = 0.0f;
++    if (yaw_deg)
++        *yaw_deg = 0.0f;
 +    if (pitch_deg)
 +        *pitch_deg = 0.0f;
 +    if (!mkb_enabled())
 +        return 0;
-+    InterlockedExchange(&s_look_axes, pitch_deg ? 3 : 1);
-+    s_look_asked = GetTickCount64();
-+    dx = InterlockedExchange(&s_look_dx, 0);
-+    dy = InterlockedExchange(&s_look_dy, 0);
-+    if (!InterlockedCompareExchange(&s_look_live, 0, 0))
-+        return 0;
-+    k = s_cfg.look_deg * s_cfg.sens;
-+    *yaw_deg = (float)(dx * k);
++    now = GetTickCount64();
++    if (yaw_deg)
++        s_look_asked[0] = now;
 +    if (pitch_deg)
++        s_look_asked[1] = now;
++    /* The counts are read here, when the title wants them, straight from
++     * the raw-input accumulators -- not only what mkb_merge moved across.
++     * The title polls the pad in clumps (USB reports), so a steady mouse
++     * reached the camera as nothing for two frames and a lump on the third:
++     * a hitch on every move. A script's travel is due by the clock, so it
++     * is handed over the same way. */
++    if (s_scripted || (s_captured && game_is_foreground()))
++        live = (yaw_deg ? 1 : 0) | (pitch_deg ? 2 : 0);
++    if (!live)
++        return 0;
++    if (s_scripted && s_script_t0) {
++        LONG sx = 0, sy = 0;
++        mkb_script_mouse(mkb_now_ms() - (unsigned long)s_script_t0, &sx, &sy);
++        if (sx) InterlockedAdd(&s_dx, sx);
++        if (sy) InterlockedAdd(&s_dy, sy);
++    }
++    if (live & 1)
++        dx = InterlockedExchange(&s_look_dx, 0) + InterlockedExchange(&s_dx, 0);
++    if (live & 2)
++        dy = InterlockedExchange(&s_look_dy, 0) + InterlockedExchange(&s_dy, 0);
++    k = s_cfg.look_deg * s_cfg.sens;
++    if (live & 1)
++        *yaw_deg = (float)(dx * k);
++    if (live & 2)
 +        *pitch_deg = (float)(-dy * k * (s_cfg.look_invert_y ? -1.0 : 1.0));
 +    return 1;
 +}
  
  static void mkb_handle_raw(HRAWINPUT h)
  {
-@@ -155,6 +386,8 @@ static void mkb_handle_raw(HRAWINPUT h)
+@@ -155,6 +415,8 @@ static void mkb_handle_raw(HRAWINPUT h)
              == (UINT)-1)
          return;
  
@@ -861,7 +890,7 @@ index d6f0042..1dc2003 100644
      if (ri->header.dwType == RIM_TYPEMOUSE) {
          const RAWMOUSE *m = &ri->data.mouse;
  
-@@ -162,6 +395,27 @@ static void mkb_handle_raw(HRAWINPUT h)
+@@ -162,6 +424,27 @@ static void mkb_handle_raw(HRAWINPUT h)
              if (m->lLastX) InterlockedAdd(&s_dx, m->lLastX);
              if (m->lLastY) InterlockedAdd(&s_dy, m->lLastY);
          }
@@ -889,7 +918,7 @@ index d6f0042..1dc2003 100644
          if (m->usButtonFlags & RI_MOUSE_LEFT_BUTTON_DOWN)
              InterlockedOr(&s_mouse_btn, 1);
          if (m->usButtonFlags & RI_MOUSE_LEFT_BUTTON_UP)
-@@ -190,20 +444,33 @@ static void mkb_handle_raw(HRAWINPUT h)
+@@ -190,20 +473,33 @@ static void mkb_handle_raw(HRAWINPUT h)
          const RAWKEYBOARD *k = &ri->data.keyboard;
          UINT vk = k->VKey;
  
@@ -932,7 +961,7 @@ index d6f0042..1dc2003 100644
          }
      }
  }
-@@ -256,9 +523,17 @@ static DWORD WINAPI mkb_thread(LPVOID unused)
+@@ -256,9 +552,17 @@ static DWORD WINAPI mkb_thread(LPVOID unused)
      }
  
      InterlockedExchange(&s_thread_up, 1);
@@ -953,7 +982,7 @@ index d6f0042..1dc2003 100644
      fflush(stderr);
  
      while (GetMessageA(&msg, NULL, 0, 0) > 0) {
-@@ -281,7 +556,9 @@ int mkb_enabled(void)
+@@ -281,7 +585,9 @@ int mkb_enabled(void)
          const char *v = getenv("RECOMP_MKB");
          on = v && *v && *v != '0';
          if (on) {
@@ -963,7 +992,7 @@ index d6f0042..1dc2003 100644
              if (InterlockedCompareExchange(&s_thread_up, 0, 0) == 0) {
                  static LONG started = 0;
                  if (InterlockedCompareExchange(&started, 1, 0) == 0)
-@@ -312,23 +589,38 @@ static int game_is_foreground(void)
+@@ -312,23 +618,38 @@ static int game_is_foreground(void)
   * end up clicking other apps' title bars. */
  static void mkb_manage_cursor(int capture)
  {
@@ -1015,7 +1044,7 @@ index d6f0042..1dc2003 100644
      }
  }
  
-@@ -356,86 +648,574 @@ static void mkb_aim_vector(double ax, double ay, SHORT *out_x, SHORT *out_y)
+@@ -356,86 +677,599 @@ static void mkb_aim_vector(double ax, double ay, SHORT *out_x, SHORT *out_y)
  
  #define MK_VK(k)  ((unsigned)(k) < 256 && s_vk_down[(k)])
  
@@ -1070,35 +1099,54 @@ index d6f0042..1dc2003 100644
 +    }
 +}
 +
-+/* Apply the script at time t: held inputs into down[], mouse travel into
-+ * *dx/*dy for the slice (last, t]. */
-+static void mkb_script_apply(unsigned long last, unsigned long t,
-+                             unsigned char *down, LONG *dx, LONG *dy)
++static void mkb_script_shown(MkbStep *st, int i, unsigned long t)
++{
++    if (!st->shown) {
++        st->shown = 1;
++        fprintf(stderr, "  [MKB] script t=%lu ms: step %d\n", t, i);
++        fflush(stderr);
++    }
++}
++
++/* Apply the script's held inputs at time t into down[]. */
++static void mkb_script_apply(unsigned long t, unsigned char *down)
 +{
 +    int i;
 +    for (i = 0; i < s_nsteps; i++) {
 +        MkbStep *st = &s_steps[i];
-+        unsigned long end = st->at + st->len;
-+        if (t < st->at || (st->in >= 0 && t >= end) || (st->in < 0 && last >= end))
++        if (st->in < 0 || t < st->at || t >= st->at + st->len)
 +            continue;
-+        if (!st->shown) {
-+            st->shown = 1;
-+            fprintf(stderr, "  [MKB] script t=%lu ms: step %d\n", t, i);
-+            fflush(stderr);
-+        }
-+        if (st->in >= 0) {
-+            down[st->in] = 1;
-+        } else {
-+            /* Counts due by b less counts due by a, both rounded: the step
-+             * hands out exactly its total, a slow one included (truncating
-+             * each poll's share lost every count of a move slower than one
-+             * count a poll). */
-+            unsigned long a = last > st->at ? last : st->at, b = t < end ? t : end;
-+            if (b > a) {
-+                double fa = (double)(a - st->at) / st->len, fb = (double)(b - st->at) / st->len;
-+                *dx += (LONG)floor(st->dx * fb + 0.5) - (LONG)floor(st->dx * fa + 0.5);
-+                *dy += (LONG)floor(st->dy * fb + 0.5) - (LONG)floor(st->dy * fa + 0.5);
-+            }
++        mkb_script_shown(st, i, t);
++        down[st->in] = 1;
++    }
++}
++
++/* The script's mouse travel due between the last call and t, into *dx/*dy.
++ * Called by the pad poll and by mkb_mouse_look_take, whichever comes first;
++ * the clock only moves forward. Counts due by b less counts due by a, both
++ * rounded: a step hands out exactly its total, a slow one included. */
++static void mkb_script_mouse(unsigned long t, LONG *dx, LONG *dy)
++{
++    static volatile LONG last;
++    LONG prev;
++    int i;
++    do {
++        prev = last;
++        if ((LONG)t <= prev)
++            return;
++    } while (InterlockedCompareExchange(&last, (LONG)t, prev) != prev);
++    for (i = 0; i < s_nsteps; i++) {
++        MkbStep *st = &s_steps[i];
++        unsigned long end = st->at + st->len, a, b;
++        if (st->in >= 0 || t < st->at || (unsigned long)prev >= end)
++            continue;
++        mkb_script_shown(st, i, t);
++        a = (unsigned long)prev > st->at ? (unsigned long)prev : st->at;
++        b = t < end ? t : end;
++        if (b > a) {
++            double fa = (double)(a - st->at) / st->len, fb = (double)(b - st->at) / st->len;
++            *dx += (LONG)floor(st->dx * fb + 0.5) - (LONG)floor(st->dx * fa + 0.5);
++            *dy += (LONG)floor(st->dy * fb + 0.5) - (LONG)floor(st->dy * fa + 0.5);
 +        }
 +    }
 +}
@@ -1380,6 +1428,18 @@ index d6f0042..1dc2003 100644
 +    fprintf(stderr, "\n");
 +}
 +
++/* Milliseconds from the performance counter: GetTickCount moves in 15.6 ms
++ * steps, which handed a scripted mouse move to one poll in four as a burst. */
++static unsigned long mkb_now_ms(void)
++{
++    static LARGE_INTEGER f;
++    LARGE_INTEGER c;
++    if (!f.QuadPart)
++        QueryPerformanceFrequency(&f);
++    QueryPerformanceCounter(&c);
++    return (unsigned long)(c.QuadPart * 1000 / f.QuadPart);
++}
++
  int mkb_merge(DWORD dwPort, XBOX_INPUT_STATE *pState)
  {
 -    SHORT aim_x = 0, aim_y = 0, mov_x = 0, mov_y = 0;
@@ -1403,19 +1463,11 @@ index d6f0042..1dc2003 100644
 -    if (!s_active) {
 -        mkb_manage_cursor(0);
 -        return 0;
-+    /* Milliseconds from the performance counter: GetTickCount moves in
-+     * 15.6 ms steps, which handed a scripted mouse move to one poll in four
-+     * as a burst. */
-+    {
-+        static LARGE_INTEGER f;
-+        LARGE_INTEGER c;
-+        if (!f.QuadPart)
-+            QueryPerformanceFrequency(&f);
-+        QueryPerformanceCounter(&c);
-+        now = (unsigned long)(c.QuadPart * 1000 / f.QuadPart);
-     }
-+    if (!t0)
++    now = mkb_now_ms();
++    if (!t0) {
 +        t0 = now;
++        InterlockedExchange(&s_script_t0, (LONG)t0);
+     }
 +    t = now - t0;
  
 -    /* Foreground gate: while the user is elsewhere the mouse belongs to
@@ -1474,25 +1526,27 @@ index d6f0042..1dc2003 100644
 +    if (s_scripted) {
 +        if (s_nsteps < 0)
 +            mkb_script_load();
-+        mkb_script_apply(last_t, t, down, &dx, &dy);
++        mkb_script_apply(t, down);
++        mkb_script_mouse(t, &dx, &dy);
 +    }
 +    /* A title hook turning its camera from the mouse (mkb_mouse_look_take)
-+     * gets the counts instead of the aim stick, for as long as it keeps
-+     * asking. */
++     * gets an axis's counts instead of the aim stick, for as long as it
++     * keeps asking for that axis. */
 +    {
-+        ULONGLONG asked = s_look_asked;
-+        int live = asked && GetTickCount64() - asked < 500 && (s_scripted || s_captured);
++        ULONGLONG at = GetTickCount64(), ax0 = s_look_asked[0], ax1 = s_look_asked[1];
++        int on = s_scripted || s_captured;
++        LONG live = (on && ax0 && at - ax0 < 500 ? 1 : 0)
++                  | (on && ax1 && at - ax1 < 500 ? 2 : 0);
 +        InterlockedExchange(&s_look_live, live);
-+        if (live) {
-+            LONG axes = InterlockedCompareExchange(&s_look_axes, 0, 0);
++        if (live & 1) {
 +            InterlockedAdd(&s_look_dx, dx);
 +            dx = 0;
 +            s_aim_vx = 0.0;
-+            if (axes & 2) {
-+                InterlockedAdd(&s_look_dy, dy);
-+                dy = 0;
-+                s_aim_vy = 0.0;
-+            }
++        }
++        if (live & 2) {
++            InterlockedAdd(&s_look_dy, dy);
++            dy = 0;
++            s_aim_vy = 0.0;
 +        }
 +    }
 +    mkb_mempoke(last_t, t);
@@ -1515,11 +1569,7 @@ index d6f0042..1dc2003 100644
 +        else if (a->kind == ACT_AXIS)
 +            ax[a->idx] = 1;
 +    }
- 
--    /* ---- mouse buttons, as the Xbox pad sees them ---- */
--    if (btn & 0x01) analog[XBOX_BUTTON_RTRIGGER] = 255;  /* fire      */
--    if (btn & 0x02) analog[XBOX_BUTTON_LTRIGGER] = 255;  /* ADS/aim   */
--    if (btn & 0x04) b |= 0;                              /* M: below  */
++
 +    /* ---- keys on the sticks: movement, and keyboard look ---- */
 +    {
 +        int mx = ax[AX_LRIGHT] - ax[AX_LLEFT], my = ax[AX_LUP] - ax[AX_LDOWN];
@@ -1532,7 +1582,10 @@ index d6f0042..1dc2003 100644
 +                           &look_x, &look_y);
 +    }
  
--    /* ---- keyboard: WASD movement ---- */
+-    /* ---- mouse buttons, as the Xbox pad sees them ---- */
+-    if (btn & 0x01) analog[XBOX_BUTTON_RTRIGGER] = 255;  /* fire      */
+-    if (btn & 0x02) analog[XBOX_BUTTON_LTRIGGER] = 255;  /* ADS/aim   */
+-    if (btn & 0x04) b |= 0;                              /* M: below  */
 +    /* ---- mouse: aim ----
 +     *
 +     * A stick reading is a speed, and the game samples the pad on its own
@@ -1544,6 +1597,46 @@ index d6f0042..1dc2003 100644
 +     * motion per report, so a slow or steady move came out as a small
 +     * deflection inside the game's deadzone, and a report that fell between
 +     * two mouse packets read as a centred stick: the camera barely turned. */
++    {
++        static LARGE_INTEGER qf, qlast;
++        LARGE_INTEGER qn;
++        double dt_ms = 0.0;
++
++        if (!qf.QuadPart)
++            QueryPerformanceFrequency(&qf);
++        QueryPerformanceCounter(&qn);
++        if (qlast.QuadPart)
++            dt_ms = (double)(qn.QuadPart - qlast.QuadPart) * 1000.0
++                  / (double)qf.QuadPart;
++        if (dt_ms >= 0.05 || !qlast.QuadPart) {
++            double a;
++            if (dt_ms > 100.0) dt_ms = 100.0;          /* after a pause */
++            if (dt_ms < 0.05)  dt_ms = 0.05;
++            a = 1.0 - exp(-dt_ms / s_cfg.smooth);
++            s_aim_vx += ((double)dx / dt_ms - s_aim_vx) * a;   /* counts/ms */
++            s_aim_vy += ((double)dy / dt_ms - s_aim_vy) * a;
++            if (s_aim_vx * s_aim_vx + s_aim_vy * s_aim_vy < 1e-4)
++                s_aim_vx = s_aim_vy = 0.0;             /* < 10 counts/s */
++            qlast = qn;
++        } else {
++            /* Two polls in the same instant: keep the counts for the next. */
++            InterlockedAdd(&s_dx, dx);
++            InterlockedAdd(&s_dy, dy);
++        }
++    }
++    if (s_aim_vx || s_aim_vy) {
++        double fx =  s_aim_vx * 10.0 / (double)s_cfg.full;
++        double fy = -s_aim_vy * 10.0 / (double)s_cfg.full;
++        if (s_cfg.invert_y) fy = -fy;
++        mkb_aim_vector(fx, fy, &aim_x, &aim_y);
++    } else if (look_x || look_y) {
++        aim_x = look_x;
++        aim_y = look_y;
++    }
+ 
+-    /* ---- keyboard: WASD movement ---- */
++    /* RECOMP_MKB_TRACE=1: once a second, how often the pad was polled, how
++     * far the mouse moved, and the largest aim deflection handed out. */
      {
 -        int mx = 0, my = 0;
 -        if (MK_VK('W')) my += 1;
@@ -1582,45 +1675,6 @@ index d6f0042..1dc2003 100644
 -    /* ---- wheel / middle button: cycle weapon ---- */
 -    if (wheel || (btn & 0x04))
 -        analog[XBOX_BUTTON_Y] = 255;
-+        static LARGE_INTEGER qf, qlast;
-+        LARGE_INTEGER qn;
-+        double dt_ms = 0.0;
-+
-+        if (!qf.QuadPart)
-+            QueryPerformanceFrequency(&qf);
-+        QueryPerformanceCounter(&qn);
-+        if (qlast.QuadPart)
-+            dt_ms = (double)(qn.QuadPart - qlast.QuadPart) * 1000.0
-+                  / (double)qf.QuadPart;
-+        if (dt_ms >= 0.05 || !qlast.QuadPart) {
-+            double a;
-+            if (dt_ms > 100.0) dt_ms = 100.0;          /* after a pause */
-+            if (dt_ms < 0.05)  dt_ms = 0.05;
-+            a = 1.0 - exp(-dt_ms / s_cfg.smooth);
-+            s_aim_vx += ((double)dx / dt_ms - s_aim_vx) * a;   /* counts/ms */
-+            s_aim_vy += ((double)dy / dt_ms - s_aim_vy) * a;
-+            if (s_aim_vx * s_aim_vx + s_aim_vy * s_aim_vy < 1e-4)
-+                s_aim_vx = s_aim_vy = 0.0;             /* < 10 counts/s */
-+            qlast = qn;
-+        } else {
-+            /* Two polls in the same instant: keep the counts for the next. */
-+            InterlockedAdd(&s_dx, dx);
-+            InterlockedAdd(&s_dy, dy);
-+        }
-+    }
-+    if (s_aim_vx || s_aim_vy) {
-+        double fx =  s_aim_vx * 10.0 / (double)s_cfg.full;
-+        double fy = -s_aim_vy * 10.0 / (double)s_cfg.full;
-+        if (s_cfg.invert_y) fy = -fy;
-+        mkb_aim_vector(fx, fy, &aim_x, &aim_y);
-+    } else if (look_x || look_y) {
-+        aim_x = look_x;
-+        aim_y = look_y;
-+    }
-+
-+    /* RECOMP_MKB_TRACE=1: once a second, how often the pad was polled, how
-+     * far the mouse moved, and the largest aim deflection handed out. */
-+    {
 +        static int trace = -1;
 +        static unsigned long t_last, polls;
 +        static long sum_x, sum_y;
@@ -1648,7 +1702,7 @@ index d6f0042..1dc2003 100644
      /* ---- merge on top of whatever the host pad produced ---- */
      if (b)        { pState->Gamepad.wButtons |= b; any = 1; }
 diff --git a/src/input/mkb_input.h b/src/input/mkb_input.h
-index 664efad..e8f60bb 100644
+index 664efad..fe9d4bd 100644
 --- a/src/input/mkb_input.h
 +++ b/src/input/mkb_input.h
 @@ -18,11 +18,23 @@
@@ -1679,7 +1733,7 @@ index 664efad..e8f60bb 100644
   */
  
  #ifndef XBOXRECOMP_MKB_INPUT_H
-@@ -51,6 +63,25 @@ int mkb_enabled(void);
+@@ -51,6 +63,27 @@ int mkb_enabled(void);
   */
  int mkb_merge(DWORD dwPort, XBOX_INPUT_STATE *pState);
  
@@ -1697,8 +1751,10 @@ index 664efad..e8f60bb 100644
 + * off), 1 otherwise. While a title keeps calling it the mouse stops steering
 + * the aim stick -- the turn goes straight into the camera, one fixed angle
 + * per count, with none of the stick's deadzone, ramp or speed limit.
-+ * pitch_deg NULL takes the horizontal only: vertical mouse movement keeps
-+ * driving the aim stick's y.
++ * Each axis is its own: NULL for one takes the other only, and an axis no
++ * hook has asked for in half a second drives the aim stick again (pitch_deg
++ * NULL: vertical movement keeps driving the stick's y). A title that turns
++ * and tilts in two places asks for each axis in its own place.
 + */
 +int mkb_mouse_look_take(float *yaw_deg, float *pitch_deg);
 +
@@ -4600,10 +4656,10 @@ index 87b7ef7..e6c21cc 100644
  static void publish(uint32_t bpp)
 diff --git a/src/video/nv2a_d3d11.c b/src/video/nv2a_d3d11.c
 new file mode 100644
-index 0000000..f0ea2a8
+index 0000000..28f7228
 --- /dev/null
 +++ b/src/video/nv2a_d3d11.c
-@@ -0,0 +1,3209 @@
+@@ -0,0 +1,3225 @@
 +/*
 + * nv2a_d3d11.c -- a Direct3D 11 render back end for the pushbuffer executor.
 + *
@@ -7683,6 +7739,22 @@ index 0000000..f0ea2a8
 +        }
 +    }
 +    IDXGISwapChain1_Present(s_swap, vsync ? 1 : 0, 0);
++    /* RECOMP_PRESENT_TRACE=1: the time of every present, for frame pacing. */
++    {
++        static int tr = -1, n;
++        static LARGE_INTEGER f;
++        LARGE_INTEGER t;
++        if (tr < 0) {
++            tr = getenv("RECOMP_PRESENT_TRACE") != NULL;
++            QueryPerformanceFrequency(&f);
++        }
++        if (tr && n < 40000) {
++            n++;
++            QueryPerformanceCounter(&t);
++            fprintf(stderr, "[PRESENT] %.3f\n",
++                    (double)(t.QuadPart % (f.QuadPart * 100000)) * 1000.0 / (double)f.QuadPart);
++        }
++    }
 +    return 1;
 +}
 +
