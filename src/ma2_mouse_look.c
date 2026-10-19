@@ -45,6 +45,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stddef.h>
+#include <math.h>
 
 extern ptrdiff_t g_xbox_mem_offset;
 int mkb_mouse_look_take(float *yaw_deg, float *pitch_deg);
@@ -72,16 +73,85 @@ static void look_trace(char axis, float d)
             (double)(t.QuadPart % (f.QuadPart * 100000)) * 1000.0 / (double)f.QuadPart, d);
 }
 
+/* The active camera: the camera manager at [0x00524A5C] keeps a vector of
+ * cameras at +4..+8; the first with byte +0x95 set is the one in use
+ * (sub_0016B554 / sub_0016B56A). 0 when there is none. */
+#define LOOK_MEM32(va) (*(volatile uint32_t *)((uint8_t *)g_xbox_mem_offset + (va)))
+static uint32_t ma2_active_camera(void)
+{
+    uint32_t mgr = LOOK_MEM32(0x00524A5Cu), p, e;
+    if (mgr < 0x10000u || mgr >= 0x04000000u)
+        return 0;
+    p = LOOK_MEM32(mgr + 4);
+    e = LOOK_MEM32(mgr + 8);
+    if (p < 0x10000u || e >= 0x04000000u || e < p || e - p > 64 * 4)
+        return 0;
+    for (; p < e; p += 4) {
+        uint32_t c = LOOK_MEM32(p);
+        if (c >= 0x10000u && c < 0x04000000u
+                && (*((volatile uint8_t *)g_xbox_mem_offset + c + 0x95)))
+            return c;
+    }
+    return 0;
+}
+
+/* MA2_LOOK_CAMDUMP=1 (bring-up): the active camera's vtable and fields,
+ * every frame for two seconds from the first mouse turn, to find where it
+ * keeps its yaw. */
+static void look_cam_dump(int moving)
+{
+    static int on = -1, shown;
+    static DWORD start;
+    uint32_t cam, k;
+    if (on < 0)
+        on = getenv("MA2_LOOK_CAMDUMP") != NULL;
+    if (!on)
+        return;
+    if (!start) {
+        if (!moving)
+            return;
+        start = GetTickCount() - 100;
+    }
+    if (GetTickCount() - start > 2000 || shown > 1000)
+        return;
+    cam = ma2_active_camera();
+    if (!cam)
+        return;
+    if (!shown++) {
+        uint32_t vt = LOOK_MEM32(cam);
+        fprintf(stderr, "[CAM] camera %08X vtable %08X:", cam, vt);
+        for (k = 0; k < 0x80 && vt >= 0x10000u && vt < 0x04000000u; k += 4)
+            fprintf(stderr, " %08X", LOOK_MEM32(vt + k));
+        fprintf(stderr, "\n");
+    }
+    {
+        /* One write a line: stderr is unbuffered and other threads log too. */
+        static char line[0x900 / 4 * 16 + 64];
+        size_t at = (size_t)snprintf(line, sizeof line, "[CAMF] %lu", (unsigned long)GetTickCount());
+        uint32_t node = LOOK_MEM32(cam + 0x78);
+        int nodeok = node >= 0x10000u && node < 0x04000000u;
+        for (k = 0; k < 0x900 && at < sizeof line - 20; k += 4) {
+            float v = k < 0x800 ? LOOK_MEMF(cam + k)
+                                : nodeok ? LOOK_MEMF(node + k - 0x800) : 0.0f;
+            at += (size_t)snprintf(line + at, sizeof line - at, " %g", v);
+        }
+        snprintf(line + at, sizeof line - at, "\n");
+        fputs(line, stderr);
+    }
+}
+
 #define MA2_TURN_STANDING   0x001002FBu   /* in sub_001002A3 */
 #define MA2_TURN_WALKING    0x001739C5u   /* in sub_00172E96 */
 #define MA2_BODY_RATE_SET   0x40u         /* the setter's this, from the body */
 #define MA2_BODY_HEADING    0x64u         /* degrees, unwrapped */
+#define MA2_WALKER_CAM_TARGET 0x12Cu      /* heading the camera aims at */
+#define MA2_WALKER_CAM_YAW    0x130u      /* the camera's yaw, degrees */
 
 void ma2_mouse_look_rate_set(uint32_t ret, uint32_t comp, float rate)
 {
     static int mode = -1, dbg, shown;
     uint32_t body;
-    float yaw;
+    float yaw, before;
 
     if (ret != MA2_TURN_STANDING && ret != MA2_TURN_WALKING)
         return;
@@ -96,9 +166,29 @@ void ma2_mouse_look_rate_set(uint32_t ret, uint32_t comp, float rate)
     if (!mkb_mouse_look_take(&yaw, NULL))
         return;
     look_trace('y', yaw);
+    look_cam_dump(yaw != 0.0f);
     if (yaw == 0.0f)
         return;
-    LOOK_MEMF(body + MA2_BODY_HEADING) += yaw;
+    before = LOOK_MEMF(body + MA2_BODY_HEADING);
+    LOOK_MEMF(body + MA2_BODY_HEADING) = before + yaw;
+    /* The camera turns with it. The walker keeps the heading it is aiming
+     * the camera at (walker+0x12C) and the camera's own yaw (walker+0x130,
+     * degrees), and moves the second toward the first at about 400 deg/s:
+     * a flick turned the mech at once and the view a quarter of a second
+     * later. The same turn on both leaves no gap to chase. The walker is the
+     * player entity the camera follows (the camera list's active entry);
+     * it is this body's when the heading it aims at is this body's heading
+     * as it stood before the turn. */
+    {
+        uint32_t walker = ma2_active_camera();
+        if (walker && fabsf(LOOK_MEMF(walker + MA2_WALKER_CAM_TARGET) - before) < 0.01f) {
+            LOOK_MEMF(walker + MA2_WALKER_CAM_TARGET) += yaw;
+            LOOK_MEMF(walker + MA2_WALKER_CAM_YAW) += yaw;
+        } else if (dbg && shown < 2000) {
+            fprintf(stderr, "[LOOK] camera not locked: walker %08X target %g heading %g\n",
+                    walker, walker ? LOOK_MEMF(walker + MA2_WALKER_CAM_TARGET) : 0.0f, before);
+        }
+    }
     if (dbg && shown < 2000) {
         shown++;
         fprintf(stderr, "[LOOK] %s body %08X rate %g yaw %+.3f heading %.3f\n",

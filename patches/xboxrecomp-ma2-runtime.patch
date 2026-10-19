@@ -521,7 +521,7 @@ index 281b4d2..32e4d68 100644
  /**
   * Unswizzle a texture from Xbox swizzled (Z-order/Morton) layout
 diff --git a/src/input/mkb_input.c b/src/input/mkb_input.c
-index d6f0042..6a8388b 100644
+index d6f0042..eb0f371 100644
 --- a/src/input/mkb_input.c
 +++ b/src/input/mkb_input.c
 @@ -9,10 +9,14 @@
@@ -1044,7 +1044,7 @@ index d6f0042..6a8388b 100644
      }
  }
  
-@@ -356,86 +677,599 @@ static void mkb_aim_vector(double ax, double ay, SHORT *out_x, SHORT *out_y)
+@@ -356,86 +677,669 @@ static void mkb_aim_vector(double ax, double ay, SHORT *out_x, SHORT *out_y)
  
  #define MK_VK(k)  ((unsigned)(k) < 256 && s_vk_down[(k)])
  
@@ -1240,6 +1240,49 @@ index d6f0042..6a8388b 100644
 +    fflush(stderr);
 +}
 +
++/* RECOMP_MEMSCAN_LAG=<total>,<total>...: with three snapshots (before a
++ * scripted flick, during it, after it settles), list the floats that moved
++ * by one of those totals in all (2% either way) and stood partway (10% to
++ * 90%) in the middle snapshot -- a value chasing the one the flick set, like
++ * a camera following a heading. */
++static void mkb_memscan_lag(float *const *snap, const char *spec)
++{
++    const size_t n = (MEMSCAN_HI - MEMSCAN_LO) / 4;
++    const char *outp = getenv("RECOMP_MEMSCAN_OUT");
++    FILE *out = outp ? fopen(outp, "w") : NULL;
++    float tot[8];
++    int nt = 0, k;
++    size_t i, hits = 0;
++    char *end;
++
++    while (spec && *spec && nt < 8) {
++        tot[nt++] = fabsf((float)strtod(spec, &end));
++        spec = (*end == ',') ? end + 1 : NULL;
++    }
++    for (i = 0; i < n; i++) {
++        float a = snap[0][i], b = snap[1][i], c = snap[2][i], d = c - a, f;
++        int ok = 0;
++        if (!isfinite(a) || !isfinite(b) || !isfinite(c) || fabsf(a) > 1e6f)
++            continue;
++        for (k = 0; k < nt; k++)
++            ok |= tot[k] > 0.0f && fabsf(fabsf(d) - tot[k]) <= 0.02f * tot[k];
++        if (!ok)
++            continue;
++        f = (b - a) / d;
++        if (f < 0.1f || f > 0.9f)
++            continue;
++        if (out)
++            fprintf(out, "L 0x%08X %g %g %g (%.2f)\n", (unsigned)(MEMSCAN_LO + i * 4), a, b, c, f);
++        if (hits++ < 300)
++            fprintf(stderr, "  [MEMSCAN-LAG] 0x%08X: %g -> %g -> %g (%.2f of the way)\n",
++                    (unsigned)(MEMSCAN_LO + i * 4), a, b, c, f);
++    }
++    if (out)
++        fclose(out);
++    fprintf(stderr, "  [MEMSCAN-LAG] %zu candidates\n", hits);
++    fflush(stderr);
++}
++
 +static void mkb_memscan(unsigned long t)
 +{
 +    static int init, nt, done, npat;
@@ -1262,7 +1305,7 @@ index d6f0042..6a8388b 100644
 +            pat[npat++] = (float)strtod(p, &end);
 +            p = (*end == ',') ? end + 1 : NULL;
 +        }
-+        if (npat ? npat + 1 != nt : nt != 4) {
++        if (getenv("RECOMP_MEMSCAN_LAG") ? nt != 3 : npat ? npat + 1 != nt : nt != 4) {
 +            if (nt)
 +                fprintf(stderr, "  [MEMSCAN] want 4 times, or one more than the"
 +                                " RECOMP_MEMSCAN_PAT weights: off\n");
@@ -1278,10 +1321,30 @@ index d6f0042..6a8388b 100644
 +        if (snap[k])
 +            memcpy(snap[k], (const char *)xbox_GetMemoryOffset() + MEMSCAN_LO, n * 4);
 +        fprintf(stderr, "  [MEMSCAN] snapshot %d at t=%lu ms\n", k + 1, t);
++        /* RECOMP_MEMSCAN_DUMP=<prefix>: also write each snapshot, raw, to
++         * <prefix><k>.bin (guest 0x10000 up), for searching offline. */
++        {
++            const char *dp = getenv("RECOMP_MEMSCAN_DUMP");
++            if (dp && *dp && snap[k]) {
++                char name[512];
++                FILE *df;
++                snprintf(name, sizeof name, "%s%d.bin", dp, k + 1);
++                if ((df = fopen(name, "wb")) != NULL) {
++                    fwrite(snap[k], 4, n, df);
++                    fclose(df);
++                }
++            }
++        }
 +        fflush(stderr);
 +    }
 +    for (k = 0; k < nt && snap[k]; k++)
 +        ;
++    if (k == nt && getenv("RECOMP_MEMSCAN_LAG")) {
++        done = 1;
++        mkb_memscan_lag(snap, getenv("RECOMP_MEMSCAN_LAG"));
++        for (k = 0; k < nt; k++) { free(snap[k]); snap[k] = NULL; }
++        return;
++    }
 +    if (k == nt && npat) {
 +        done = 1;
 +        mkb_memscan_pattern(snap, nt, pat);
@@ -1392,14 +1455,15 @@ index d6f0042..6a8388b 100644
 +    }
 +}
 +
-+/* RECOMP_MEMLOG=<hex addr>,...[@<ms>]: every <ms> of script time (default
-+ * 100) print the floats at those guest addresses -- how a candidate camera
-+ * variable moves through a scripted turn. */
++/* RECOMP_MEMLOG=<hex addr>[:<count>],...[@<ms>]: every <ms> of script time
++ * (default 100) print the floats at those guest addresses (<count> floats
++ * from one, for a struct) -- how a candidate camera variable moves through
++ * a scripted turn. */
 +static void mkb_memlog(unsigned long t)
 +{
 +    static int init, n;
 +    static unsigned long every = 100, next;
-+    static uint32_t addr[16];
++    static uint32_t addr[128];
 +    extern ptrdiff_t xbox_GetMemoryOffset(void);
 +    int k;
 +
@@ -1407,8 +1471,14 @@ index d6f0042..6a8388b 100644
 +        const char *e = getenv("RECOMP_MEMLOG");
 +        char *end;
 +        init = 1;
-+        while (e && *e && *e != '@' && n < 16) {
-+            addr[n++] = (uint32_t)strtoul(e, &end, 16);
++        while (e && *e && *e != '@' && n < 128) {
++            uint32_t a = (uint32_t)strtoul(e, &end, 16), c = 1;
++            if (*end == ':')
++                c = (uint32_t)strtoul(end + 1, &end, 10);
++            while (c-- && n < 128) {
++                addr[n++] = a;
++                a += 4;
++            }
 +            e = (*end == ',') ? end + 1 : end;
 +        }
 +        if (e && *e == '@')
@@ -1581,11 +1651,7 @@ index d6f0042..6a8388b 100644
 +            mkb_aim_vector(lx * (ly ? 0.7071 : 1.0), ly * (lx ? 0.7071 : 1.0),
 +                           &look_x, &look_y);
 +    }
- 
--    /* ---- mouse buttons, as the Xbox pad sees them ---- */
--    if (btn & 0x01) analog[XBOX_BUTTON_RTRIGGER] = 255;  /* fire      */
--    if (btn & 0x02) analog[XBOX_BUTTON_LTRIGGER] = 255;  /* ADS/aim   */
--    if (btn & 0x04) b |= 0;                              /* M: below  */
++
 +    /* ---- mouse: aim ----
 +     *
 +     * A stick reading is a speed, and the game samples the pad on its own
@@ -1601,7 +1667,11 @@ index d6f0042..6a8388b 100644
 +        static LARGE_INTEGER qf, qlast;
 +        LARGE_INTEGER qn;
 +        double dt_ms = 0.0;
-+
+ 
+-    /* ---- mouse buttons, as the Xbox pad sees them ---- */
+-    if (btn & 0x01) analog[XBOX_BUTTON_RTRIGGER] = 255;  /* fire      */
+-    if (btn & 0x02) analog[XBOX_BUTTON_LTRIGGER] = 255;  /* ADS/aim   */
+-    if (btn & 0x04) b |= 0;                              /* M: below  */
 +        if (!qf.QuadPart)
 +            QueryPerformanceFrequency(&qf);
 +        QueryPerformanceCounter(&qn);
