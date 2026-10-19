@@ -521,7 +521,7 @@ index 281b4d2..32e4d68 100644
  /**
   * Unswizzle a texture from Xbox swizzled (Z-order/Morton) layout
 diff --git a/src/input/mkb_input.c b/src/input/mkb_input.c
-index d6f0042..eb0f371 100644
+index d6f0042..827d6eb 100644
 --- a/src/input/mkb_input.c
 +++ b/src/input/mkb_input.c
 @@ -9,10 +9,14 @@
@@ -543,7 +543,7 @@ index d6f0042..eb0f371 100644
   *
   * Small movements get a floor of RECOMP_MKB_DZ of full throw, because
   * every console title applies its own dead zone to the stick, and a
-@@ -36,6 +40,127 @@
+@@ -36,6 +40,128 @@
  #include <stdlib.h>
  #include <string.h>
  #include <math.h>
@@ -552,6 +552,7 @@ index d6f0042..eb0f371 100644
 +/* F9 is read on the input thread, so the toggle works even while the
 + * game is stalled on the poll side. It cannot be bound. */
 +#define MKB_TOGGLE_VK  VK_F9
++#define MKB_MARK_VK    VK_F8    /* drops a [MARK] line in the log */
 +
 +/* ---- bindings ----------------------------------------------------------- *
 + *
@@ -671,7 +672,7 @@ index d6f0042..eb0f371 100644
  
  /* ---- configuration ----------------------------------------------------- */
  
-@@ -43,12 +168,16 @@ typedef struct {
+@@ -43,12 +169,16 @@ typedef struct {
      double sens;        /* multiplier on the aim deflection          */
      double dz;          /* assumed game deadzone, 0..1               */
      double acc;         /* aim acceleration exponent, 1 = linear     */
@@ -690,7 +691,7 @@ index d6f0042..eb0f371 100644
  
  /* One "key=value" line; returns 1 when the key was recognised. */
  static int mkb_apply_kv(const char *key, const char *val)
-@@ -64,10 +193,21 @@ static int mkb_apply_kv(const char *key, const char *val)
+@@ -64,10 +194,21 @@ static int mkb_apply_kv(const char *key, const char *val)
          d = strtod(val, NULL); if (d > 0.0 && d < 10.0) s_cfg.acc = d;
      } else if (!strcmp(key, "full")) {
          l = strtol(val, NULL, 0); if (l > 0 && l < 1000) s_cfg.full = l;
@@ -712,7 +713,7 @@ index d6f0042..eb0f371 100644
      } else {
          return 0;
      }
-@@ -81,6 +221,8 @@ static void mkb_load_config(void)
+@@ -81,6 +222,8 @@ static void mkb_load_config(void)
          "RECOMP_MKB_DZ",   "dz",
          "RECOMP_MKB_ACC",  "acc",
          "RECOMP_MKB_FULL", "full",
@@ -721,7 +722,7 @@ index d6f0042..eb0f371 100644
          "RECOMP_MKB_INVERT_Y",  "invert_y",
          "RECOMP_MKB_SWAP_STICKS", "swap_sticks",
          NULL
-@@ -91,6 +233,7 @@ static void mkb_load_config(void)
+@@ -91,6 +234,7 @@ static void mkb_load_config(void)
      FILE *f;
      int i;
  
@@ -729,7 +730,7 @@ index d6f0042..eb0f371 100644
      for (i = 0; kv[i]; i += 2) {
          const char *v = getenv(kv[i]);
          if (v && *v)
-@@ -114,6 +257,9 @@ static void mkb_load_config(void)
+@@ -114,6 +258,9 @@ static void mkb_load_config(void)
          while (fgets(line, sizeof line, f)) {
              char *eq = strchr(line, '=');
              char *k, *v;
@@ -739,7 +740,7 @@ index d6f0042..eb0f371 100644
              if (!eq) continue;
              *eq = 0;
              k = line; v = eq + 1;
-@@ -128,22 +274,136 @@ static void mkb_load_config(void)
+@@ -128,22 +275,144 @@ static void mkb_load_config(void)
      fclose(f);
  }
  
@@ -816,6 +817,14 @@ index d6f0042..eb0f371 100644
 +    }
 +}
 +
++/* F8 presses not yet taken by a title hook (mkb_take_mark), and in all. */
++static volatile LONG s_marks_pending, s_marks_made;
++
++int mkb_take_mark(void)
++{
++    return (int)InterlockedExchange(&s_marks_pending, 0);
++}
++
 +int mkb_mouse_captured(void)
 +{
 +    return mkb_enabled() && s_captured;
@@ -881,7 +890,7 @@ index d6f0042..eb0f371 100644
  
  static void mkb_handle_raw(HRAWINPUT h)
  {
-@@ -155,6 +415,8 @@ static void mkb_handle_raw(HRAWINPUT h)
+@@ -155,6 +424,8 @@ static void mkb_handle_raw(HRAWINPUT h)
              == (UINT)-1)
          return;
  
@@ -890,7 +899,7 @@ index d6f0042..eb0f371 100644
      if (ri->header.dwType == RIM_TYPEMOUSE) {
          const RAWMOUSE *m = &ri->data.mouse;
  
-@@ -162,6 +424,27 @@ static void mkb_handle_raw(HRAWINPUT h)
+@@ -162,6 +433,27 @@ static void mkb_handle_raw(HRAWINPUT h)
              if (m->lLastX) InterlockedAdd(&s_dx, m->lLastX);
              if (m->lLastY) InterlockedAdd(&s_dy, m->lLastY);
          }
@@ -918,7 +927,7 @@ index d6f0042..eb0f371 100644
          if (m->usButtonFlags & RI_MOUSE_LEFT_BUTTON_DOWN)
              InterlockedOr(&s_mouse_btn, 1);
          if (m->usButtonFlags & RI_MOUSE_LEFT_BUTTON_UP)
-@@ -190,20 +473,33 @@ static void mkb_handle_raw(HRAWINPUT h)
+@@ -190,20 +482,42 @@ static void mkb_handle_raw(HRAWINPUT h)
          const RAWKEYBOARD *k = &ri->data.keyboard;
          UINT vk = k->VKey;
  
@@ -943,6 +952,15 @@ index d6f0042..eb0f371 100644
 +                && (s_captured || game_is_foreground()))
 +                mkb_set_captured(!s_captured, "F9");
          }
++        /* F8 marks the moment in the log, for a player pointing at a bug. */
++        if (vk == MKB_MARK_VK && k->Message == WM_KEYDOWN && !s_vk_down[vk & 0xFF]
++            && game_is_foreground()) {
++            LONG n = InterlockedIncrement(&s_marks_made);
++            InterlockedIncrement(&s_marks_pending);
++            fprintf(stderr, "[MARK] F8 #%ld at %llu ms\n", (long)n,
++                    (unsigned long long)GetTickCount64());
++            fflush(stderr);
++        }
 +        /* Esc pauses the game and hands the pointer back with it. */
 +        if (vk == VK_ESCAPE && k->Message == WM_KEYDOWN && s_captured)
 +            mkb_set_captured(0, "Esc");
@@ -961,7 +979,7 @@ index d6f0042..eb0f371 100644
          }
      }
  }
-@@ -256,9 +552,17 @@ static DWORD WINAPI mkb_thread(LPVOID unused)
+@@ -256,9 +570,17 @@ static DWORD WINAPI mkb_thread(LPVOID unused)
      }
  
      InterlockedExchange(&s_thread_up, 1);
@@ -982,7 +1000,7 @@ index d6f0042..eb0f371 100644
      fflush(stderr);
  
      while (GetMessageA(&msg, NULL, 0, 0) > 0) {
-@@ -281,7 +585,9 @@ int mkb_enabled(void)
+@@ -281,7 +603,9 @@ int mkb_enabled(void)
          const char *v = getenv("RECOMP_MKB");
          on = v && *v && *v != '0';
          if (on) {
@@ -992,7 +1010,7 @@ index d6f0042..eb0f371 100644
              if (InterlockedCompareExchange(&s_thread_up, 0, 0) == 0) {
                  static LONG started = 0;
                  if (InterlockedCompareExchange(&started, 1, 0) == 0)
-@@ -312,23 +618,38 @@ static int game_is_foreground(void)
+@@ -312,23 +636,38 @@ static int game_is_foreground(void)
   * end up clicking other apps' title bars. */
  static void mkb_manage_cursor(int capture)
  {
@@ -1044,7 +1062,7 @@ index d6f0042..eb0f371 100644
      }
  }
  
-@@ -356,86 +677,669 @@ static void mkb_aim_vector(double ax, double ay, SHORT *out_x, SHORT *out_y)
+@@ -356,86 +695,669 @@ static void mkb_aim_vector(double ax, double ay, SHORT *out_x, SHORT *out_y)
  
  #define MK_VK(k)  ((unsigned)(k) < 256 && s_vk_down[(k)])
  
@@ -1639,7 +1657,11 @@ index d6f0042..eb0f371 100644
 +        else if (a->kind == ACT_AXIS)
 +            ax[a->idx] = 1;
 +    }
-+
+ 
+-    /* ---- mouse buttons, as the Xbox pad sees them ---- */
+-    if (btn & 0x01) analog[XBOX_BUTTON_RTRIGGER] = 255;  /* fire      */
+-    if (btn & 0x02) analog[XBOX_BUTTON_LTRIGGER] = 255;  /* ADS/aim   */
+-    if (btn & 0x04) b |= 0;                              /* M: below  */
 +    /* ---- keys on the sticks: movement, and keyboard look ---- */
 +    {
 +        int mx = ax[AX_LRIGHT] - ax[AX_LLEFT], my = ax[AX_LUP] - ax[AX_LDOWN];
@@ -1651,7 +1673,8 @@ index d6f0042..eb0f371 100644
 +            mkb_aim_vector(lx * (ly ? 0.7071 : 1.0), ly * (lx ? 0.7071 : 1.0),
 +                           &look_x, &look_y);
 +    }
-+
+ 
+-    /* ---- keyboard: WASD movement ---- */
 +    /* ---- mouse: aim ----
 +     *
 +     * A stick reading is a speed, and the game samples the pad on its own
@@ -1663,50 +1686,6 @@ index d6f0042..eb0f371 100644
 +     * motion per report, so a slow or steady move came out as a small
 +     * deflection inside the game's deadzone, and a report that fell between
 +     * two mouse packets read as a centred stick: the camera barely turned. */
-+    {
-+        static LARGE_INTEGER qf, qlast;
-+        LARGE_INTEGER qn;
-+        double dt_ms = 0.0;
- 
--    /* ---- mouse buttons, as the Xbox pad sees them ---- */
--    if (btn & 0x01) analog[XBOX_BUTTON_RTRIGGER] = 255;  /* fire      */
--    if (btn & 0x02) analog[XBOX_BUTTON_LTRIGGER] = 255;  /* ADS/aim   */
--    if (btn & 0x04) b |= 0;                              /* M: below  */
-+        if (!qf.QuadPart)
-+            QueryPerformanceFrequency(&qf);
-+        QueryPerformanceCounter(&qn);
-+        if (qlast.QuadPart)
-+            dt_ms = (double)(qn.QuadPart - qlast.QuadPart) * 1000.0
-+                  / (double)qf.QuadPart;
-+        if (dt_ms >= 0.05 || !qlast.QuadPart) {
-+            double a;
-+            if (dt_ms > 100.0) dt_ms = 100.0;          /* after a pause */
-+            if (dt_ms < 0.05)  dt_ms = 0.05;
-+            a = 1.0 - exp(-dt_ms / s_cfg.smooth);
-+            s_aim_vx += ((double)dx / dt_ms - s_aim_vx) * a;   /* counts/ms */
-+            s_aim_vy += ((double)dy / dt_ms - s_aim_vy) * a;
-+            if (s_aim_vx * s_aim_vx + s_aim_vy * s_aim_vy < 1e-4)
-+                s_aim_vx = s_aim_vy = 0.0;             /* < 10 counts/s */
-+            qlast = qn;
-+        } else {
-+            /* Two polls in the same instant: keep the counts for the next. */
-+            InterlockedAdd(&s_dx, dx);
-+            InterlockedAdd(&s_dy, dy);
-+        }
-+    }
-+    if (s_aim_vx || s_aim_vy) {
-+        double fx =  s_aim_vx * 10.0 / (double)s_cfg.full;
-+        double fy = -s_aim_vy * 10.0 / (double)s_cfg.full;
-+        if (s_cfg.invert_y) fy = -fy;
-+        mkb_aim_vector(fx, fy, &aim_x, &aim_y);
-+    } else if (look_x || look_y) {
-+        aim_x = look_x;
-+        aim_y = look_y;
-+    }
- 
--    /* ---- keyboard: WASD movement ---- */
-+    /* RECOMP_MKB_TRACE=1: once a second, how often the pad was polled, how
-+     * far the mouse moved, and the largest aim deflection handed out. */
      {
 -        int mx = 0, my = 0;
 -        if (MK_VK('W')) my += 1;
@@ -1745,6 +1724,45 @@ index d6f0042..eb0f371 100644
 -    /* ---- wheel / middle button: cycle weapon ---- */
 -    if (wheel || (btn & 0x04))
 -        analog[XBOX_BUTTON_Y] = 255;
++        static LARGE_INTEGER qf, qlast;
++        LARGE_INTEGER qn;
++        double dt_ms = 0.0;
++
++        if (!qf.QuadPart)
++            QueryPerformanceFrequency(&qf);
++        QueryPerformanceCounter(&qn);
++        if (qlast.QuadPart)
++            dt_ms = (double)(qn.QuadPart - qlast.QuadPart) * 1000.0
++                  / (double)qf.QuadPart;
++        if (dt_ms >= 0.05 || !qlast.QuadPart) {
++            double a;
++            if (dt_ms > 100.0) dt_ms = 100.0;          /* after a pause */
++            if (dt_ms < 0.05)  dt_ms = 0.05;
++            a = 1.0 - exp(-dt_ms / s_cfg.smooth);
++            s_aim_vx += ((double)dx / dt_ms - s_aim_vx) * a;   /* counts/ms */
++            s_aim_vy += ((double)dy / dt_ms - s_aim_vy) * a;
++            if (s_aim_vx * s_aim_vx + s_aim_vy * s_aim_vy < 1e-4)
++                s_aim_vx = s_aim_vy = 0.0;             /* < 10 counts/s */
++            qlast = qn;
++        } else {
++            /* Two polls in the same instant: keep the counts for the next. */
++            InterlockedAdd(&s_dx, dx);
++            InterlockedAdd(&s_dy, dy);
++        }
++    }
++    if (s_aim_vx || s_aim_vy) {
++        double fx =  s_aim_vx * 10.0 / (double)s_cfg.full;
++        double fy = -s_aim_vy * 10.0 / (double)s_cfg.full;
++        if (s_cfg.invert_y) fy = -fy;
++        mkb_aim_vector(fx, fy, &aim_x, &aim_y);
++    } else if (look_x || look_y) {
++        aim_x = look_x;
++        aim_y = look_y;
++    }
++
++    /* RECOMP_MKB_TRACE=1: once a second, how often the pad was polled, how
++     * far the mouse moved, and the largest aim deflection handed out. */
++    {
 +        static int trace = -1;
 +        static unsigned long t_last, polls;
 +        static long sum_x, sum_y;
@@ -1772,7 +1790,7 @@ index d6f0042..eb0f371 100644
      /* ---- merge on top of whatever the host pad produced ---- */
      if (b)        { pState->Gamepad.wButtons |= b; any = 1; }
 diff --git a/src/input/mkb_input.h b/src/input/mkb_input.h
-index 664efad..fe9d4bd 100644
+index 664efad..a80a137 100644
 --- a/src/input/mkb_input.h
 +++ b/src/input/mkb_input.h
 @@ -18,11 +18,23 @@
@@ -1803,7 +1821,7 @@ index 664efad..fe9d4bd 100644
   */
  
  #ifndef XBOXRECOMP_MKB_INPUT_H
-@@ -51,6 +63,27 @@ int mkb_enabled(void);
+@@ -51,6 +63,32 @@ int mkb_enabled(void);
   */
  int mkb_merge(DWORD dwPort, XBOX_INPUT_STATE *pState);
  
@@ -1827,6 +1845,11 @@ index 664efad..fe9d4bd 100644
 + * and tilts in two places asks for each axis in its own place.
 + */
 +int mkb_mouse_look_take(float *yaw_deg, float *pitch_deg);
++
++/* F8 (bug hunting): the layer logs "[MARK] F8 #n" when the player presses
++ * it; this returns how many presses a title hook has not yet taken, so the
++ * title can log its own state (the player's position) beside each mark. */
++int mkb_take_mark(void);
 +
  #ifdef __cplusplus
  }

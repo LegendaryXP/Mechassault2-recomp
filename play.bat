@@ -11,6 +11,7 @@ rem   1-4 = cycle cargo (VTOL)      Tab = scoreboard / tutorial text
 rem   Menus: arrows move, Enter selects, Backspace goes back, Esc pauses
 rem   F9 locks the mouse to the game (camera control); F9 or Esc frees it
 rem   F11 or Alt+Enter = borderless fullscreen on/off
+rem   F8 = mark this moment in the log (bug hunting: press it where a bug is)
 rem   close the window to quit
 rem
 rem Drawing and vertex shaders run on your graphics card (Direct3D 11); the
@@ -68,4 +69,7 @@ set RECOMP_APU_EP_MARK=1
 rem 16:9: the console is set up for a widescreen TV, so the game draws its
 rem widescreen mode and the window is 16:9. RECOMP_WIDESCREEN=0 = 4:3 TV.
 
-start "MechAssault 2" /min cmd /c "build\Release\ma2.exe 1>logs\last_stdout.txt 2>logs\last_stderr.txt"
+rem The log: logs\last_stderr.txt, replaced every launch. A bug-hunt launch
+rem names its own (MA2_LOG_NAME) so a later normal launch keeps it.
+if "%MA2_LOG_NAME%"=="" set MA2_LOG_NAME=last
+start "MechAssault 2" /min cmd /c "build\Release\ma2.exe 1>logs\%MA2_LOG_NAME%_stdout.txt 2>logs\%MA2_LOG_NAME%_stderr.txt"

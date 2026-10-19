@@ -7,7 +7,8 @@ param(
     [switch]$Frames,
     [string]$DumpWhile = "",
     [switch]$NoKeyboard,
-    [switch]$NoUsb
+    [switch]$NoUsb,
+    [switch]$SeparateSave
 )
 $root = 'C:\Mechassault2\ma2-recomp'
 Set-Location $root
@@ -39,18 +40,24 @@ $env:RECOMP_KEYBOARD = $(if ($NoKeyboard) { $null } else { '1' })
 # As play.bat: DirectSound's APU restarts off (audio).
 $env:RECOMP_APU_SSL_IRQ = '0'; $env:RECOMP_APU_EP_MARK = '1'
 $env:RECOMP_MUTE = '1'          # test runs are silent; play.bat is not
-# Test runs keep their own game saves (UDATA/TDATA): the player's progress in
-# %LOCALAPPDATA%\xboxrecomp is never touched by a scripted run. The folder is
-# seeded with the save the scripted boot was tuned against (a profile, no
-# campaign progress); an empty one boots through first-run screens and the
-# scripts' timings no longer land in the mission.
-if (-not $env:RECOMP_SAVE_DIR) {
-    # A fresh copy of analysis\testsave_seed each run, so no run inherits
-    # another's progress.
+# Saves: test runs share the player's (%LOCALAPPDATA%\xboxrecomp UDATA and
+# TDATA), so a test can start where the player is. Each run first copies
+# them to %LOCALAPPDATA%\xboxrecomp\backup-before-test (replaced every run).
+# -SeparateSave runs from a fresh copy of analysis\testsave_seed instead (a
+# profile, no progress: what the scripted boot timings were tuned against).
+$xr = "$env:LOCALAPPDATA\xboxrecomp"
+if ($SeparateSave) {
     $env:RECOMP_SAVE_DIR = "$root\analysis\testsave"
     if (Test-Path "$root\analysis\testsave_seed") {
         Remove-Item "$root\analysis\testsave" -Recurse -Force -ErrorAction SilentlyContinue
         Copy-Item "$root\analysis\testsave_seed" "$root\analysis\testsave" -Recurse
+    }
+} else {
+    $env:RECOMP_SAVE_DIR = $null
+    if (Test-Path "$xr\UDATA") {
+        Remove-Item "$xr\backup-before-test" -Recurse -Force -ErrorAction SilentlyContinue
+        New-Item -ItemType Directory -Force "$xr\backup-before-test" | Out-Null
+        Copy-Item "$xr\UDATA", "$xr\TDATA" "$xr\backup-before-test" -Recurse -ErrorAction SilentlyContinue
     }
 }
 $env:MA2_SKIP_ICALL = $Skip

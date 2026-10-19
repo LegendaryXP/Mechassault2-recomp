@@ -163,10 +163,19 @@ static void look_cam_dump(int moving)
 static uint32_t s_body;
 
 /* sub_0006C790 wrapper: the pilot's two stick turns name the body. */
+static void look_poslog(uint32_t walker);
+
 void ma2_mouse_look_rate_set(uint32_t ret, uint32_t comp, float rate)
 {
     uint32_t body;
     (void)rate;
+    /* Every body's rate setter runs every frame, whatever the player drives:
+     * the place to log where the player is (MA2_POSLOG, F8). */
+    {
+        uint32_t w = ma2_active_camera();
+        if (w)
+            look_poslog(w);
+    }
     if (ret != MA2_TURN_STANDING && ret != MA2_TURN_WALKING)
         return;
     body = comp - MA2_BODY_RATE_SET;
@@ -211,6 +220,50 @@ static void look_turn(uint32_t walker, float yaw, int dbg)
         fprintf(stderr, "[LOOK] turn walker %08X yaw %+.3f aim %.3f heading %.3f%s\n",
                 walker, yaw, aim + yaw, legs ? LOOK_MEMF(s_body + MA2_BODY_HEADING) : 0.0f,
                 legs ? "" : " (body not known: aim only)");
+    }
+}
+
+/* Bug hunting: the player's position.
+ *   MA2_POSLOG=<ms>: a [POS] line every <ms> while the pilot is in a walker.
+ *   F8 (any time): a [MARK] line from the input layer, and here a [POS]
+ *   line at once, so a player can point at a spot ("I sink here").
+ * Position: the body's (x, y, z) and heading when the stick-turn wrapper has
+ * named a body at this walker, and the walker's scene node (the camera's
+ * pivot) always. */
+int mkb_take_mark(void);
+static void look_poslog(uint32_t walker)
+{
+    if (walker < 0x10000u || walker >= 0x04000000u)
+        return;
+    static int every = -1;
+    static DWORD next;
+    uint32_t node;
+    int marked;
+    DWORD now = GetTickCount();
+    if (every < 0) {
+        const char *e = getenv("MA2_POSLOG");
+        every = e && *e ? atoi(e) : 0;
+    }
+    marked = mkb_take_mark();
+    if (!marked && (!every || (int)(now - next) < 0))
+        return;
+    node = LOOK_MEM32(walker + MA2_WALKER_NODE);
+    next = now + (DWORD)every;
+    {
+        char line[256];
+        int legs = body_is_walkers(s_body, walker);
+        int at = snprintf(line, sizeof line, "[POS]%s %lu node %.2f %.2f %.2f aim %.1f",
+                          marked ? " MARK" : "", (unsigned long)now,
+                          node >= 0x10000u && node < 0x04000000u ? LOOK_MEMF(node + 0x38) : 0.0f,
+                          node >= 0x10000u && node < 0x04000000u ? LOOK_MEMF(node + 0x3C) : 0.0f,
+                          node >= 0x10000u && node < 0x04000000u ? LOOK_MEMF(node + 0x40) : 0.0f,
+                          LOOK_MEMF(walker + MA2_WALKER_CAM_TARGET));
+        if (legs)
+            at += snprintf(line + at, sizeof line - at, " body %08X %.2f %.2f %.2f heading %.1f",
+                           s_body, LOOK_MEMF(s_body + MA2_BODY_POS), LOOK_MEMF(s_body + MA2_BODY_POS + 4),
+                           LOOK_MEMF(s_body + MA2_BODY_POS + 8), LOOK_MEMF(s_body + MA2_BODY_HEADING));
+        snprintf(line + at, sizeof line - at, " walker %08X\n", walker);
+        fputs(line, stderr);
     }
 }
 
