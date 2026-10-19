@@ -330,10 +330,84 @@ static int ma2_is_skipped(uint32_t va)
     return 0;
 }
 
+/* ── MechAssault 2: vtable methods the disassembler never found ── */
+
+/*
+ * Nothing calls these directly, so the function finder missed them, they got
+ * no dispatch entry, and every call failed: return address popped, eax = 0.
+ * In combat that was ~1000 failed calls a second, each logged as 18 lines --
+ * the main thread spent two thirds of its time in WriteFile and the frame
+ * rate fell from 60-100 to 30-40 (MODLOG, "COMBAT FRAME DROPS").
+ *
+ *   0x0006B4E0  lea eax, [ecx+0x28]; ret -- the getter beside SetMatrix
+ *               (0x0006B4F0 copies 16 dwords to this+0x28). Failing, it gave
+ *               its callers a NULL matrix, read from guest page 0.
+ *   0x001C4EC6, 0x001C4F66, 0x001C4FAE, 0x001C5275  forward to the object at
+ *               this+0x38 through its vtable (+0x3C, +0x48, +0x24, +0x40):
+ *                   cmp [ecx+0x38], 0 / je none
+ *                   mov ecx, [ecx+0x38] / mov eax, [ecx] / jmp [eax+slot]
+ *                   none: (xor al, al) ret
+ *
+ * A few instructions each, so written here rather than seeded and the whole
+ * title regenerated. MA2_SKIP_ICALL=<va> makes one fail again, as before.
+ */
+extern __declspec(thread) uint32_t g_ecx;
+extern recomp_func_t recomp_lookup(uint32_t xbox_va);
+extern recomp_func_t recomp_lookup_kernel(uint32_t xbox_va);
+recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
+void recomp_icall_fail_log(uint32_t va);
+
+static void ma2_get_matrix_0006B4E0(void)
+{
+    g_eax = g_ecx + 0x28;
+    g_esp += 4;                         /* ret */
+}
+
+/* The jmp is a tail call: the method returns straight to our caller, so the
+ * return address stays on the guest stack for it to pop. */
+static void ma2_forward(uint32_t slot, int clear_al)
+{
+    uint32_t sub = MA2_MEM32(g_ecx + 0x38), va;
+    recomp_func_t fn;
+
+    if (!sub) {
+        if (clear_al)
+            g_eax &= ~0xFFu;
+        g_esp += 4;                     /* ret */
+        return;
+    }
+    g_ecx = sub;
+    g_eax = MA2_MEM32(sub);
+    va = MA2_MEM32(g_eax + slot);
+    fn = recomp_lookup_manual(va);
+    if (!fn) fn = recomp_lookup(va);
+    if (!fn) fn = recomp_lookup_kernel(va);
+    if (fn) {
+        fn();
+    } else {
+        recomp_icall_fail_log(va);
+        g_esp += 4;
+        g_eax = 0;
+    }
+}
+
+static void ma2_forward_001C4EC6(void) { ma2_forward(0x3C, 0); }
+static void ma2_forward_001C4F66(void) { ma2_forward(0x48, 1); }
+static void ma2_forward_001C4FAE(void) { ma2_forward(0x24, 0); }
+static void ma2_forward_001C5275(void) { ma2_forward(0x40, 1); }
+
 recomp_func_t recomp_lookup_manual(uint32_t xbox_va)
 {
     if (ma2_is_skipped(xbox_va))
         return ma2_skipped_icall;
+    switch (xbox_va) {
+    case 0x0006B4E0u: return ma2_get_matrix_0006B4E0;
+    case 0x001C4EC6u: return ma2_forward_001C4EC6;
+    case 0x001C4F66u: return ma2_forward_001C4F66;
+    case 0x001C4FAEu: return ma2_forward_001C4FAE;
+    case 0x001C5275u: return ma2_forward_001C5275;
+    default: break;
+    }
     return (recomp_func_t)0;
 }
 
@@ -349,18 +423,47 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va)
  * During early bring-up you will see many of these. Most are harmless
  * (the ICALL macro pops the dummy return address and continues).
  * Focus on the ones that cause crashes or incorrect behavior.
+ *
+ * Rate-limited per address, as recomp_icall_not_code_log is: reported at
+ * 1, 10, 100, 1000 ... calls, with the recent targets on the first. This
+ * printed 18 lines for every failure, and a vtable method missing from the
+ * dispatch table fails every frame: in MA2's combat that was 18,000 lines a
+ * second, one WriteFile each, on the thread that runs the game.
  */
 void recomp_icall_fail_log(uint32_t va)
 {
-    fprintf(stderr, "[ICALL] Failed to resolve VA 0x%08X (total calls: %llu)\n",
-            va, (unsigned long long)g_icall_count);
+    enum { SLOTS = 64 };
+    static uint32_t seen[SLOTS];
+    static uint64_t hits[SLOTS + 1];    /* [SLOTS]: addresses past the table */
+    static int count;
+    static SRWLOCK lock = SRWLOCK_INIT;
+    uint64_t n;
+    int i;
 
-    /* Dump last 16 call targets from the ring buffer */
-    fprintf(stderr, "  Recent ICALL targets:\n");
-    for (int i = 0; i < 16; i++) {
-        int idx = (g_icall_trace_idx - 16 + i) & 15;
-        if (g_icall_trace[idx])
-            fprintf(stderr, "    [%2d] 0x%08X\n", i, g_icall_trace[idx]);
+    AcquireSRWLockExclusive(&lock);
+    for (i = 0; i < count && seen[i] != va; i++)
+        ;
+    if (i == count && count < SLOTS)
+        seen[count++] = va;
+    n = ++hits[i];
+    ReleaseSRWLockExclusive(&lock);
+    while (n >= 10 && n % 10 == 0)
+        n /= 10;
+    if (n != 1)
+        return;
+
+    fprintf(stderr, "[ICALL] Failed to resolve VA 0x%08X -- %llu time(s)%s (total calls: %llu)\n",
+            va, (unsigned long long)hits[i], i == SLOTS ? " (all addresses past the first 64)" : "",
+            (unsigned long long)g_icall_count);
+
+    if (hits[i] == 1) {
+        /* Dump last 16 call targets from the ring buffer */
+        fprintf(stderr, "  Recent ICALL targets:\n");
+        for (int k = 0; k < 16; k++) {
+            int idx = (g_icall_trace_idx - 16 + k) & 15;
+            if (g_icall_trace[idx])
+                fprintf(stderr, "    [%2d] 0x%08X\n", k, g_icall_trace[idx]);
+        }
     }
     fflush(stderr);
 }
