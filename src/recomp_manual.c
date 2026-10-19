@@ -331,22 +331,26 @@ void sub_0006C790(void)
 /*
  * sub_00120EBD(input), thiscall, ret 4: a walker's look pitch, integrated:
  * this+0x144 += input * this+0x140 * dt, then clamped to [this+0x13C,
- * this+0x138]. The human pilot's call (returns to 0x00175CEF) feeds it the
- * smoothed Look y; afterwards the mouse tilts the pitch itself
+ * this+0x138]. The human pilot's calls feed it the smoothed Look y --
+ * sub_00175CA4 for mechs, tanks and most vehicles (returns to 0x00175CEF,
+ * the pilot in edi), the VTOL pilot's update sub_00174A48 (returns to
+ * 0x00174C18, the pilot in ebx); afterwards the mouse turns and tilts
  * (src/ma2_mouse_look.c).
  */
 extern void sub_00120EBD_gen(void);
-void ma2_mouse_look_pitch(uint32_t ret, uint32_t walker, float input);
+void ma2_mouse_look_pitch(uint32_t ret, uint32_t walker, float input, uint32_t pilot);
 
 void sub_00120EBD(void)
 {
+    extern __declspec(thread) uint32_t g_ebx, g_edi;
     uint32_t walker = g_ecx;
     uint32_t ret = MA2_MEM32(g_esp);
     uint32_t iv = MA2_MEM32(g_esp + 4);
+    uint32_t pilot = ret == 0x00174C18u ? g_ebx : g_edi;
     float input;
     memcpy(&input, &iv, sizeof input);
     sub_00120EBD_gen();
-    ma2_mouse_look_pitch(ret, walker, input);
+    ma2_mouse_look_pitch(ret, walker, input, pilot);
 }
 
 /*

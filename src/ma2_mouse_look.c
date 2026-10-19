@@ -50,8 +50,20 @@
  * third-person camera. When it is silent the mech pilot's update stands in
  * (ma2_mouse_look_update, below) and logs why, once per change.
  *
- * Outside the walker (menus, vehicles, on foot) nothing asks, and after half
- * a second the mouse drives the stick on both axes again.
+ * Vehicles go through the same pitch integrator: tanks, flyers and movers
+ * through the pilot's sub_00175CA4 (the call above), the VTOL from its
+ * pilot's update, sub_00174A48 (returns to 0x00174C18). The hook names the
+ * pilot ([pilot+8] the camera, [pilot+0xC] the vehicle) and the mouse turns
+ * what that pilot's Look X turns -- a tank's turret, a VTOL's or flyer's
+ * body (look_vehicle) -- with the aim and the camera yaw, and tilts the
+ * same walker+0x144. A pilot class whose Look X turns nothing it knows (the
+ * corporeal one) gets the tilt only. A VTOL also climbs or dives while the
+ * stick pushes past either end of that range (sub_00174A48 reads the raw
+ * Look y there); the mouse does not do that -- Jump (pilot+0x70) climbs and
+ * pilot+0x214 dives, as with the pad.
+ *
+ * Elsewhere (menus, pilots that never make the call) nothing asks, and
+ * after half a second the mouse drives the stick on both axes again.
  *
  * MA2_MOUSE_LOOK=0 restores the stick path. MA2_LOOK_DEBUG=1 logs turns
  * and tilts.
@@ -225,6 +237,36 @@ static uint32_t s_pilot_cam, s_pilot_mech;
 
 static int look_va_ok(uint32_t va) { return va >= 0x10000u && va < 0x04000000u; }
 
+/* The player's vehicle, as the pilot's pitch call (ma2_mouse_look_pitch)
+ * last saw it: the camera entity [pilot+8], the vehicle [pilot+0xC] and the
+ * pilot's behaviour class, told by its vtable (sub_000C9084 makes one per
+ * entity type). What the mouse turns is what the stick's Look X turns in
+ * that class:
+ *  - walker (MAMech): the bodies in look_bodies below.
+ *  - tank (MATank): only the turret, a body embedded at tank+0x488 whose
+ *    heading is the turret's angle from the hull. Look X sets its yaw rate
+ *    (sub_001753E6 -> sub_00109FF4 -> sub_002ADC10); the hull drives toward
+ *    the Move stick, taken relative to the camera, by itself.
+ *  - VTOL, flyer, mover (MAFlyer and the rest on MAMover): the body
+ *    [vehicle+0x8C]; Look X sets its yaw rate (VTOL sub_001745B9 -> vt+0x260,
+ *    the others sub_0017537D -> vt+0x234).
+ *  - anything else (the corporeal pilot ignores Look X): nothing; the
+ *    sideways mouse stays on the stick there.
+ * The third-person camera aims at the vehicle's heading, plus the turret's
+ * angle on a tank (sub_0011F506: +0x12C from sub_000DD905 and, for MAMech
+ * and MATank, the entity's vt+0x19C), so turning these turns the aim the
+ * camera works out each frame. */
+enum { VEH_OTHER, VEH_WALKER, VEH_TANK, VEH_FLYER, VEH_VTOL, VEH_MOVER };
+static const char *const s_veh_names[] = { "other", "walker", "tank", "flyer", "VTOL", "mover" };
+static uint32_t s_veh_cam, s_veh;
+static int s_veh_kind;
+
+#define MA2_TANK_TURRET     0x488u    /* tank+0x488: the turret's body */
+#define MA2_BODY_LAST_HEADING 0x28u   /* last frame's heading */
+#define MA2_BODY_RATE       0x74u     /* yaw rate, deg/s */
+#define MA2_BODY_CMD_HEADING 0xA0u    /* the controller's heading (+0x7C block) */
+#define MA2_BODY_CMD_RATE   0xB0u     /* the controller's yaw rate */
+
 /* The headings the Look stick can turn. sub_00172E96 turns the body at
  * [mech+0x8C] (through sub_001002A3 standing, inline walking), and through
  * the mech's vtable +0x270 (sub_00100228) a second body embedded at
@@ -234,12 +276,23 @@ static int look_va_ok(uint32_t va) { return va >= 0x10000u && va < 0x04000000u; 
  * body's heading read as the torso's twist from the legs (body + second =
  * aim, held at +-45), which the game keeps up itself. Before the pilot's
  * update has named the mech, the body the stick-turn wrapper saw last is
- * used, while it stands at this camera. */
+ * used, while it stands at this camera. In a vehicle *a is what it turns
+ * (s_veh_kind above): the turret's body on a tank, else its body. */
 static int look_bodies(uint32_t walker, uint32_t *a, uint32_t *b, int *flag)
 {
     uint32_t mech = walker == s_pilot_cam ? s_pilot_mech : 0;
     *a = *b = 0;
     *flag = 0;
+    if (walker == s_veh_cam && s_veh_kind != VEH_WALKER) {
+        if (s_veh_kind == VEH_TANK) {
+            *a = s_veh + MA2_TANK_TURRET;
+        } else if (s_veh_kind != VEH_OTHER) {
+            uint32_t body = LOOK_MEM32(s_veh + MA2_MECH_BODY);
+            if (look_va_ok(body))
+                *a = body;
+        }
+        return *a != 0;
+    }
     if (look_va_ok(mech)) {
         uint32_t body = LOOK_MEM32(mech + MA2_MECH_BODY);
         if (look_va_ok(body))
@@ -273,29 +326,46 @@ static int look_bodies(uint32_t walker, uint32_t *a, uint32_t *b, int *flag)
 static void look_turn(uint32_t walker, float yaw, int dbg)
 {
     static int shown, lines;
-    static uint32_t last_mech_cam;
+    static uint32_t last_mech_cam, last_a;
     static float left_a, left_b;
     static DWORD next, first;
     float aim = LOOK_MEMF(walker + MA2_WALKER_CAM_TARGET);
     uint32_t a, b;
     int flag;
     int known = look_bodies(walker, &a, &b, &flag);
+    int kind = walker == s_veh_cam ? s_veh_kind : VEH_WALKER;
     DWORD now = GetTickCount();
 
-    if (walker != last_mech_cam) {
+    if (walker != last_mech_cam || a != last_a) {
         last_mech_cam = walker;
+        last_a = a;
         first = now;
         if (lines++ < 200)
-            fprintf(stderr, "[LOOK] turning camera %08X: mech %08X flag %d, body %08X, second body %08X%s\n",
-                    walker, walker == s_pilot_cam ? s_pilot_mech : 0, flag, a, b,
+            fprintf(stderr, "[LOOK] turning camera %08X: %s %08X flag %d, %s %08X, second body %08X%s\n",
+                    walker, s_veh_names[kind],
+                    kind != VEH_WALKER ? s_veh : walker == s_pilot_cam ? s_pilot_mech : 0, flag,
+                    kind == VEH_TANK ? "turret" : "body", a, b,
                     known ? "" : " (none known: aim and camera only)");
     } else if (now - first < 60000 && (int)(now - next) >= 0 && lines < 200) {
         lines++;
         next = now + 500;
-        fprintf(stderr, "[LOOK] turn %+.2f: aim %.2f cam %.2f; body %.2f (left %.2f); second %.2f (left %.2f)\n",
-                yaw, aim, LOOK_MEMF(walker + MA2_WALKER_CAM_YAW),
-                a ? LOOK_MEMF(a + MA2_BODY_HEADING) : 0.0f, left_a,
-                b ? LOOK_MEMF(b + MA2_BODY_HEADING) : 0.0f, left_b);
+        if (kind == VEH_WALKER) {
+            fprintf(stderr, "[LOOK] turn %+.2f: aim %.2f cam %.2f; body %.2f (left %.2f); second %.2f (left %.2f)\n",
+                    yaw, aim, LOOK_MEMF(walker + MA2_WALKER_CAM_YAW),
+                    a ? LOOK_MEMF(a + MA2_BODY_HEADING) : 0.0f, left_a,
+                    b ? LOOK_MEMF(b + MA2_BODY_HEADING) : 0.0f, left_b);
+        } else if (a) {
+            /* A heading the game puts back shows as "left" against the
+             * heading; the other copies say which one it keeps. */
+            uint32_t hull = kind == VEH_TANK ? LOOK_MEM32(s_veh + MA2_MECH_BODY) : 0;
+            fprintf(stderr, "[LOOK] turn %+.2f: aim %.2f cam %.2f; %s %.2f (left %.2f; last frame %.2f,"
+                            " controller %.2f, rate %.2f / %.2f); hull %.2f\n",
+                    yaw, aim, LOOK_MEMF(walker + MA2_WALKER_CAM_YAW), s_veh_names[kind],
+                    LOOK_MEMF(a + MA2_BODY_HEADING), left_a, LOOK_MEMF(a + MA2_BODY_LAST_HEADING),
+                    LOOK_MEMF(a + MA2_BODY_CMD_HEADING), LOOK_MEMF(a + MA2_BODY_RATE),
+                    LOOK_MEMF(a + MA2_BODY_CMD_RATE),
+                    look_va_ok(hull) ? LOOK_MEMF(hull + MA2_BODY_HEADING) : 0.0f);
+        }
     }
     LOOK_MEMF(walker + MA2_WALKER_CAM_TARGET) = aim + yaw;
     LOOK_MEMF(walker + MA2_WALKER_CAM_YAW) += yaw;
@@ -464,14 +534,15 @@ static int look_on(void)
     return s_mode;
 }
 
-/* Hand the mouse to the camera entity: the sideways turn (look_turn) and,
- * when pitch_on, the tilt -- walker+0x144 in the game's own clamp. */
-static void look_apply(uint32_t walker, float input, int pitch_on)
+/* Hand the mouse to the camera entity: when yaw_on, the sideways turn
+ * (look_turn), and when pitch_on, the tilt -- walker+0x144 in the game's
+ * own clamp. An axis not asked for stays on the stick. */
+static void look_apply(uint32_t walker, float input, int pitch_on, int yaw_on)
 {
     static int shown;
-    float yaw, up = 0.0f, p, lo, hi;
+    float yaw = 0.0f, up = 0.0f, p, lo, hi;
 
-    if (!mkb_mouse_look_take(&yaw, pitch_on ? &up : NULL))
+    if (!mkb_mouse_look_take(yaw_on ? &yaw : NULL, pitch_on ? &up : NULL))
         return;
     look_trace('y', yaw);
     look_trace('p', up);
@@ -501,22 +572,91 @@ static void look_apply(uint32_t walker, float input, int pitch_on)
 static DWORD s_pitch_at;
 static uint32_t s_pitch_walker;
 
-void ma2_mouse_look_pitch(uint32_t ret, uint32_t walker, float input)
+#define MA2_PITCH_VTOL      0x00174C18u   /* in sub_00174A48 */
+#define MA2_PILOT_CAMERA    0x08u
+#define MA2_ENTITY_TYPE     0x28u     /* the entity's type id */
+#define MA2_PILOT_VEHICLE   0x0Cu
+#define MA2_PILOT_VT_WALKER 0x00477410u
+#define MA2_PILOT_VT_VTOL   0x00477570u   /* "Default VTOL Behavior" */
+#define MA2_PILOT_VT_FLYER  0x004776E0u   /* "Default Flyer Behavior" */
+#define MA2_PILOT_VT_TANK   0x00477850u   /* "Tank Behavior" */
+#define MA2_PILOT_VT_MOVER  0x004779B8u   /* "Default Mover Behavior" */
+#define MA2_ENTITY_HEADING_SRC 0x90u      /* nonzero: sub_000DD905 reads its +0x28 */
+#define MA2_CAM_AIM_OFFSET  0x11Cu        /* added to the heading for the aim */
+#define MA2_CAM_FLAGS       0x114u
+
+/* Name the vehicle the pitch call's pilot drives (s_veh_*, and the mech for
+ * look_bodies), with a line for each new one: what the mouse turns and the
+ * angles the camera's aim is made of. -1: not the pilot of this camera. */
+static int look_vehicle(uint32_t pilot, uint32_t walker)
 {
-    if (ret != MA2_PITCH_PILOT)
+    static int shown;
+    uint32_t vt, veh;
+    int kind;
+
+    if (!look_va_ok(pilot) || LOOK_MEM32(pilot + MA2_PILOT_CAMERA) != walker)
+        return -1;
+    vt = LOOK_MEM32(pilot);
+    veh = LOOK_MEM32(pilot + MA2_PILOT_VEHICLE);
+    kind = vt == MA2_PILOT_VT_WALKER ? VEH_WALKER :
+           vt == MA2_PILOT_VT_TANK ? VEH_TANK :
+           vt == MA2_PILOT_VT_VTOL ? VEH_VTOL :
+           vt == MA2_PILOT_VT_FLYER ? VEH_FLYER :
+           vt == MA2_PILOT_VT_MOVER ? VEH_MOVER : VEH_OTHER;
+    if (!look_va_ok(veh))
+        kind = VEH_OTHER;
+    if (kind == VEH_WALKER) {
+        s_pilot_cam = walker;
+        s_pilot_mech = veh;
+    }
+    if (walker != s_veh_cam || veh != s_veh || kind != s_veh_kind) {
+        s_veh_cam = walker;
+        s_veh = veh;
+        s_veh_kind = kind;
+        if (shown++ < 50 && look_va_ok(veh)) {
+            char line[512];
+            uint32_t body = LOOK_MEM32(veh + MA2_MECH_BODY), src = LOOK_MEM32(veh + MA2_ENTITY_HEADING_SRC);
+            int at = snprintf(line, sizeof line,
+                              "[LOOK] camera %08X: %s, pilot %08X (vtable %08X), vehicle %08X type %08X;"
+                              " body %08X heading %.2f",
+                              walker, s_veh_names[kind], pilot, vt, veh, LOOK_MEM32(veh + MA2_ENTITY_TYPE),
+                              body, look_va_ok(body) ? LOOK_MEMF(body + MA2_BODY_HEADING) : 0.0f);
+            if (kind == VEH_TANK)
+                at += snprintf(line + at, sizeof line - at, ", turret %.2f",
+                               LOOK_MEMF(veh + MA2_TANK_TURRET + MA2_BODY_HEADING));
+            if (src)
+                at += snprintf(line + at, sizeof line - at, ", heading source %08X", src);
+            snprintf(line + at, sizeof line - at, "; aim %.2f cam %.2f offset %.2f flags %08X; mouse %s\n",
+                     LOOK_MEMF(walker + MA2_WALKER_CAM_TARGET), LOOK_MEMF(walker + MA2_WALKER_CAM_YAW),
+                     LOOK_MEMF(walker + MA2_CAM_AIM_OFFSET), LOOK_MEM32(walker + MA2_CAM_FLAGS),
+                     kind == VEH_OTHER ? "tilts; the stick turns" : "turns and tilts");
+            fputs(line, stderr);
+        }
+    }
+    return kind;
+}
+
+void ma2_mouse_look_pitch(uint32_t ret, uint32_t walker, float input, uint32_t pilot)
+{
+    int kind;
+
+    if (ret != MA2_PITCH_PILOT && ret != MA2_PITCH_VTOL)
         return;
     if (!look_on() || walker < 0x10000u || walker >= 0x04000000u)
         return;
     s_pitch_at = GetTickCount();
+    kind = look_vehicle(pilot, walker);
     if (walker != s_pitch_walker) {
         /* One line a camera, in every log: which path drives the mouse. */
         static int shown;
         s_pitch_walker = walker;
         if (shown++ < 50)
-            fprintf(stderr, "[LOOK] mouse look on camera %08X (pilot pitch call); body %s\n",
-                    walker, body_is_walkers(s_body, walker) ? "known" : "not known yet");
+            fprintf(stderr, "[LOOK] mouse look on camera %08X (%s pitch call); body %s\n",
+                    walker, ret == MA2_PITCH_VTOL ? "VTOL" : "pilot",
+                    kind > VEH_WALKER ? "the vehicle's" :
+                    body_is_walkers(s_body, walker) ? "known" : "not known yet");
     }
-    look_apply(walker, input, 1);
+    look_apply(walker, input, 1, kind != VEH_OTHER);
 }
 
 /* The mech pilot's update, sub_00172E96 (thiscall, this = pilot), runs every
@@ -528,11 +668,9 @@ void ma2_mouse_look_pitch(uint32_t ret, uint32_t walker, float input)
  * tilt only while the game has Look y enabled -- on the same camera entity,
  * when it is a third-person one. Each change of the reason is logged once
  * ([LOOK] pilot update ...), so a play log says which way the mouse went. */
-#define MA2_PILOT_CAMERA    0x08u
 #define MA2_PILOT_OFF       0x6E4u    /* nonzero: the pilot is not driving */
 #define MA2_PILOT_ACTIONS   0x6A8u    /* + action id: the game's enables */
 #define MA2_ACTION_LOOK_Y   5u
-#define MA2_ENTITY_TYPE     0x28u     /* the entity's type id */
 #define MA2_TYPE_IDS        0x004EAFC0u
 static const char *const s_cam_types[] = {
     "MACamera", "MAFreeCamera", "MACameraFirst", "MACameraThird",
@@ -576,5 +714,5 @@ void ma2_mouse_look_update(uint32_t pilot)
     }
     last_why = why; last_pilot = pilot; last_cam = cam; last_type = type;
     if (third)
-        look_apply(cam, 0.0f, look_y);
+        look_apply(cam, 0.0f, look_y, 1);
 }
