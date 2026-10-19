@@ -13,7 +13,25 @@ $root = 'C:\Mechassault2\ma2-recomp'
 Set-Location $root
 # A relaunch leaves a chain of ma2.exe processes (parent waits on child);
 # killing only the top one strands the rest, which then hold the exe open.
-Get-Process -Name ma2 -ErrorAction SilentlyContinue | Stop-Process -Force
+# So a run ends by killing every process descended from the one it started --
+# and only those: an ma2.exe already running is the player's (play.bat) or
+# another session's, and is never touched. Wait for it instead.
+function Get-Descendants([int]$Id) {
+    $all = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue
+    $out = @(); $todo = @($Id)
+    while ($todo.Count) {
+        $next = @()
+        foreach ($q in $todo) {
+            foreach ($c in ($all | Where-Object { $_.ParentProcessId -eq $q })) { $out += $c.ProcessId; $next += $c.ProcessId }
+        }
+        $todo = $next
+    }
+    $out
+}
+while (Get-Process -Name ma2 -ErrorAction SilentlyContinue) {
+    Write-Host "run.ps1: ma2.exe is already running (the player's or another run's); waiting"
+    Start-Sleep -Seconds 15
+}
 $env:RECOMP_WATCHDOG_SECS = "$Secs"
 $env:RECOMP_AC97_READY = '1'; $env:RECOMP_PB_EXEC = '1'; $env:RECOMP_PB_WALK = 'dma'; $env:RECOMP_ASYNC_IO = '1'; $env:RECOMP_VBLANK = '1'; $env:RECOMP_HEAP_RECLAIM = '1'
 $env:RECOMP_USB = $(if ($NoUsb) { $null } else { '1' }); $env:RECOMP_USB_PADS = $(if ($NoUsb) { $null } else { '1' })
@@ -21,6 +39,20 @@ $env:RECOMP_KEYBOARD = $(if ($NoKeyboard) { $null } else { '1' })
 # As play.bat: DirectSound's APU restarts off (audio).
 $env:RECOMP_APU_SSL_IRQ = '0'; $env:RECOMP_APU_EP_MARK = '1'
 $env:RECOMP_MUTE = '1'          # test runs are silent; play.bat is not
+# Test runs keep their own game saves (UDATA/TDATA): the player's progress in
+# %LOCALAPPDATA%\xboxrecomp is never touched by a scripted run. The folder is
+# seeded with the save the scripted boot was tuned against (a profile, no
+# campaign progress); an empty one boots through first-run screens and the
+# scripts' timings no longer land in the mission.
+if (-not $env:RECOMP_SAVE_DIR) {
+    # A fresh copy of analysis\testsave_seed each run, so no run inherits
+    # another's progress.
+    $env:RECOMP_SAVE_DIR = "$root\analysis\testsave"
+    if (Test-Path "$root\analysis\testsave_seed") {
+        Remove-Item "$root\analysis\testsave" -Recurse -Force -ErrorAction SilentlyContinue
+        Copy-Item "$root\analysis\testsave_seed" "$root\analysis\testsave" -Recurse
+    }
+}
 $env:MA2_SKIP_ICALL = $Skip
 if ($Frames) {
     $fb = "$root\analysis\fb_$Name"
@@ -41,8 +73,13 @@ $err = "$root\analysis\${Name}_stderr.txt"
 # file read ran at 2 MB/s.
 $p = Start-Process -FilePath "$env:ComSpec" -WorkingDirectory $root -WindowStyle Hidden -PassThru `
     -ArgumentList '/c', "`"`"$root\build\Release\ma2.exe`" 1>`"$root\analysis\${Name}_stdout.txt`" 2>`"$err`"`""
-if (-not $p.WaitForExit(($Secs + 40) * 1000)) { Stop-Process -Id $p.Id -Force }
-Get-Process -Name ma2 -ErrorAction SilentlyContinue | Stop-Process -Force
+$kids = @()
+if (-not $p.WaitForExit(($Secs + 40) * 1000)) {
+    $kids = Get-Descendants $p.Id
+    Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+}
+$kids += Get-Descendants $p.Id
+foreach ($k in $kids) { Stop-Process -Id $k -Force -ErrorAction SilentlyContinue }
 $flips = (Select-String -Path $err -Pattern '\((\d+) flips\)' | Select-Object -Last 1).Matches.Groups[1].Value
 $crash = (Select-String -Path $err -Pattern '^\[CRASH\]' | Select-Object -First 1).Line
 $exit = (Select-String -Path $err -Pattern 'HalReturnToFirmware: routine' | Select-Object -First 1)
