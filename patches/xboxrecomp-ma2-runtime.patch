@@ -2944,7 +2944,7 @@ index 327f01d..fe80235 100644
  /* Where BACK_END_WRITE_SEMAPHORE_RELEASE (0x1D70) values land: the guest VA
   * of the semaphore the title reads GPU progress from (for XDK D3D, the
 diff --git a/src/kernel/nv2a_pb_exec.c b/src/kernel/nv2a_pb_exec.c
-index 1280565..f46baf4 100644
+index 1280565..27a0c4c 100644
 --- a/src/kernel/nv2a_pb_exec.c
 +++ b/src/kernel/nv2a_pb_exec.c
 @@ -262,9 +262,13 @@ typedef struct {
@@ -3096,28 +3096,42 @@ index 1280565..f46baf4 100644
      default:   return fmt;                 /* already linear, or unhandled */
      }
  }
-@@ -1094,7 +1186,10 @@ static int sample_tex(const Texture *t, uint32_t face_offset,
+@@ -1094,17 +1186,30 @@ static int sample_tex(const Texture *t, uint32_t face_offset,
                          uint32_t px[16]; } cache[4096];
          uint32_t bb = d3d8_format_dxt_block_bytes(fmt);
          uint32_t bx = u >> 2, by = v >> 2, bw = (t->width + 3) >> 2;
 -        const uint8_t *blk = mem + base + ((size_t)by * bw + bx) * bb;
-+        /* A compressed volume is its slices' block images back to back. */
-+        size_t slice = t->depth > 1
-+                     ? (size_t)s_tex_slice * bw * ((t->height + 3) >> 2) * bb : 0;
-+        const uint8_t *blk = mem + base + slice + ((size_t)by * bw + bx) * bb;
-         uintptr_t key = (uintptr_t)blk;
+-        uintptr_t key = (uintptr_t)blk;
++        size_t blkno = (size_t)by * bw + bx;
++        const uint8_t *blk;
++        uintptr_t key;
++        /* A compressed volume is not its slices' block images back to back:
++         * the slices go in groups of four, and within a group the blocks run
++         * row, column, then slice -- the four blocks of one 4x4x4 cell side
++         * by side (the last group holds what is left). Read slice-major, the
++         * blocks of neighbouring slices interleaved into stripes. */
++        if (t->depth > 1) {
++            uint32_t z = s_tex_slice, g = z >> 2, bh = (t->height + 3) >> 2;
++            uint32_t gd = t->depth - g * 4 < 4 ? t->depth - g * 4 : 4;
++            blkno = (size_t)g * 4 * bw * bh + blkno * gd + (z & 3);
++        }
++        blk = mem + base + blkno * bb;
++        key = (uintptr_t)blk;
          size_t slot = ((key / bb) ^ (key >> 16)) & 4095;
          uint64_t raw[2] = {0, 0};
-@@ -1103,7 +1198,7 @@ static int sample_tex(const Texture *t, uint32_t face_offset,
+         memcpy(raw, blk, bb);
+         if (cache[slot].key != key || cache[slot].fmt != fmt
              || cache[slot].raw[0] != raw[0] || cache[slot].raw[1] != raw[1]) {
              uint32_t i;
++            /* The block alone, as a 4x4 image. */
              for (i = 0; i < 16; i++)
 -                d3d8_dxt_decode_texel(mem + base, fmt, bx * 4 + (i & 3),
-+                d3d8_dxt_decode_texel(mem + base + slice, fmt, bx * 4 + (i & 3),
-                                       by * 4 + (i >> 2), t->width,
+-                                      by * 4 + (i >> 2), t->width,
++                d3d8_dxt_decode_texel(blk, fmt, i & 3, i >> 2, 4,
                                        &cache[slot].px[i]);
              cache[slot].key = key;
-@@ -1121,7 +1216,9 @@ static int sample_tex(const Texture *t, uint32_t face_offset,
+             cache[slot].fmt = fmt;
+@@ -1121,7 +1226,9 @@ static int sample_tex(const Texture *t, uint32_t face_offset,
           * index for every one of them. */
          fmt = linear_twin(fmt);
          p = mem + base;
@@ -3128,7 +3142,7 @@ index 1280565..f46baf4 100644
      } else {
          p = mem + base + (size_t)v * t->pitch;
      }
-@@ -1200,6 +1297,25 @@ static int sample_tex(const Texture *t, uint32_t face_offset,
+@@ -1200,6 +1307,25 @@ static int sample_tex(const Texture *t, uint32_t face_offset,
          return 1;
      }
  
@@ -3154,7 +3168,7 @@ index 1280565..f46baf4 100644
      /* 8-bit. */
      case 0x13: {                                    /* LIN_L8 */
          uint32_t t = p[u];
-@@ -1920,37 +2036,85 @@ static void backend_from_xf(const Nv2aVshOutput *v, Nv2aVertex *o)
+@@ -1920,37 +2046,85 @@ static void backend_from_xf(const Nv2aVshOutput *v, Nv2aVertex *o)
      o->diffuse = pack_color(v->d0);
      o->u = v->tex[0][0] * su;
      o->v = v->tex[0][1] * sv;
@@ -3258,7 +3272,7 @@ index 1280565..f46baf4 100644
      s_backend->draw(&surf, &batch);
      s_gpu.tris_drawn += s_bcount / 3;
      s_bcount = 0;
-@@ -1995,7 +2159,12 @@ static void raster_indexed(uint32_t i0, uint32_t i1, uint32_t i2, uint32_t argb)
+@@ -1995,7 +2169,12 @@ static void raster_indexed(uint32_t i0, uint32_t i1, uint32_t i2, uint32_t argb)
              o[k].diffuse = vertex_color(ix[k]);
              o[k].u = textured ? uv[k][0] : 0.0f;
              o[k].v = textured ? uv[k][1] : 0.0f;
@@ -3271,7 +3285,7 @@ index 1280565..f46baf4 100644
          s_bcount += 3;
          return;
      }
-@@ -2106,7 +2275,7 @@ static uint32_t tex_texel_bytes(uint32_t fmt)
+@@ -2106,7 +2285,7 @@ static uint32_t tex_texel_bytes(uint32_t fmt)
      case 0x00: case 0x01: case 0x0B: case 0x13: case 0x19: case 0x1F:
          return 1;
      case 0x02: case 0x03: case 0x04: case 0x05: case 0x10: case 0x11:
@@ -3280,7 +3294,7 @@ index 1280565..f46baf4 100644
          return 2;
      default:
          return 4;
-@@ -2388,12 +2557,65 @@ static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
+@@ -2388,12 +2567,65 @@ static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
  #define NV_RASTER_MAX_THREADS 16
  #define NV_RASTER_MT_MIN_PIXELS 8192
  
@@ -3346,7 +3360,7 @@ index 1280565..f46baf4 100644
      XfCount cnt[NV_RASTER_MAX_THREADS];
  } s_pool;
  
-@@ -2403,7 +2625,12 @@ static DWORD WINAPI raster_worker(LPVOID arg)
+@@ -2403,7 +2635,12 @@ static DWORD WINAPI raster_worker(LPVOID arg)
      for (;;) {
          WaitForSingleObject(s_pool.start[k], INFINITE);
          memset(&s_pool.cnt[k], 0, sizeof s_pool.cnt[k]);
@@ -3360,7 +3374,7 @@ index 1280565..f46baf4 100644
          if (InterlockedDecrement(&s_pool.pending) == 0)
              SetEvent(s_pool.done);
      }
-@@ -2462,11 +2689,83 @@ static void xf_rows_parallel(const XfTri *T, XfCount *total)
+@@ -2462,11 +2699,83 @@ static void xf_rows_parallel(const XfTri *T, XfCount *total)
          total->zpass += s_pool.cnt[k].zpass;
      }
  }
@@ -3444,7 +3458,7 @@ index 1280565..f46baf4 100644
  #endif
  
  static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
-@@ -2564,6 +2863,20 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
+@@ -2564,6 +2873,20 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
      s_gpu.xf_drawn++;
      T.inv_area = 1.0f / area;
  
@@ -3465,7 +3479,7 @@ index 1280565..f46baf4 100644
      xf_rows_parallel(&T, &cnt);
      s_gpu.xf_depth_fail += cnt.depth_fail;
      s_gpu.xf_pixels += cnt.pixels;
-@@ -2664,8 +2977,6 @@ static void raster_xf_clipped(const Nv2aVshOutput *a, const Nv2aVshOutput *b,
+@@ -2664,8 +2987,6 @@ static void raster_xf_clipped(const Nv2aVshOutput *a, const Nv2aVshOutput *b,
  
  /* About 7 MB, so allocated by the first batch that transforms rather than
   * carried in every build that never turns the executor on. */
@@ -3474,7 +3488,7 @@ index 1280565..f46baf4 100644
  /* Does this batch run the title's vertex program? RECOMP_NO_VSH turns the
   * interpreter off (the batch then falls to the screen-space heuristics). */
  static int batch_uses_program(void)
-@@ -2721,15 +3032,172 @@ static void xf_set_viewport(void)
+@@ -2721,15 +3042,172 @@ static void xf_set_viewport(void)
      s_xf_o[2] = of[2];
  }
  
@@ -3650,7 +3664,7 @@ index 1280565..f46baf4 100644
      xf_set_viewport();
      {
          const VertexAttr *tc = texcoord_attr();
-@@ -2815,6 +3283,51 @@ static void raster_batch_program(void)
+@@ -2815,6 +3293,51 @@ static void raster_batch_program(void)
                          s_xf[i].pos[3]);
          }
      }
@@ -3702,7 +3716,7 @@ index 1280565..f46baf4 100644
      for (i = 0; i < NV2A_VSH_INPUTS; i++) {
          const VertexAttr *at = &s_gpu.attr[i];
          uint32_t f = at->type | (at->size << 4) | (i << 8), j;
-@@ -2828,6 +3341,19 @@ static void raster_batch_program(void)
+@@ -2828,6 +3351,19 @@ static void raster_batch_program(void)
      if (s_gpu.texs[0].valid)
          note_texture_use();
  
@@ -3722,7 +3736,7 @@ index 1280565..f46baf4 100644
      switch (s_gpu.prim) {
      case NV_PRIM_TRIANGLES:
          for (i = 0; i + 2 < n; i += 3)
-@@ -2857,6 +3383,10 @@ static void raster_batch_program(void)
+@@ -2857,6 +3393,10 @@ static void raster_batch_program(void)
      default:
          break;
      }
@@ -3733,7 +3747,7 @@ index 1280565..f46baf4 100644
      if (backend_draws())
          backend_flush(!s_xf_no_tex);
  }
-@@ -3186,22 +3716,54 @@ static void draw_inline_array(void)
+@@ -3186,22 +3726,54 @@ static void draw_inline_array(void)
  
      memcpy(saved, s_gpu.attr, sizeof saved);
  
@@ -3792,7 +3806,7 @@ index 1280565..f46baf4 100644
  
      count = (s_gpu.inline_count * 4) / vsize;
      if (count < 3 || count > NV_MAX_INDICES)
-@@ -3406,6 +3968,8 @@ static void tex_stage_method(uint32_t method, uint32_t param)
+@@ -3406,6 +3978,8 @@ static void tex_stage_method(uint32_t method, uint32_t param)
          t->color = (param >> 8) & 0xFF;
          t->cube = (param >> 2) & 1;
          t->levels = (param >> 16) & 0xF;
@@ -3801,7 +3815,7 @@ index 1280565..f46baf4 100644
          /* A swizzled texture carries its own dimensions here, as log2 in
           * BASE_SIZE_U/V. It has to: IMAGE_RECT describes a linear image, and
           * a title that only uses swizzled textures never sends one. */
-@@ -3747,6 +4311,10 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -3747,6 +4321,10 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
          /* The stall ends when the buffer being read is the one just finished.
           * There is no scanout here to wait for, so that is now. */
          s_gpu.flip_read = s_gpu.flip_write;
@@ -3812,7 +3826,7 @@ index 1280565..f46baf4 100644
          /* And this is a completed swap, which is what a title's own swap
           * counter counts -- see xbox_Nv2aFrameCounterFlip. */
          xbox_Nv2aFrameCounterFlip();
-@@ -3762,6 +4330,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -3762,6 +4340,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
              extern void xbox_FramebufferWindowFrameStats(uint32_t);
              static uint32_t draws_at_flip;
              xbox_FramebufferWindowFrameStats(s_gpu.draws - draws_at_flip);
@@ -3820,7 +3834,7 @@ index 1280565..f46baf4 100644
              draws_at_flip = s_gpu.draws;
          }
          if (s_gpu.pitch) {
-@@ -3798,8 +4367,6 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -3798,8 +4377,6 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
              }
          }
          s_gpu.drawn_stale = 1;
@@ -4586,10 +4600,10 @@ index 87b7ef7..e6c21cc 100644
  static void publish(uint32_t bpp)
 diff --git a/src/video/nv2a_d3d11.c b/src/video/nv2a_d3d11.c
 new file mode 100644
-index 0000000..8789af6
+index 0000000..f0ea2a8
 --- /dev/null
 +++ b/src/video/nv2a_d3d11.c
-@@ -0,0 +1,3168 @@
+@@ -0,0 +1,3209 @@
 +/*
 + * nv2a_d3d11.c -- a Direct3D 11 render back end for the pushbuffer executor.
 + *
@@ -5486,6 +5500,47 @@ index 0000000..8789af6
 +            if (shown++ < 4)
 +                fprintf(stderr, "  [D3D11] volume texture %08X fmt %02X %ux%ux%u\n",
 +                        t->offset, t->color, t->width, t->height, t->depth);
++        }
++        /* RECOMP_D3D11_VOL_DUMP=1: each new volume's slices top to bottom,
++         * alpha beside the colour, to d3d11_vol_<address>.bmp. */
++        if (getenv("RECOMP_D3D11_VOL_DUMP") && t->width <= 1024) {
++            static uint32_t done[64];
++            static int ndone;
++            int k, seen = 0;
++            for (k = 0; k < ndone; k++)
++                seen |= done[k] == t->offset;
++            if (!seen && ndone < 64) {
++                uint32_t w = t->width, h = t->height * t->depth, x, y;
++                uint32_t row = ((w * 2 * 3) + 3) & ~3u, sz = 54 + row * h;
++                uint8_t hdr[54] = { 'B', 'M' }, line[2048 * 3 + 4];
++                char name[64];
++                FILE *f;
++                done[ndone++] = t->offset;
++                snprintf(name, sizeof name, "d3d11_vol_%08X.bmp", t->offset);
++                if ((f = fopen(name, "wb")) != NULL) {
++                    uint32_t ww = w * 2;
++                    int32_t hh = -(int32_t)h;
++                    memcpy(hdr + 2, &sz, 4); hdr[10] = 54; hdr[14] = 40;
++                    memcpy(hdr + 18, &ww, 4); memcpy(hdr + 22, &hh, 4);
++                    hdr[26] = 1; hdr[28] = 24;
++                    fwrite(hdr, 1, 54, f);
++                    for (y = 0; y < h; y++) {
++                        memset(line, 0, sizeof line);
++                        for (x = 0; x < w; x++) {
++                            uint32_t p = s_decode[(size_t)y * w + x];
++                            line[x * 3 + 0] = (uint8_t)p;
++                            line[x * 3 + 1] = (uint8_t)(p >> 8);
++                            line[x * 3 + 2] = (uint8_t)(p >> 16);
++                            line[(w + x) * 3 + 0] = line[(w + x) * 3 + 1] =
++                                line[(w + x) * 3 + 2] = (uint8_t)(p >> 24);
++                        }
++                        fwrite(line, 1, row, f);
++                    }
++                    fclose(f);
++                    fprintf(stderr, "  [D3D11] volume %08X fmt %02X -> %s\n",
++                            t->offset, t->color, name);
++                }
++            }
 +        }
 +        return v;
 +    }
