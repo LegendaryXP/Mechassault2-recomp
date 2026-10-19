@@ -54,3 +54,6 @@ xbox_kernel.log
 *.bmp
 logs/
 shader_cache/
+
+# Shared build/run slot between sessions
+.slot.lock

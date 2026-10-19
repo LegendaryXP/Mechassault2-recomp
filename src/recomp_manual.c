@@ -302,6 +302,30 @@ void sub_00366DBC(void)
     g_eax = 0x80150005u;      /* the code sub_0036BFD0 itself returns on failure */
 }
 
+/* ── MechAssault 2: the mouse turning the walker (sub_0006C790) ──────── */
+
+/*
+ * sub_0006C790(rate), thiscall, ret 4: a physics body's yaw-rate setter
+ * (this+0x34; the body object is this - 0x40). Every body in the game calls
+ * it; the return address says who called, and the pilot's two stick turns
+ * are the mouse's to steer: afterwards it turns the heading itself
+ * (src/ma2_mouse_look.c).
+ */
+#include <string.h>   /* memcpy */
+extern void sub_0006C790_gen(void);
+void ma2_mouse_look_rate_set(uint32_t ret, uint32_t comp, float rate);
+
+void sub_0006C790(void)
+{
+    uint32_t comp = g_ecx;
+    uint32_t ret = MA2_MEM32(g_esp);        /* [esp] is the return address */
+    uint32_t rv = MA2_MEM32(g_esp + 4);
+    float rate;
+    memcpy(&rate, &rv, sizeof rate);
+    sub_0006C790_gen();
+    ma2_mouse_look_rate_set(ret, comp, rate);
+}
+
 /* ── Bring-up switch: MA2_SKIP_ICALL ───────────────────────── */
 
 /*

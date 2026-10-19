@@ -521,7 +521,7 @@ index 281b4d2..32e4d68 100644
  /**
   * Unswizzle a texture from Xbox swizzled (Z-order/Morton) layout
 diff --git a/src/input/mkb_input.c b/src/input/mkb_input.c
-index d6f0042..92d783c 100644
+index d6f0042..1dc2003 100644
 --- a/src/input/mkb_input.c
 +++ b/src/input/mkb_input.c
 @@ -9,10 +9,14 @@
@@ -671,7 +671,7 @@ index d6f0042..92d783c 100644
  
  /* ---- configuration ----------------------------------------------------- */
  
-@@ -43,12 +168,14 @@ typedef struct {
+@@ -43,12 +168,16 @@ typedef struct {
      double sens;        /* multiplier on the aim deflection          */
      double dz;          /* assumed game deadzone, 0..1               */
      double acc;         /* aim acceleration exponent, 1 = linear     */
@@ -681,14 +681,16 @@ index d6f0042..92d783c 100644
      int    swap_sticks; /* mouse aims with the left stick instead    */
 +    double smooth;      /* ms over which the mouse speed is averaged */
 +    int    click_capture; /* a click in the window locks the mouse too */
++    double look_deg;    /* degrees per count, for a title's direct look */
++    int    look_invert_y; /* direct look: mouse up looks down */
  } MkbConfig;
  
 -static MkbConfig s_cfg = { 1.0, 0.18, 1.0, 8, 0, 0 };
-+static MkbConfig s_cfg = { 1.0, 0.18, 1.0, 20, 0, 0, 25.0, 0 };
++static MkbConfig s_cfg = { 1.0, 0.18, 1.0, 20, 0, 0, 25.0, 0, 0.05, 0 };
  
  /* One "key=value" line; returns 1 when the key was recognised. */
  static int mkb_apply_kv(const char *key, const char *val)
-@@ -64,10 +191,17 @@ static int mkb_apply_kv(const char *key, const char *val)
+@@ -64,10 +193,21 @@ static int mkb_apply_kv(const char *key, const char *val)
          d = strtod(val, NULL); if (d > 0.0 && d < 10.0) s_cfg.acc = d;
      } else if (!strcmp(key, "full")) {
          l = strtol(val, NULL, 0); if (l > 0 && l < 1000) s_cfg.full = l;
@@ -696,6 +698,10 @@ index d6f0042..92d783c 100644
 +        d = strtod(val, NULL); if (d >= 1.0 && d <= 500.0) s_cfg.smooth = d;
 +    } else if (!strcmp(key, "click_capture")) {
 +        s_cfg.click_capture = atoi(val) != 0;
++    } else if (!strcmp(key, "look_deg")) {
++        d = strtod(val, NULL); if (d > 0.0 && d < 10.0) s_cfg.look_deg = d;
++    } else if (!strcmp(key, "look_invert_y")) {
++        s_cfg.look_invert_y = atoi(val) != 0;
      } else if (!strcmp(key, "invert_y")) {
          s_cfg.invert_y = atoi(val) != 0;
      } else if (!strcmp(key, "swap_sticks")) {
@@ -706,15 +712,16 @@ index d6f0042..92d783c 100644
      } else {
          return 0;
      }
-@@ -81,6 +215,7 @@ static void mkb_load_config(void)
+@@ -81,6 +221,8 @@ static void mkb_load_config(void)
          "RECOMP_MKB_DZ",   "dz",
          "RECOMP_MKB_ACC",  "acc",
          "RECOMP_MKB_FULL", "full",
 +        "RECOMP_MKB_SMOOTH", "smooth",
++        "RECOMP_MKB_LOOK_DEG", "look_deg",
          "RECOMP_MKB_INVERT_Y",  "invert_y",
          "RECOMP_MKB_SWAP_STICKS", "swap_sticks",
          NULL
-@@ -91,6 +226,7 @@ static void mkb_load_config(void)
+@@ -91,6 +233,7 @@ static void mkb_load_config(void)
      FILE *f;
      int i;
  
@@ -722,7 +729,7 @@ index d6f0042..92d783c 100644
      for (i = 0; kv[i]; i += 2) {
          const char *v = getenv(kv[i]);
          if (v && *v)
-@@ -114,6 +250,9 @@ static void mkb_load_config(void)
+@@ -114,6 +257,9 @@ static void mkb_load_config(void)
          while (fgets(line, sizeof line, f)) {
              char *eq = strchr(line, '=');
              char *k, *v;
@@ -732,7 +739,7 @@ index d6f0042..92d783c 100644
              if (!eq) continue;
              *eq = 0;
              k = line; v = eq + 1;
-@@ -128,22 +267,78 @@ static void mkb_load_config(void)
+@@ -128,22 +274,107 @@ static void mkb_load_config(void)
      fclose(f);
  }
  
@@ -813,10 +820,39 @@ index d6f0042..92d783c 100644
 +{
 +    return mkb_enabled() && s_captured;
 +}
++
++/* Direct look: counts mkb_merge set aside for a title hook, which axes it
++ * takes (bit 0 x, bit 1 y), and when it last asked (GetTickCount64 ms;
++ * 0 = never). */
++static volatile LONG s_look_dx, s_look_dy, s_look_live, s_look_axes;
++static volatile ULONGLONG s_look_asked;
++
++int mkb_mouse_look_take(float *yaw_deg, float *pitch_deg)
++{
++    LONG dx, dy;
++    double k;
++
++    *yaw_deg = 0.0f;
++    if (pitch_deg)
++        *pitch_deg = 0.0f;
++    if (!mkb_enabled())
++        return 0;
++    InterlockedExchange(&s_look_axes, pitch_deg ? 3 : 1);
++    s_look_asked = GetTickCount64();
++    dx = InterlockedExchange(&s_look_dx, 0);
++    dy = InterlockedExchange(&s_look_dy, 0);
++    if (!InterlockedCompareExchange(&s_look_live, 0, 0))
++        return 0;
++    k = s_cfg.look_deg * s_cfg.sens;
++    *yaw_deg = (float)(dx * k);
++    if (pitch_deg)
++        *pitch_deg = (float)(-dy * k * (s_cfg.look_invert_y ? -1.0 : 1.0));
++    return 1;
++}
  
  static void mkb_handle_raw(HRAWINPUT h)
  {
-@@ -155,6 +350,8 @@ static void mkb_handle_raw(HRAWINPUT h)
+@@ -155,6 +386,8 @@ static void mkb_handle_raw(HRAWINPUT h)
              == (UINT)-1)
          return;
  
@@ -825,7 +861,7 @@ index d6f0042..92d783c 100644
      if (ri->header.dwType == RIM_TYPEMOUSE) {
          const RAWMOUSE *m = &ri->data.mouse;
  
-@@ -162,6 +359,27 @@ static void mkb_handle_raw(HRAWINPUT h)
+@@ -162,6 +395,27 @@ static void mkb_handle_raw(HRAWINPUT h)
              if (m->lLastX) InterlockedAdd(&s_dx, m->lLastX);
              if (m->lLastY) InterlockedAdd(&s_dy, m->lLastY);
          }
@@ -853,7 +889,7 @@ index d6f0042..92d783c 100644
          if (m->usButtonFlags & RI_MOUSE_LEFT_BUTTON_DOWN)
              InterlockedOr(&s_mouse_btn, 1);
          if (m->usButtonFlags & RI_MOUSE_LEFT_BUTTON_UP)
-@@ -190,20 +408,33 @@ static void mkb_handle_raw(HRAWINPUT h)
+@@ -190,20 +444,33 @@ static void mkb_handle_raw(HRAWINPUT h)
          const RAWKEYBOARD *k = &ri->data.keyboard;
          UINT vk = k->VKey;
  
@@ -896,7 +932,7 @@ index d6f0042..92d783c 100644
          }
      }
  }
-@@ -256,9 +487,17 @@ static DWORD WINAPI mkb_thread(LPVOID unused)
+@@ -256,9 +523,17 @@ static DWORD WINAPI mkb_thread(LPVOID unused)
      }
  
      InterlockedExchange(&s_thread_up, 1);
@@ -917,7 +953,7 @@ index d6f0042..92d783c 100644
      fflush(stderr);
  
      while (GetMessageA(&msg, NULL, 0, 0) > 0) {
-@@ -281,7 +520,9 @@ int mkb_enabled(void)
+@@ -281,7 +556,9 @@ int mkb_enabled(void)
          const char *v = getenv("RECOMP_MKB");
          on = v && *v && *v != '0';
          if (on) {
@@ -927,7 +963,7 @@ index d6f0042..92d783c 100644
              if (InterlockedCompareExchange(&s_thread_up, 0, 0) == 0) {
                  static LONG started = 0;
                  if (InterlockedCompareExchange(&started, 1, 0) == 0)
-@@ -312,23 +553,38 @@ static int game_is_foreground(void)
+@@ -312,23 +589,38 @@ static int game_is_foreground(void)
   * end up clicking other apps' title bars. */
  static void mkb_manage_cursor(int capture)
  {
@@ -979,7 +1015,7 @@ index d6f0042..92d783c 100644
      }
  }
  
-@@ -356,86 +612,414 @@ static void mkb_aim_vector(double ax, double ay, SHORT *out_x, SHORT *out_y)
+@@ -356,86 +648,574 @@ static void mkb_aim_vector(double ax, double ay, SHORT *out_x, SHORT *out_y)
  
  #define MK_VK(k)  ((unsigned)(k) < 256 && s_vk_down[(k)])
  
@@ -1053,10 +1089,15 @@ index d6f0042..92d783c 100644
 +        if (st->in >= 0) {
 +            down[st->in] = 1;
 +        } else {
++            /* Counts due by b less counts due by a, both rounded: the step
++             * hands out exactly its total, a slow one included (truncating
++             * each poll's share lost every count of a move slower than one
++             * count a poll). */
 +            unsigned long a = last > st->at ? last : st->at, b = t < end ? t : end;
 +            if (b > a) {
-+                *dx += (LONG)(st->dx * (double)(b - a) / st->len);
-+                *dy += (LONG)(st->dy * (double)(b - a) / st->len);
++                double fa = (double)(a - st->at) / st->len, fb = (double)(b - st->at) / st->len;
++                *dx += (LONG)floor(st->dx * fb + 0.5) - (LONG)floor(st->dx * fa + 0.5);
++                *dy += (LONG)floor(st->dy * fb + 0.5) - (LONG)floor(st->dy * fa + 0.5);
 +            }
 +        }
 +    }
@@ -1088,32 +1129,101 @@ index d6f0042..92d783c 100644
 + * floats; after the fourth, list every float that moved between 1 and 2,
 + * held between 2 and 3, and moved back by about as much between 3 and 4 --
 + * what an angle does when a script turns one way, waits, and turns back.
-+ * For finding the variables a title keeps its camera in. */
++ * For finding the variables a title keeps its camera in.
++ *
++ * RECOMP_MEMSCAN_PAT=<w1>,<w2>,... (one weight per step between snapshots,
++ * up to 8 snapshots) lists instead the floats whose steps go as k*w for one
++ * k: "1,1,-2" for a script that turns, turns again as far, and turns back
++ * twice as far -- what an accumulated angle does and a position on an orbit,
++ * a matrix entry or a screen-space vertex does not. RECOMP_MEMSCAN_TOL is the
++ * tolerance as a fraction of k (default 0.15). */
 +#define MEMSCAN_LO 0x00010000u
 +#define MEMSCAN_HI 0x04000000u
++#define MEMSCAN_MAX 8
++static void mkb_memscan_pattern(float *const *snap, int nt, const float *w)
++{
++    const size_t n = (MEMSCAN_HI - MEMSCAN_LO) / 4;
++    const char *outp = getenv("RECOMP_MEMSCAN_OUT");
++    const char *tv = getenv("RECOMP_MEMSCAN_TOL");
++    float tol = tv && *tv ? (float)atof(tv) : 0.15f;
++    FILE *out = outp ? fopen(outp, "w") : NULL;
++    size_t i, hits = 0;
++    float ww = 0.0f;
++    int s;
++
++    for (s = 0; s + 1 < nt; s++)
++        ww += w[s] * w[s];
++    for (i = 0; i < n && ww > 0.0f; i++) {
++        float d[MEMSCAN_MAX], k = 0.0f, err = 0.0f;
++        int ok = 1;
++        for (s = 0; s < nt && ok; s++)
++            ok = isfinite(snap[s][i]) && fabsf(snap[s][i]) < 1e6f;
++        if (!ok)
++            continue;
++        for (s = 0; s + 1 < nt; s++) {
++            d[s] = snap[s + 1][i] - snap[s][i];
++            k += d[s] * w[s];
++        }
++        k /= ww;
++        if (fabsf(k) < 1e-3f || fabsf(k) < 1e-4f * fabsf(snap[0][i]))
++            continue;
++        for (s = 0; s + 1 < nt; s++) {
++            float e = fabsf(d[s] - k * w[s]);
++            if (e > err) err = e;
++        }
++        if (err > tol * fabsf(k))
++            continue;
++        if (out) {
++            fprintf(out, "P 0x%08X k=%g err=%.3f", (unsigned)(MEMSCAN_LO + i * 4), k, err / fabsf(k));
++            for (s = 0; s < nt; s++)
++                fprintf(out, " %g", snap[s][i]);
++            fprintf(out, "\n");
++        }
++        if (hits++ < 300) {
++            fprintf(stderr, "  [MEMSCAN-PAT] 0x%08X k=%g:", (unsigned)(MEMSCAN_LO + i * 4), k);
++            for (s = 0; s < nt; s++)
++                fprintf(stderr, " %g", snap[s][i]);
++            fprintf(stderr, "\n");
++        }
++    }
++    if (out)
++        fclose(out);
++    fprintf(stderr, "  [MEMSCAN-PAT] %zu candidates\n", hits);
++    fflush(stderr);
++}
++
 +static void mkb_memscan(unsigned long t)
 +{
-+    static int init, nt, done;
-+    static unsigned long at[4];
-+    static float *snap[4];
++    static int init, nt, done, npat;
++    static unsigned long at[MEMSCAN_MAX];
++    static float *snap[MEMSCAN_MAX], pat[MEMSCAN_MAX];
 +    extern ptrdiff_t xbox_GetMemoryOffset(void);
 +    const size_t n = (MEMSCAN_HI - MEMSCAN_LO) / 4;
 +    int k;
 +
 +    if (!init) {
 +        const char *e = getenv("RECOMP_MEMSCAN");
++        const char *p = getenv("RECOMP_MEMSCAN_PAT");
 +        char *end;
 +        init = 1;
-+        while (e && *e && nt < 4) {
++        while (e && *e && nt < MEMSCAN_MAX) {
 +            at[nt++] = strtoul(e, &end, 10);
 +            e = (*end == ',') ? end + 1 : NULL;
 +        }
-+        if (nt != 4)
++        while (p && *p && npat < MEMSCAN_MAX - 1) {
++            pat[npat++] = (float)strtod(p, &end);
++            p = (*end == ',') ? end + 1 : NULL;
++        }
++        if (npat ? npat + 1 != nt : nt != 4) {
++            if (nt)
++                fprintf(stderr, "  [MEMSCAN] want 4 times, or one more than the"
++                                " RECOMP_MEMSCAN_PAT weights: off\n");
 +            nt = 0;
++        }
 +    }
 +    if (!nt || done)
 +        return;
-+    for (k = 0; k < 4; k++) {
++    for (k = 0; k < nt; k++) {
 +        if (snap[k] || t < at[k])
 +            continue;
 +        snap[k] = (float *)malloc(n * 4);
@@ -1122,7 +1232,15 @@ index d6f0042..92d783c 100644
 +        fprintf(stderr, "  [MEMSCAN] snapshot %d at t=%lu ms\n", k + 1, t);
 +        fflush(stderr);
 +    }
-+    if (snap[0] && snap[1] && snap[2] && snap[3]) {
++    for (k = 0; k < nt && snap[k]; k++)
++        ;
++    if (k == nt && npat) {
++        done = 1;
++        mkb_memscan_pattern(snap, nt, pat);
++        for (k = 0; k < nt; k++) { free(snap[k]); snap[k] = NULL; }
++        return;
++    }
++    if (k == nt) {
 +        size_t i, hits = 0;
 +        const char *outp = getenv("RECOMP_MEMSCAN_OUT");
 +        FILE *out = outp ? fopen(outp, "w") : NULL;
@@ -1155,6 +1273,25 @@ index d6f0042..92d783c 100644
 +                continue;
 +            if ((b > 0) == (d > 0) || fabsf(b + d) > 0.5f * fabsf(b))
 +                continue;
++            /* RECOMP_MEMSCAN_WATCH=<lo>:<hi>: arm the write watch on the
++             * first heap candidate (0x01000000 up) whose reading in snapshot
++             * 2 is that large -- the heap moves run to run, so its writer is
++             * only found in the run that found the address. */
++            {
++                static int armed;
++                const char *wv = getenv("RECOMP_MEMSCAN_WATCH");
++                uint32_t va = (uint32_t)(MEMSCAN_LO + i * 4);
++                extern int xbox_WatchArmAt(uint32_t va);
++                if (wv && !armed && va >= 0x01000000u) {
++                    float lo = (float)atof(wv), hi = 1e9f;
++                    const char *c = strchr(wv, ':');
++                    if (c) hi = (float)atof(c + 1);
++                    if (fabsf(b) >= lo && fabsf(b) <= hi && xbox_WatchArmAt(va)) {
++                        armed = 1;
++                        fprintf(stderr, "  [MEMSCAN-IN] watching 0x%08X\n", va);
++                    }
++                }
++            }
 +            if (out)
 +                fprintf(out, "I 0x%08X %g %g %g %g\n", (unsigned)(MEMSCAN_LO + i * 4), a, b, c, d);
 +            if (hits++ < 200)
@@ -1205,6 +1342,42 @@ index d6f0042..92d783c 100644
 +        f = (float *)((char *)xbox_GetMemoryOffset() + pk[k].addr);
 +        *f += pk[k].len ? pk[k].v * (float)(b - a) / (float)pk[k].len : pk[k].v;
 +    }
++}
++
++/* RECOMP_MEMLOG=<hex addr>,...[@<ms>]: every <ms> of script time (default
++ * 100) print the floats at those guest addresses -- how a candidate camera
++ * variable moves through a scripted turn. */
++static void mkb_memlog(unsigned long t)
++{
++    static int init, n;
++    static unsigned long every = 100, next;
++    static uint32_t addr[16];
++    extern ptrdiff_t xbox_GetMemoryOffset(void);
++    int k;
++
++    if (!init) {
++        const char *e = getenv("RECOMP_MEMLOG");
++        char *end;
++        init = 1;
++        while (e && *e && *e != '@' && n < 16) {
++            addr[n++] = (uint32_t)strtoul(e, &end, 16);
++            e = (*end == ',') ? end + 1 : end;
++        }
++        if (e && *e == '@')
++            every = strtoul(e + 1, NULL, 10);
++        if (!every)
++            every = 100;
++    }
++    if (!n || t < next)
++        return;
++    next = t + every;
++    fprintf(stderr, "  [MEMLOG] t=%lu", t);
++    for (k = 0; k < n; k++) {
++        if (addr[k] >= 0x10000u && addr[k] < 0x04000000u)
++            fprintf(stderr, " %08X=%g", addr[k],
++                    *(const float *)((const char *)xbox_GetMemoryOffset() + addr[k]));
++    }
++    fprintf(stderr, "\n");
 +}
 +
  int mkb_merge(DWORD dwPort, XBOX_INPUT_STATE *pState)
@@ -1262,6 +1435,9 @@ index d6f0042..92d783c 100644
 +            s_aim_vx = s_aim_vy = 0.0;
 +            InterlockedExchange(&s_dx, 0);
 +            InterlockedExchange(&s_dy, 0);
++            InterlockedExchange(&s_look_live, 0);
++            InterlockedExchange(&s_look_dx, 0);
++            InterlockedExchange(&s_look_dy, 0);
 +            InterlockedExchange(&s_wheel, 0);
 +            InterlockedExchange(&s_mouse_tap, 0);
 +            memset((void *)s_vk_tap, 0, sizeof s_vk_tap);
@@ -1300,9 +1476,29 @@ index d6f0042..92d783c 100644
 +            mkb_script_load();
 +        mkb_script_apply(last_t, t, down, &dx, &dy);
 +    }
++    /* A title hook turning its camera from the mouse (mkb_mouse_look_take)
++     * gets the counts instead of the aim stick, for as long as it keeps
++     * asking. */
++    {
++        ULONGLONG asked = s_look_asked;
++        int live = asked && GetTickCount64() - asked < 500 && (s_scripted || s_captured);
++        InterlockedExchange(&s_look_live, live);
++        if (live) {
++            LONG axes = InterlockedCompareExchange(&s_look_axes, 0, 0);
++            InterlockedAdd(&s_look_dx, dx);
++            dx = 0;
++            s_aim_vx = 0.0;
++            if (axes & 2) {
++                InterlockedAdd(&s_look_dy, dy);
++                dy = 0;
++                s_aim_vy = 0.0;
++            }
++        }
++    }
 +    mkb_mempoke(last_t, t);
 +    last_t = t;
 +    mkb_memscan(t);
++    mkb_memlog(t);
 +    down[IN_WHEEL_UP]   = (unsigned char)mkb_pulse(&wheel_up, wheel > 0 ? wheel : 0, now);
 +    down[IN_WHEEL_DOWN] = (unsigned char)mkb_pulse(&wheel_dn, wheel < 0 ? -wheel : 0, now);
  
@@ -1452,7 +1648,7 @@ index d6f0042..92d783c 100644
      /* ---- merge on top of whatever the host pad produced ---- */
      if (b)        { pState->Gamepad.wButtons |= b; any = 1; }
 diff --git a/src/input/mkb_input.h b/src/input/mkb_input.h
-index 664efad..6c0d3ca 100644
+index 664efad..e8f60bb 100644
 --- a/src/input/mkb_input.h
 +++ b/src/input/mkb_input.h
 @@ -18,11 +18,23 @@
@@ -1483,7 +1679,7 @@ index 664efad..6c0d3ca 100644
   */
  
  #ifndef XBOXRECOMP_MKB_INPUT_H
-@@ -51,6 +63,11 @@ int mkb_enabled(void);
+@@ -51,6 +63,25 @@ int mkb_enabled(void);
   */
  int mkb_merge(DWORD dwPort, XBOX_INPUT_STATE *pState);
  
@@ -1491,6 +1687,20 @@ index 664efad..6c0d3ca 100644
 + * F9, Esc or leaving the window frees it). For the window's title bar and
 + * its WM_SETCURSOR, which hides the pointer while this is true. */
 +int mkb_mouse_captured(void);
++
++/*
++ * Direct mouse look, for a title hook that turns its own camera: how far
++ * the mouse moved since the last call, in degrees (look_deg per count,
++ * times sens; x right, y up; look_invert_y, not invert_y, flips y -- the
++ * game's own invert option does not apply to it). Returns 0 and zeros when
++ * the mouse is not driving the game (not locked, window not in front, layer
++ * off), 1 otherwise. While a title keeps calling it the mouse stops steering
++ * the aim stick -- the turn goes straight into the camera, one fixed angle
++ * per count, with none of the stick's deadzone, ramp or speed limit.
++ * pitch_deg NULL takes the horizontal only: vertical mouse movement keeps
++ * driving the aim stick's y.
++ */
++int mkb_mouse_look_take(float *yaw_deg, float *pitch_deg);
 +
  #ifdef __cplusplus
  }
@@ -3748,10 +3958,51 @@ index 8acb0af..8cacb6b 100644
 +
  #endif
 diff --git a/src/kernel/xbox_memory_layout.c b/src/kernel/xbox_memory_layout.c
-index 362cefe..d1434f5 100644
+index 362cefe..86612f8 100644
 --- a/src/kernel/xbox_memory_layout.c
 +++ b/src/kernel/xbox_memory_layout.c
-@@ -4175,6 +4175,16 @@ int xbox_ContiguousFree(uint32_t va)
+@@ -2159,6 +2159,14 @@ static DWORD WINAPI watch_resolver(LPVOID unused)
+     unsigned tries;
+ 
+     (void)unused;
++    /* RECOMP_WATCH_DELAY=<seconds>: arm only after that long -- a dword on a
++     * page the boot writes constantly (the main thread's stack) would
++     * otherwise single-step the whole boot. */
++    {
++        const char *dv = getenv("RECOMP_WATCH_DELAY");
++        if (dv && *dv)
++            Sleep((DWORD)(atof(dv) * 1000.0));
++    }
+     for (tries = 0; tries < 15000u && !g_watch_page; tries++) {
+         uint32_t va;
+         if (watch_resolve(&va) && watch_arm(va))
+@@ -2188,7 +2196,7 @@ void xbox_WatchInit(void)
+     if (*endp == '+')
+         g_watch_off = (uint32_t)strtoul(endp + 1, NULL, 0);
+ 
+-    if (g_watch_derefs) {
++    if (g_watch_derefs || getenv("RECOMP_WATCH_DELAY")) {
+         fprintf(stderr, "  WATCH: resolving %u-deep chain from 0x%08X "
+                         "+0x%X\n", g_watch_derefs, g_watch_root, g_watch_off);
+         CloseHandle(CreateThread(NULL, 0, watch_resolver, NULL, 0, NULL));
+@@ -2240,6 +2248,16 @@ static int watch_arm(uint32_t va)
+     return 1;
+ }
+ 
++/* Arm the watch from running code -- a tool that has just found an address
++ * (a memory scan of a heap the allocator lays out differently every run)
++ * hands it here, in the same run. One watch at a time; 0 if one is armed. */
++int xbox_WatchArmAt(uint32_t va)
++{
++    if (g_watch_page || g_memory_base == NULL)
++        return 0;
++    return watch_arm(va);
++}
++
+ /* Print the RECOMP_PEEK globals. Shared, because the two moments worth
+  * sampling are a hang and an early exit, and only the first had it: a title
+  * whose main() returns during init never reaches the watchdog, so the one
+@@ -4175,6 +4193,16 @@ int xbox_ContiguousFree(uint32_t va)
      g_contig_frees++;
      contig_report("free", va, n);
      contig_unlock();
@@ -3768,7 +4019,7 @@ index 362cefe..d1434f5 100644
      return 1;
  }
  
-@@ -4459,6 +4469,20 @@ uint32_t xbox_HeapBlockSize(uint32_t xbox_va)
+@@ -4459,6 +4487,20 @@ uint32_t xbox_HeapBlockSize(uint32_t xbox_va)
      return r;
  }
  
@@ -3789,6 +4040,19 @@ index 362cefe..d1434f5 100644
  void xbox_HeapFree(uint32_t xbox_va)
  {
      static int frees = 0, matched = 0;
+diff --git a/src/kernel/xbox_memory_layout.h b/src/kernel/xbox_memory_layout.h
+index 14eee45..fe71631 100644
+--- a/src/kernel/xbox_memory_layout.h
++++ b/src/kernel/xbox_memory_layout.h
+@@ -269,6 +269,8 @@ void xbox_WatchdogStart(void);
+  * RECOMP_PEEK is unset. Called at a hang and at an early exit. */
+ void xbox_PeekSample(const char *label);
+ void xbox_WatchInit(void);
++/* Arm the write watch on va now (one at a time; 0 when one is armed). */
++int xbox_WatchArmAt(uint32_t va);
+ 
+ /* ================================================================
+  * Xbox stack for recompiled code
 diff --git a/src/usb/ohci.c b/src/usb/ohci.c
 index d45d8bb..2fde8dc 100644
 --- a/src/usb/ohci.c
@@ -7494,6 +7758,70 @@ index 0000000..8789af6
 +void xbox_D3D11BackendInstall(void) { }
 +
 +#endif
+diff --git a/templates/new-game/src/recomp_manual.c b/templates/new-game/src/recomp_manual.c
+index a8de77d..f43c33d 100644
+--- a/templates/new-game/src/recomp_manual.c
++++ b/templates/new-game/src/recomp_manual.c
+@@ -111,18 +111,50 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va)
+  * During early bring-up you will see many of these. Most are harmless
+  * (the ICALL macro pops the dummy return address and continues).
+  * Focus on the ones that cause crashes or incorrect behavior.
++ *
++ * Rate-limited per address, like recomp_icall_not_code_log below: reported
++ * at 1, 10, 100, 1000 ... calls, with the recent targets on the first. A
++ * vtable method missing from the dispatch table fails every frame, and
++ * printing all 18 lines each time cost MechAssault 2 half its frame rate in
++ * combat: ~18,000 lines a second, one WriteFile each (stderr is unbuffered),
++ * on the thread running the game. The addresses are what tools.seed_from_log
++ * needs, and the first line per address carries them.
+  */
+ void recomp_icall_fail_log(uint32_t va)
+ {
+-    fprintf(stderr, "[ICALL] Failed to resolve VA 0x%08X (total calls: %llu)\n",
+-            va, (unsigned long long)g_icall_count);
+-
+-    /* Dump last 16 call targets from the ring buffer */
+-    fprintf(stderr, "  Recent ICALL targets:\n");
+-    for (int i = 0; i < 16; i++) {
+-        int idx = (g_icall_trace_idx - 16 + i) & 15;
+-        if (g_icall_trace[idx])
+-            fprintf(stderr, "    [%2d] 0x%08X\n", i, g_icall_trace[idx]);
++    enum { SLOTS = 64 };
++    static uint32_t seen[SLOTS];
++    static uint64_t hits[SLOTS + 1];    /* [SLOTS]: addresses past the table */
++    static int count;
++    uint64_t n;
++    int i, c = count;
++
++    /* Unlocked, like the logger below: two threads failing at once may
++     * share a slot or miss a count, but every index stays in bounds. */
++    for (i = 0; i < c && seen[i] != va; i++)
++        ;
++    if (i == c && c < SLOTS) {
++        seen[c] = va;
++        count = c + 1;
++    }
++    n = ++hits[i];
++    while (n >= 10 && n % 10 == 0)
++        n /= 10;
++    if (n != 1)
++        return;
++
++    fprintf(stderr, "[ICALL] Failed to resolve VA 0x%08X -- %llu time(s)%s (total calls: %llu)\n",
++            va, (unsigned long long)hits[i], i == SLOTS ? " (all addresses past the first 64)" : "",
++            (unsigned long long)g_icall_count);
++
++    if (hits[i] == 1) {
++        /* Dump last 16 call targets from the ring buffer */
++        fprintf(stderr, "  Recent ICALL targets:\n");
++        for (int k = 0; k < 16; k++) {
++            int idx = (g_icall_trace_idx - 16 + k) & 15;
++            if (g_icall_trace[idx])
++                fprintf(stderr, "    [%2d] 0x%08X\n", k, g_icall_trace[idx]);
++        }
+     }
+     fflush(stderr);
+ }
 diff --git a/tools/recomp/lifter.py b/tools/recomp/lifter.py
 index baf1834..b13ffe0 100644
 --- a/tools/recomp/lifter.py
