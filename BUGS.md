@@ -11,6 +11,12 @@ have one. Fixed bugs move to MODLOG.md.
   at the horizon. Suspect the water's bump-environment-mapped stage (the NV2A
   texture-shader modes) or a reflection render target, possibly the same
   cause as the odd reflections below.
+  **Fix in, needs your test** (toolkit bc8bf7f, 2026-10-19): the bump-map
+  and dot-product texture stages, which used to read black, now sample. No
+  test save reaches water, so it is unchecked there. Please look at the same
+  water; if it is wrong in a new way, `set RECOMP_D3D11_DOT=0` before
+  starting brings the old black back (compare), and logs\last_stderr.txt
+  has a "(BUMPENVMAP...): ... matrix" line with the numbers the water used.
 - **Speech may still be too quiet under combat** (user, 2026-10-19: "speech
   is better but still quieter than intended, or the combat sounds overpower
   the voices"). The radio speech now plays at unity through its FX send
