@@ -5,6 +5,16 @@ have one. Fixed bugs move to MODLOG.md.
 
 ## Open
 
+- **Lighting/lightmaps wrong after a mission-complete level transition**
+  (screenshot analysis/bug_level_transition_lighting.webp, 2026-10-19). Only
+  when the next level is reached by finishing a mission, not otherwise:
+  surfaces look wrongly lit. The new level loads into memory the old one
+  used. Textures are re-hashed every frame (nv2a_d3d11.c tex_get_decoded),
+  so stale texture bytes are unlikely; suspect state keyed by address that
+  outlives the level -- a render target the old level drew into at an
+  address the new level fills with a texture (rt_alias), a palette (keyed by
+  address, not content), or vertex-program constants. Possibly related to
+  the dark lighting later in the first jump-jet level (streamed sections).
 - **Water draws black** (night level by the water with a wrecked ship;
   screenshot analysis/bug_water_black.webp, 2026-10-19). The water surface is
   solid black, and a bright grainy white band (spray or mist?) lies across it
