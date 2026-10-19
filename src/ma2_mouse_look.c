@@ -14,11 +14,21 @@
  * driving the stick turned late, by nothing for a small move, and never
  * faster than 180 deg/s.
  *
- * So after those two calls the mouse turns the heading itself:
- * mkb_mouse_look_take() hands over the degrees the mouse moved sideways
- * since the last frame (look_deg per count, times sens, from mkb.ini), and
- * while this keeps asking, sideways mouse movement no longer moves the Look
- * stick -- the rate the game sets comes from the pad alone.
+ * The heading is not the whole of it. The player's walker (the camera list's
+ * active entity) keeps the aim, walker+0x12C -- where the mech looks; a copy
+ * of the heading when standing or walking ahead, its own when strafing or on
+ * a diagonal, where the legs turn toward the way the mech moves -- and the
+ * camera's yaw, walker+0x130, which chases the aim at about 400 deg/s. And
+ * the two stick turns above are skipped when strafing or on a diagonal.
+ *
+ * So the mouse turns all three at once, from the pitch hook below, which the
+ * pilot runs every frame however it moves: mkb_mouse_look_take() hands over
+ * the degrees the mouse moved since the last frame (look_deg per count, times
+ * sens, from mkb.ini); aim, camera yaw and heading (the body named by the
+ * last stick turn, when it stands at this walker) each get them, so nothing
+ * chases and the legs keep their angle to the aim. While this keeps asking,
+ * mouse movement no longer moves the Look stick -- the rates the game sets
+ * come from the pad alone.
  *
  * Up/down is the walker's look pitch, walker+0x144, in degrees (0 level,
  * positive looking down), integrated by sub_00120EBD: pitch += input *
@@ -144,56 +154,63 @@ static void look_cam_dump(int moving)
 #define MA2_TURN_WALKING    0x001739C5u   /* in sub_00172E96 */
 #define MA2_BODY_RATE_SET   0x40u         /* the setter's this, from the body */
 #define MA2_BODY_HEADING    0x64u         /* degrees, unwrapped */
-#define MA2_WALKER_CAM_TARGET 0x12Cu      /* heading the camera aims at */
+#define MA2_BODY_POS        0x44u         /* x, y, z */
+#define MA2_WALKER_NODE     0x78u         /* scene node; its +0x38 is x, y, z */
+#define MA2_WALKER_CAM_TARGET 0x12Cu      /* the aim: heading the camera aims at */
 #define MA2_WALKER_CAM_YAW    0x130u      /* the camera's yaw, degrees */
 
+/* The pilot's body, as its stick turns last saw it (0 = not yet). */
+static uint32_t s_body;
+
+/* sub_0006C790 wrapper: the pilot's two stick turns name the body. */
 void ma2_mouse_look_rate_set(uint32_t ret, uint32_t comp, float rate)
 {
-    static int mode = -1, dbg, shown;
     uint32_t body;
-    float yaw, before;
-
+    (void)rate;
     if (ret != MA2_TURN_STANDING && ret != MA2_TURN_WALKING)
         return;
-    if (mode < 0) {
-        const char *e = getenv("MA2_MOUSE_LOOK");
-        mode = !(e && *e == '0');
-        dbg = getenv("MA2_LOOK_DEBUG") != NULL;
-    }
     body = comp - MA2_BODY_RATE_SET;
-    if (!mode || body < 0x10000u || body >= 0x04000000u)
-        return;
-    if (!mkb_mouse_look_take(&yaw, NULL))
-        return;
-    look_trace('y', yaw);
-    look_cam_dump(yaw != 0.0f);
-    if (yaw == 0.0f)
-        return;
-    before = LOOK_MEMF(body + MA2_BODY_HEADING);
-    LOOK_MEMF(body + MA2_BODY_HEADING) = before + yaw;
-    /* The camera turns with it. The walker keeps the heading it is aiming
-     * the camera at (walker+0x12C) and the camera's own yaw (walker+0x130,
-     * degrees), and moves the second toward the first at about 400 deg/s:
-     * a flick turned the mech at once and the view a quarter of a second
-     * later. The same turn on both leaves no gap to chase. The walker is the
-     * player entity the camera follows (the camera list's active entry);
-     * it is this body's when the heading it aims at is this body's heading
-     * as it stood before the turn. */
-    {
-        uint32_t walker = ma2_active_camera();
-        if (walker && fabsf(LOOK_MEMF(walker + MA2_WALKER_CAM_TARGET) - before) < 0.01f) {
-            LOOK_MEMF(walker + MA2_WALKER_CAM_TARGET) += yaw;
-            LOOK_MEMF(walker + MA2_WALKER_CAM_YAW) += yaw;
-        } else if (dbg && shown < 2000) {
-            fprintf(stderr, "[LOOK] camera not locked: walker %08X target %g heading %g\n",
-                    walker, walker ? LOOK_MEMF(walker + MA2_WALKER_CAM_TARGET) : 0.0f, before);
-        }
-    }
-    if (dbg && shown < 2000) {
+    if (body >= 0x10000u && body < 0x04000000u)
+        s_body = body;
+}
+
+/* Is this body the walker's? Its scene node sits at the body, offset by the
+ * camera's orbit (about 10 units): within 40 is the same mech. */
+static int body_is_walkers(uint32_t body, uint32_t walker)
+{
+    uint32_t node = LOOK_MEM32(walker + MA2_WALKER_NODE);
+    float dx, dz;
+    if (!body || node < 0x10000u || node >= 0x04000000u)
+        return 0;
+    dx = LOOK_MEMF(body + MA2_BODY_POS) - LOOK_MEMF(node + 0x38);
+    dz = LOOK_MEMF(body + MA2_BODY_POS + 8) - LOOK_MEMF(node + 0x40);
+    return dx * dx + dz * dz < 40.0f * 40.0f;
+}
+
+/* The sideways mouse turn, once a frame from the pitch hook below (which the
+ * pilot runs in every way of moving; the stick turns above are skipped when
+ * strafing or moving diagonally). Three angles move together:
+ *  - walker+0x12C, the aim: where the mech looks and the camera points.
+ *    Standing or walking ahead it is a copy of the body's heading; strafing
+ *    or on a diagonal the body's legs turn toward the way it moves (the
+ *    heading is the aim plus that angle, 90 strafing) and the aim is its own.
+ *  - walker+0x130, the camera's yaw, which chases the aim at ~400 deg/s.
+ *  - body+0x64, the heading (legs), so the legs keep their angle to the aim.
+ * Turned together there is no gap for either to chase. */
+static void look_turn(uint32_t walker, float yaw, int dbg)
+{
+    static int shown;
+    float aim = LOOK_MEMF(walker + MA2_WALKER_CAM_TARGET);
+    int legs = body_is_walkers(s_body, walker);
+    LOOK_MEMF(walker + MA2_WALKER_CAM_TARGET) = aim + yaw;
+    LOOK_MEMF(walker + MA2_WALKER_CAM_YAW) += yaw;
+    if (legs)
+        LOOK_MEMF(s_body + MA2_BODY_HEADING) += yaw;
+    if (dbg && shown < 4000) {
         shown++;
-        fprintf(stderr, "[LOOK] %s body %08X rate %g yaw %+.3f heading %.3f\n",
-                ret == MA2_TURN_WALKING ? "walking " : "standing", body, rate, yaw,
-                LOOK_MEMF(body + MA2_BODY_HEADING));
+        fprintf(stderr, "[LOOK] turn walker %08X yaw %+.3f aim %.3f heading %.3f%s\n",
+                walker, yaw, aim + yaw, legs ? LOOK_MEMF(s_body + MA2_BODY_HEADING) : 0.0f,
+                legs ? "" : " (body not known: aim only)");
     }
 }
 
@@ -206,7 +223,7 @@ void ma2_mouse_look_rate_set(uint32_t ret, uint32_t comp, float rate)
 void ma2_mouse_look_pitch(uint32_t ret, uint32_t walker, float input)
 {
     static int mode = -1, dbg, shown;
-    float up, p, lo, hi;
+    float yaw, up, p, lo, hi;
 
     if (ret != MA2_PITCH_PILOT)
         return;
@@ -217,9 +234,13 @@ void ma2_mouse_look_pitch(uint32_t ret, uint32_t walker, float input)
     }
     if (!mode || walker < 0x10000u || walker >= 0x04000000u)
         return;
-    if (!mkb_mouse_look_take(NULL, &up))
+    if (!mkb_mouse_look_take(&yaw, &up))
         return;
+    look_trace('y', yaw);
     look_trace('p', up);
+    look_cam_dump(yaw != 0.0f);
+    if (yaw != 0.0f)
+        look_turn(walker, yaw, dbg);
     lo = LOOK_MEMF(walker + MA2_PITCH_MIN);
     hi = LOOK_MEMF(walker + MA2_PITCH_MAX);
     p = LOOK_MEMF(walker + MA2_PITCH);
