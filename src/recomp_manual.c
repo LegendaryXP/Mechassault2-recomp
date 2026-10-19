@@ -107,6 +107,7 @@ extern ptrdiff_t g_xbox_mem_offset;
 #define MA2_MEM32(va) (*(volatile uint32_t *)((uint8_t *)g_xbox_mem_offset + (va)))
 
 extern void sub_0040F510_gen(void);
+extern void sub_0040F220(void);        /* D3D InsertFence(flags) */
 extern void nv2a_pb_set_semaphore_target(uint32_t guest_va);
 
 extern volatile uint32_t *xbox_Nv2aRegPtr(uint32_t offset);
@@ -189,6 +190,19 @@ void sub_0040F510(void)
             volatile uint32_t *get = xbox_Nv2aRegPtr(0x800044u);
             volatile uint32_t *latch = xbox_Nv2aRegPtr(0x400B10u);
             int ms, idle_ms = 0;
+
+            /* fence == seq: a fence D3D has not inserted yet. The original
+             * inserts and kicks it at 0x0040F538 (InsertFence(0): the
+             * semaphore release with value seq, seq += 2, KickOff); waiting
+             * before that could only end by the idle timeout below, ~20 ms at
+             * every load. Insert it the same way first, so the wait is for a
+             * release that is in flight. stdcall, ret 4; eax/ecx/edx are
+             * clobbered, as in the original. */
+            if (fence == MA2_MEM32(dev + 0x2C) && !ma2_fence_done(dev, sem, fence)) {
+                g_esp -= 4; MA2_MEM32(g_esp) = 0;
+                g_esp -= 4; MA2_MEM32(g_esp) = 0x0040F53Fu;
+                sub_0040F220();
+            }
 
             /* Wait here rather than in the lifted loop, which never looks
              * again once the executor has gone idle: up to 2 s, forcing the
