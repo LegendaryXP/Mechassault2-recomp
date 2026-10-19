@@ -24,10 +24,10 @@
  * So the mouse turns all three at once, from the pitch hook below, which the
  * pilot runs every frame however it moves: mkb_mouse_look_take() hands over
  * the degrees the mouse moved since the last frame (look_deg per count, times
- * sens, from mkb.ini); aim, camera yaw and the headings of the bodies the
- * stick turns (the mech's [mech+0x8C], and its second body at mech+0x2B8 on
- * mechs that have one -- look_bodies) each get them, so nothing chases and
- * the legs keep their angle to the aim. While this keeps asking,
+ * sens, from mkb.ini); aim, camera yaw and the heading of the body the
+ * stick turns (the mech's [mech+0x8C], or on some mechs its second body at
+ * mech+0x2B8 -- look_bodies) each get them, so nothing chases and the legs
+ * keep their angle to the aim. While this keeps asking,
  * mouse movement no longer moves the Look stick -- the rates the game sets
  * come from the pad alone.
  *
@@ -231,7 +231,7 @@ static int body_is_walkers(uint32_t body, uint32_t walker)
 static uint32_t s_pilot_cam, s_pilot_mech;
 
 #define MA2_MECH_BODY       0x8Cu     /* [mech+0x8C]: the body the legs stand on */
-#define MA2_MECH_FLAGS_HI   0x26Cu    /* bit 30: stick turns the second body */
+#define MA2_MECH_FLAGS_HI   0x26Cu    /* bit 10: stick turns the second body */
 #define MA2_MECH_BODY2_ON   0x400u    /* nonzero: the mech has the second body */
 #define MA2_MECH_BODY2      0x2B8u    /* mech+0x2B8: second body, same layout */
 
@@ -267,15 +267,17 @@ static int s_veh_kind;
 #define MA2_BODY_CMD_HEADING 0xA0u    /* the controller's heading (+0x7C block) */
 #define MA2_BODY_CMD_RATE   0xB0u     /* the controller's yaw rate */
 
-/* The headings the Look stick can turn. sub_00172E96 turns the body at
- * [mech+0x8C] (through sub_001002A3 standing, inline walking), and through
- * the mech's vtable +0x270 (sub_00100228) a second body embedded at
- * mech+0x2B8, when mech+0x400 is set; a per-mech flag (mech+0x26C bit 30)
- * sends the stick to the second one only. Both get the mouse's turn, so
- * neither lags behind the aim, whichever the flag picks. In play the second
- * body's heading read as the torso's twist from the legs (body + second =
- * aim, held at +-45), which the game keeps up itself. Before the pilot's
- * update has named the mech, the body the stick-turn wrapper saw last is
+/* The heading the Look stick turns. sub_00172E96 turns the body at
+ * [mech+0x8C] (through sub_001002A3 standing, inline walking) and sets the
+ * second body's rate to 0 -- a body embedded at mech+0x2B8, when mech+0x400
+ * is set, turned through the mech's vtable +0x270 (sub_00100228); with
+ * mech+0x26C bit 10 set the stick turns that second body instead
+ * (0x0017374F). The second body's heading is the torso's twist from the
+ * legs, and the camera aims at the sum (body + second = aim, sub_0011F506
+ * through the mech's vt+0x19C, sub_00100CE0); the game unwinds the twist
+ * into the legs by itself. So the mouse turns one of them, the one the
+ * stick would: turning both turned the aim twice the mouse's angle. Before
+ * the pilot has named the mech, the body the stick-turn wrapper saw last is
  * used, while it stands at this camera. In a vehicle *a is what it turns
  * (s_veh_kind above): the turret's body on a tank, else its body. */
 static int look_bodies(uint32_t walker, uint32_t *a, uint32_t *b, int *flag)
@@ -297,11 +299,11 @@ static int look_bodies(uint32_t walker, uint32_t *a, uint32_t *b, int *flag)
         uint32_t body = LOOK_MEM32(mech + MA2_MECH_BODY);
         if (look_va_ok(body))
             *a = body;
-        if (LOOK_MEM32(mech + MA2_MECH_BODY2_ON))
+        *flag = (int)((LOOK_MEM32(mech + MA2_MECH_FLAGS_HI) >> 10) & 1u);
+        if (LOOK_MEM32(mech + MA2_MECH_BODY2_ON) && *flag) {
             *b = mech + MA2_MECH_BODY2;
-        if (*b == *a)
-            *b = 0;
-        *flag = (int)((LOOK_MEM32(mech + MA2_MECH_FLAGS_HI) >> 30) & 1u);
+            *a = 0;
+        }
     } else if (body_is_walkers(s_body, walker)) {
         *a = s_body;
     }
