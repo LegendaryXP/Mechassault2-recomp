@@ -487,8 +487,41 @@ index e725646..ef7947b 100644
  
      wfx.wFormatTag      = WAVE_FORMAT_PCM;
      wfx.nChannels       = XA2_CHANNELS;
+diff --git a/src/d3d/d3d8_swizzle.h b/src/d3d/d3d8_swizzle.h
+index 281b4d2..32e4d68 100644
+--- a/src/d3d/d3d8_swizzle.h
++++ b/src/d3d/d3d8_swizzle.h
+@@ -130,6 +130,28 @@ static inline uint32_t swizzle_offset(uint32_t x, uint32_t y,
+     return swizzle_deposit(x, mask_x) | swizzle_deposit(y, mask_y);
+ }
+ 
++/**
++ * The same for a volume texture: x, y and z take the address bits in turn,
++ * lowest first, each while it still has bits (xemu's generate_swizzle_masks
++ * with a depth). Read as a flat image, a volume's slices interleave into
++ * bands and checkers -- MechAssault 2's smoke puffs came out as striped
++ * squares that way.
++ */
++static inline uint32_t swizzle_offset3(uint32_t x, uint32_t y, uint32_t z,
++                                       uint32_t width, uint32_t height,
++                                       uint32_t depth)
++{
++    uint32_t mx = 0, my = 0, mz = 0, bit = 1, mask_bit = 1;
++
++    while (bit < width || bit < height || bit < depth) {
++        if (bit < width)  { mx |= mask_bit; mask_bit <<= 1; }
++        if (bit < height) { my |= mask_bit; mask_bit <<= 1; }
++        if (bit < depth)  { mz |= mask_bit; mask_bit <<= 1; }
++        bit <<= 1;
++    }
++    return swizzle_deposit(x, mx) | swizzle_deposit(y, my) | swizzle_deposit(z, mz);
++}
++
+ 
+ /**
+  * Unswizzle a texture from Xbox swizzled (Z-order/Morton) layout
 diff --git a/src/input/mkb_input.c b/src/input/mkb_input.c
-index d6f0042..b20959b 100644
+index d6f0042..92d783c 100644
 --- a/src/input/mkb_input.c
 +++ b/src/input/mkb_input.c
 @@ -9,10 +9,14 @@
@@ -735,14 +768,13 @@ index d6f0042..b20959b 100644
 +static volatile LONG s_mouse_btn;    /* 1 L, 2 R, 4 M, 8 X1, 16 X2: held */
 +static volatile LONG s_mouse_tap;    /* pressed since the last poll         */
  static volatile unsigned char s_vk_down[256];
--
--static volatile LONG s_active = 1;   /* F9 toggles this               */
 +static volatile unsigned char s_vk_tap[256];   /* pressed since the last poll */
 +/* RECOMP_MKB_SCRIPT drives the layer instead of the real devices, for
 + * unattended tests on a machine someone is using: real input is ignored,
 + * the cursor is left alone and the foreground check is skipped. */
 +static int s_scripted;
-+
+ 
+-static volatile LONG s_active = 1;   /* F9 toggles this               */
 +/* The mouse is the game's only while locked: it starts free, F9 locks it
 + * (hidden, held at the window's centre, every movement turning the camera),
 + * and F9 again, Esc (the game pauses as well) or leaving the window free
@@ -947,7 +979,7 @@ index d6f0042..b20959b 100644
      }
  }
  
-@@ -356,86 +612,288 @@ static void mkb_aim_vector(double ax, double ay, SHORT *out_x, SHORT *out_y)
+@@ -356,86 +612,414 @@ static void mkb_aim_vector(double ax, double ay, SHORT *out_x, SHORT *out_y)
  
  #define MK_VK(k)  ((unsigned)(k) < 256 && s_vk_down[(k)])
  
@@ -1051,6 +1083,130 @@ index d6f0042..b20959b 100644
 +    return p->down;
 +}
 +
++/* RECOMP_MEMSCAN=<t1>,<t2>,<t3>,<t4>: at those script times (ms, the same
++ * clock as RECOMP_MKB_SCRIPT), snapshot guest RAM 0x10000-0x4000000 as
++ * floats; after the fourth, list every float that moved between 1 and 2,
++ * held between 2 and 3, and moved back by about as much between 3 and 4 --
++ * what an angle does when a script turns one way, waits, and turns back.
++ * For finding the variables a title keeps its camera in. */
++#define MEMSCAN_LO 0x00010000u
++#define MEMSCAN_HI 0x04000000u
++static void mkb_memscan(unsigned long t)
++{
++    static int init, nt, done;
++    static unsigned long at[4];
++    static float *snap[4];
++    extern ptrdiff_t xbox_GetMemoryOffset(void);
++    const size_t n = (MEMSCAN_HI - MEMSCAN_LO) / 4;
++    int k;
++
++    if (!init) {
++        const char *e = getenv("RECOMP_MEMSCAN");
++        char *end;
++        init = 1;
++        while (e && *e && nt < 4) {
++            at[nt++] = strtoul(e, &end, 10);
++            e = (*end == ',') ? end + 1 : NULL;
++        }
++        if (nt != 4)
++            nt = 0;
++    }
++    if (!nt || done)
++        return;
++    for (k = 0; k < 4; k++) {
++        if (snap[k] || t < at[k])
++            continue;
++        snap[k] = (float *)malloc(n * 4);
++        if (snap[k])
++            memcpy(snap[k], (const char *)xbox_GetMemoryOffset() + MEMSCAN_LO, n * 4);
++        fprintf(stderr, "  [MEMSCAN] snapshot %d at t=%lu ms\n", k + 1, t);
++        fflush(stderr);
++    }
++    if (snap[0] && snap[1] && snap[2] && snap[3]) {
++        size_t i, hits = 0;
++        const char *outp = getenv("RECOMP_MEMSCAN_OUT");
++        FILE *out = outp ? fopen(outp, "w") : NULL;
++        done = 1;
++        for (i = 0; i < n; i++) {
++            float a = snap[0][i], b = snap[1][i], c = snap[2][i], d = snap[3][i];
++            float d1 = b - a, d2 = c - b, d3 = d - c;
++            if (!isfinite(a) || !isfinite(b) || !isfinite(c) || !isfinite(d))
++                continue;
++            if (fabsf(a) > 1e5f || fabsf(d1) < 0.02f || fabsf(d2) > 1e-4f * (1 + fabsf(c)))
++                continue;
++            if (fabsf(d1 + d3) > 0.3f * fabsf(d1))
++                continue;
++            if (out)
++                fprintf(out, "T 0x%08X %g %g %g %g\n", (unsigned)(MEMSCAN_LO + i * 4), a, b, c, d);
++            if (hits++ < 400)
++                fprintf(stderr, "  [MEMSCAN] 0x%08X: %g -> %g -> %g -> %g\n",
++                        (unsigned)(MEMSCAN_LO + i * 4), a, b, c, d);
++        }
++        fprintf(stderr, "  [MEMSCAN] %zu candidates\n", hits);
++        /* And what an input value does with snapshots 2 and 4 taken while
++         * the script holds one direction and then the other: at rest (about
++         * 0) in 1 and 3, opposite signs in 2 and 4. */
++        hits = 0;
++        for (i = 0; i < n; i++) {
++            float a = snap[0][i], b = snap[1][i], c = snap[2][i], d = snap[3][i];
++            if (!isfinite(a) || !isfinite(b) || !isfinite(c) || !isfinite(d))
++                continue;
++            if (fabsf(a) > 1e-3f || fabsf(c) > 1e-3f || fabsf(b) < 0.05f || fabsf(b) > 1e4f)
++                continue;
++            if ((b > 0) == (d > 0) || fabsf(b + d) > 0.5f * fabsf(b))
++                continue;
++            if (out)
++                fprintf(out, "I 0x%08X %g %g %g %g\n", (unsigned)(MEMSCAN_LO + i * 4), a, b, c, d);
++            if (hits++ < 200)
++                fprintf(stderr, "  [MEMSCAN-IN] 0x%08X: %g -> %g -> %g -> %g\n",
++                        (unsigned)(MEMSCAN_LO + i * 4), a, b, c, d);
++        }
++        if (out)
++            fclose(out);
++        fprintf(stderr, "  [MEMSCAN-IN] %zu candidates\n", hits);
++        fflush(stderr);
++        for (k = 0; k < 4; k++) { free(snap[k]); snap[k] = NULL; }
++    }
++}
++
++/* RECOMP_MEMPOKE=<t>:<hex addr>:<float>[:<ms>],...: from script time t, add
++ * <float> to the float at that guest address -- once, or spread over <ms>
++ * milliseconds (a steady drift). For proving which variable a camera reads. */
++static void mkb_mempoke(unsigned long last, unsigned long t)
++{
++    static int init, n;
++    static struct { unsigned long at, len; uint32_t addr; float v; } pk[16];
++    extern ptrdiff_t xbox_GetMemoryOffset(void);
++    int k;
++
++    if (!init) {
++        const char *e = getenv("RECOMP_MEMPOKE");
++        char *end;
++        init = 1;
++        while (e && *e && n < 16) {
++            pk[n].at = strtoul(e, &end, 10);
++            if (*end != ':') break;
++            pk[n].addr = (uint32_t)strtoul(end + 1, &end, 16);
++            if (*end != ':') break;
++            pk[n].v = (float)strtod(end + 1, &end);
++            pk[n].len = 0;
++            if (*end == ':')
++                pk[n].len = strtoul(end + 1, &end, 10);
++            n++;
++            e = (*end == ',') ? end + 1 : NULL;
++        }
++    }
++    for (k = 0; k < n; k++) {
++        unsigned long end = pk[k].at + (pk[k].len ? pk[k].len : 1);
++        unsigned long a = last > pk[k].at ? last : pk[k].at, b = t < end ? t : end;
++        float *f;
++        if (b <= a || pk[k].addr < 0x10000u || pk[k].addr >= 0x04000000u)
++            continue;
++        f = (float *)((char *)xbox_GetMemoryOffset() + pk[k].addr);
++        *f += pk[k].len ? pk[k].v * (float)(b - a) / (float)pk[k].len : pk[k].v;
++    }
++}
++
  int mkb_merge(DWORD dwPort, XBOX_INPUT_STATE *pState)
  {
 -    SHORT aim_x = 0, aim_y = 0, mov_x = 0, mov_y = 0;
@@ -1085,7 +1241,10 @@ index d6f0042..b20959b 100644
 +        QueryPerformanceCounter(&c);
 +        now = (unsigned long)(c.QuadPart * 1000 / f.QuadPart);
      }
--
++    if (!t0)
++        t0 = now;
++    t = now - t0;
+ 
 -    /* Foreground gate: while the user is elsewhere the mouse belongs to
 -     * whoever has it, and the game should read a pad at rest. */
 -    if (!game_is_foreground()) {
@@ -1093,10 +1252,6 @@ index d6f0042..b20959b 100644
 -        InterlockedExchange(&s_dx, 0);
 -        InterlockedExchange(&s_dy, 0);
 -        return 0;
-+    if (!t0)
-+        t0 = now;
-+    t = now - t0;
-+
 +    if (!s_scripted) {
 +        /* Foreground gate: while the user is elsewhere the mouse and keys
 +         * belong to whoever has them, and the game reads a pad at rest. */
@@ -1145,7 +1300,9 @@ index d6f0042..b20959b 100644
 +            mkb_script_load();
 +        mkb_script_apply(last_t, t, down, &dx, &dy);
 +    }
++    mkb_mempoke(last_t, t);
 +    last_t = t;
++    mkb_memscan(t);
 +    down[IN_WHEEL_UP]   = (unsigned char)mkb_pulse(&wheel_up, wheel > 0 ? wheel : 0, now);
 +    down[IN_WHEEL_DOWN] = (unsigned char)mkb_pulse(&wheel_dn, wheel < 0 ? -wheel : 0, now);
  
@@ -1339,10 +1496,25 @@ index 664efad..6c0d3ca 100644
  }
  #endif
 diff --git a/src/kernel/kernel.h b/src/kernel/kernel.h
-index 564c0bf..d9979bc 100644
+index 564c0bf..fafd285 100644
 --- a/src/kernel/kernel.h
 +++ b/src/kernel/kernel.h
-@@ -1078,11 +1078,30 @@ NTSTATUS __stdcall xbox_ExSaveNonVolatileSetting(ULONG ValueIndex, ULONG Type, P
+@@ -823,6 +823,14 @@ int     xbox_IrqlBlocksInterrupts(void);
+ int     xbox_IrqlRaisedCount(void);
+ int     xbox_IrqlEnterInterrupt(int level);     /* around host-run ISRs and DPCs */
+ void    xbox_IrqlLeaveInterrupt(int saved);
++/* The atomic form of "is the processor at PASSIVE_LEVEL, and if so, run":
++ * claims it for a host-run ISR or DPC so that no guest thread can raise to
++ * DISPATCH_LEVEL until xbox_IrqlReleaseProcessor. Returns 0 (run it later)
++ * while a thread is raised, unless force is set. */
++int     xbox_IrqlClaimProcessor(int force);
++void    xbox_IrqlReleaseProcessor(void);
++int     xbox_IrqlClaimWaits(void);      /* raises that waited for a claim */
++int     xbox_DpcHeldTicks(void);        /* DPC drains put off by a raise */
+ 
+ /* Total crossings of the DISPATCH boundary, and who is holding it up.
+  * A depth that is non-zero while this stops moving is stuck, not busy. */
+@@ -1078,11 +1086,30 @@ NTSTATUS __stdcall xbox_ExSaveNonVolatileSetting(ULONG ValueIndex, ULONG Type, P
  #define XC_PARENTAL_CONTROL       XC_P_CONTROL_GAMES
  #define XC_PARENTAL_PASSWORD      XC_P_CONTROL_PASSWORD
  
@@ -1377,7 +1549,7 @@ index 564c0bf..d9979bc 100644
  /* Unknown ordinals - stub */
  VOID    __stdcall xbox_Unknown_8(void);
 diff --git a/src/kernel/kernel_bridge.c b/src/kernel/kernel_bridge.c
-index 965dd08..aed1571 100644
+index 965dd08..0b7eb76 100644
 --- a/src/kernel/kernel_bridge.c
 +++ b/src/kernel/kernel_bridge.c
 @@ -44,6 +44,9 @@
@@ -1676,7 +1848,21 @@ index 965dd08..aed1571 100644
          xbox_FramebufferWindowStart();
  
          /* Record the resolved address, not the physical one the title passed.
-@@ -2698,6 +2868,30 @@ static int kernel_raise_interrupt(uint32_t vector)
+@@ -2433,11 +2603,8 @@ static void bridge_HalReadSMCTrayState(void)
+  * interrupt enable and queues here, and the enumeration it should have started
+  * lives entirely in the deferred routine.
+  *
+- * ponytail: runs the routine inline rather than queueing it. A real DPC runs
+- * at DISPATCH_LEVEL shortly after the ISR returns, and this runs it before the
+- * ISR returns, on whichever thread queued it. That ordering difference has not
+- * mattered for anything here yet; when it does, the upgrade is a real queue
+- * drained by the thread that lowered IRQL, not a second call site.
++ * Queued now, and run by the timer thread once it can claim the processor:
++ * see the pending DPC queue and kernel_dpc_claim below.
+  */
+ /* Run a DPC's deferred routine on the calling thread.
+  *
+@@ -2698,6 +2865,30 @@ static int kernel_raise_interrupt(uint32_t vector)
  
  static volatile LONG g_vblank_total;
  
@@ -1707,7 +1893,7 @@ index 965dd08..aed1571 100644
  uint32_t xbox_VblankCount(void)
  {
      return (uint32_t)g_vblank_total;
-@@ -2706,18 +2900,26 @@ uint32_t xbox_VblankCount(void)
+@@ -2706,18 +2897,26 @@ uint32_t xbox_VblankCount(void)
  static void kernel_vblank_tick(void)
  {
      static int enabled = -1;
@@ -1738,9 +1924,87 @@ index 965dd08..aed1571 100644
      InterlockedIncrement(&g_vblank_total);
  
      if (!xbox_GetConnectedInterrupt(NV2A_VECTOR))
-@@ -3023,10 +3225,14 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
+@@ -2760,6 +2959,53 @@ static void kernel_drain_dpcs(void)
+     }
+ }
+ 
++/* DPCs run with the processor claimed (xbox_IrqlClaimProcessor), never beside
++ * a guest thread at DISPATCH_LEVEL.
++ *
++ * On the console a DPC runs only once IRQL has dropped below DISPATCH_LEVEL,
++ * so code that raises to DISPATCH_LEVEL owns everything a DPC touches until it
++ * lowers again. This thread drained the queue whenever it woke, whatever any
++ * other thread was doing, and MechAssault 2's USB stack paid for it: XPP
++ * submits transfers at DISPATCH_LEVEL on the game thread and retires them in
++ * its DPC here, both ends push and pop one unlocked free list of transfer
++ * descriptors, and minutes into a mission a rumble SET_REPORT took a
++ * "descriptor" at 0xFFFFFFFF from it and faulted writing its setup packet
++ * there (sub_0042532E). A drain that cannot claim the processor waits for the
++ * next tick; a raise that lands while the drain runs waits for it to finish.
++ *
++ * Bounded like the device models' hold-off: two seconds without the claim is
++ * a raise that leaked rather than a critical section, and the queue is run
++ * anyway rather than stalling every driver behind it. */
++static volatile LONG g_dpc_held_ticks;
++
++int xbox_DpcHeldTicks(void)
++{
++    return (int)InterlockedCompareExchange(&g_dpc_held_ticks, 0, 0);
++}
++
++static int kernel_dpc_claim(void)
++{
++    static double held_since;
++    static int forced_warned;
++    double t = kernel_now_ms();
++    int force = held_since != 0.0 && t - held_since > 2000.0;
++
++    if (!xbox_IrqlClaimProcessor(force)) {
++        if (held_since == 0.0)
++            held_since = t;
++        InterlockedIncrement(&g_dpc_held_ticks);
++        return 0;
++    }
++    if (force && !forced_warned && xbox_IrqlBlocksInterrupts()) {
++        forced_warned = 1;
++        fprintf(stderr, "  [KERNEL] guest IRQL held for 2 s (depth %d); "
++                "running DPCs anyway\n", xbox_IrqlRaisedCount());
++        fflush(stderr);
++    }
++    held_since = 0.0;
++    return 1;
++}
++
+ /* ── KeInitializeDpc (ordinal 107) ────────────────────────
+  * VOID KeInitializeDpc(PKDPC Dpc, PKDEFERRED_ROUTINE DeferredRoutine,
+  *                       PVOID DeferredContext)
+@@ -2992,6 +3238,20 @@ static XboxTimer g_timers[XBOX_MAX_TIMERS];
+ static CRITICAL_SECTION g_timer_lock;
+ static int g_timer_started;
+ 
++/* Whether any timer with a DPC is due: the timer thread claims the processor
++ * only when there is a DPC to run. */
++static int kernel_timer_dpc_due(long long now)
++{
++    int i, due = 0;
++
++    EnterCriticalSection(&g_timer_lock);
++    for (i = 0; i < XBOX_MAX_TIMERS && !due; i++)
++        due = g_timers[i].timer_va && g_timers[i].dpc_va
++           && now >= g_timers[i].due_ms;
++    LeaveCriticalSection(&g_timer_lock);
++    return due;
++}
++
+ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
+ {
+     int slot = xbox_worker_stack_alloc();
+@@ -3021,12 +3281,23 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
+ 
+     for (;;) {
          long long now;
-         int i;
+-        int i;
++        int i, claimed;
  
 -        Sleep(10);
 +        /* 1 ms (main() raises the timer resolution): vblank, DPCs and
@@ -1749,13 +2013,43 @@ index 965dd08..aed1571 100644
 +         * still does, with the old clock, for comparison). */
 +        Sleep(kernel_timer_coarse() ? 10 : 1);
          kernel_vblank_tick();  /* the GPU's frame clock */
-         kernel_drain_dpcs();   /* deferred work, before due timers */
+-        kernel_drain_dpcs();   /* deferred work, before due timers */
 -        now = (long long)GetTickCount64();
 +        now = (long long)kernel_now_ms();
++        /* Deferred work, before due timers, and only with the processor
++         * claimed: see kernel_dpc_claim. Claimed only when there is a DPC to
++         * run, so an idle tick never makes a raise wait. */
++        claimed = 0;
++        if (g_dpc_head != g_dpc_tail || kernel_timer_dpc_due(now))
++            claimed = kernel_dpc_claim();
++        if (claimed)
++            kernel_drain_dpcs();
  
          for (i = 0; i < XBOX_MAX_TIMERS; i++) {
              uint32_t dpc, fired_va;
-@@ -3083,7 +3289,7 @@ static void kernel_set_timer(uint32_t timer_va, long long due_100ns,
+@@ -3036,6 +3307,12 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
+                 LeaveCriticalSection(&g_timer_lock);
+                 continue;
+             }
++            /* A timer whose DPC cannot run yet stays due for the next tick;
++             * one that only signals waiters fires now. */
++            if (g_timers[i].dpc_va && !claimed) {
++                LeaveCriticalSection(&g_timer_lock);
++                continue;
++            }
+             fired_va = g_timers[i].timer_va;
+             dpc = g_timers[i].dpc_va;
+             if (g_timers[i].period_ms > 0)
+@@ -3058,6 +3335,8 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
+                 }
+             }
+         }
++        if (claimed)
++            xbox_IrqlReleaseProcessor();
+     }
+ }
+ 
+@@ -3083,7 +3362,7 @@ static void kernel_set_timer(uint32_t timer_va, long long due_100ns,
      if (free_slot >= 0) {
          g_timers[free_slot].timer_va  = timer_va;
          g_timers[free_slot].dpc_va    = dpc_va;
@@ -1764,7 +2058,7 @@ index 965dd08..aed1571 100644
          g_timers[free_slot].period_ms = period_ms;
      }
      LeaveCriticalSection(&g_timer_lock);
-@@ -3923,6 +4129,9 @@ static int bridge_handle_is_async(uint32_t token)
+@@ -3923,6 +4202,9 @@ static int bridge_handle_is_async(uint32_t token)
      return 0;
  }
  
@@ -1774,7 +2068,7 @@ index 965dd08..aed1571 100644
  /* Off unless RECOMP_ASYNC_IO is set, so the two behaviours stay comparable
   * rather than one being swapped in blind. */
  static int bridge_async_io_enabled(void)
-@@ -3951,6 +4160,8 @@ static void bridge_NtReadFile(void)
+@@ -3951,6 +4233,8 @@ static void bridge_NtReadFile(void)
          g_eax = 0xC0000005u;                 /* STATUS_ACCESS_VIOLATION */
          return;
      }
@@ -1783,7 +2077,7 @@ index 965dd08..aed1571 100644
      if (offset_va) {
          off.LowPart  = BRIDGE_MEM32(offset_va);
          off.HighPart = (LONG)BRIDGE_MEM32(offset_va + 4);
-@@ -3958,11 +4169,19 @@ static void bridge_NtReadFile(void)
+@@ -3958,11 +4242,19 @@ static void bridge_NtReadFile(void)
      }
      g_eax = (uint32_t)xbox_NtReadFile(handle, NULL, NULL, NULL, &ios,
                  XBOX_TO_NATIVE(buffer_va), length, poff);
@@ -1805,7 +2099,7 @@ index 965dd08..aed1571 100644
          const uint8_t *p = (const uint8_t *)XBOX_TO_NATIVE(buffer_va);
          uint32_t got = (uint32_t)ios.Information;
          /* The offset matters as much as the length. A title streaming a pack
-@@ -3985,9 +4204,35 @@ static void bridge_NtReadFile(void)
+@@ -3985,9 +4277,35 @@ static void bridge_NtReadFile(void)
                      got > 2 ? p[2] : 0, got > 3 ? p[3] : 0);
          fflush(stderr);
      }
@@ -1841,7 +2135,7 @@ index 965dd08..aed1571 100644
  
      /* An asynchronous request returns STATUS_PENDING, even when the data was
       * already there.
-@@ -4036,6 +4281,20 @@ static void bridge_NtWriteFile(void)
+@@ -4036,6 +4354,20 @@ static void bridge_NtWriteFile(void)
      bridge_write_iostatus(iostatus, ios.Status, (uint32_t)ios.Information);
      bridge_complete_file_io(STACK_ARG(1), STACK_ARG(2), STACK_ARG(3),
                              iostatus);
@@ -1862,7 +2156,7 @@ index 965dd08..aed1571 100644
  }
  
  /* ── NtQueryInformationFile (ordinal 211, 5 args = 20 bytes) */
-@@ -8449,7 +8708,7 @@ static void bridge_PsCreateSystemThread(void)
+@@ -8449,7 +8781,7 @@ static void bridge_PsCreateSystemThread(void)
                      bridge_run_thread_inline(fn, start_context1, start_context2);
                  } else {
                      bridge_spawn_guest_thread(fn, start_context1, start_context2,
@@ -1871,7 +2165,7 @@ index 965dd08..aed1571 100644
                  }
              }
          } else {
-@@ -10041,6 +10300,91 @@ static void kernel_thunk_dispatch(void)
+@@ -10041,6 +10373,91 @@ static void kernel_thunk_dispatch(void)
      (void)held;
  }
  
@@ -1963,7 +2257,7 @@ index 965dd08..aed1571 100644
  static void kernel_thunk_dispatch_body(void)
  {
      int slot = g_kernel_dispatch_slot;
-@@ -10147,7 +10491,19 @@ static void kernel_thunk_dispatch_body(void)
+@@ -10147,7 +10564,19 @@ static void kernel_thunk_dispatch_body(void)
          }
      }
  
@@ -1985,10 +2279,103 @@ index 965dd08..aed1571 100644
      } else {
          /* No specific bridge - return 0. Warn once per ordinal rather than
 diff --git a/src/kernel/kernel_hal.c b/src/kernel/kernel_hal.c
-index 3a09ca8..e09d521 100644
+index 3a09ca8..7c8547f 100644
 --- a/src/kernel/kernel_hal.c
 +++ b/src/kernel/kernel_hal.c
-@@ -733,10 +733,24 @@ VOID __stdcall xbox_AvSendTVEncoderOption(
+@@ -93,6 +93,82 @@ int xbox_IrqlRaisedCount(void)
+     return (int)InterlockedCompareExchange(&g_irql_raised_count, 0, 0);
+ }
+ 
++/* The host thread running guest code that would have the processor to itself
++ * on the console -- an ISR, or the DPC queue -- or 0.
++ *
++ * Asking xbox_IrqlBlocksInterrupts and then running the routine is a check and
++ * an act with a gap between them, and the DPC drain did not even check. A
++ * guest thread could raise to DISPATCH_LEVEL at any point while a DPC ran, and
++ * then both were inside the driver at once. On the console that cannot happen:
++ * one processor, and a DPC never runs while code is at DISPATCH_LEVEL.
++ * MechAssault 2's USB stack (XPP) depends on exactly that. It submits transfers
++ * at DISPATCH_LEVEL on the game thread and its DPC retires them on the timer
++ * thread here, and both push and pop one free list of transfer descriptors
++ * with no lock. Run concurrently, the list lost a link and a submit wrote its
++ * setup packet through 0xFFFFFFFF.
++ *
++ * So the gate is two-sided. A host thread claims this, then checks the depth;
++ * a raising thread bumps the depth, then waits while someone else holds this.
++ * Both steps are interlocked, so whichever comes second sees the other: either
++ * the routine is held back, or the raise waits for it to return. */
++static volatile LONG g_irq_owner = 0;
++static volatile LONG s_irq_waits = 0;
++extern RECOMP_TLS uint32_t g_esp;
++
++static void irql_wait_for_claim(void)
++{
++    LONG me = (LONG)GetCurrentThreadId();
++    LONG owner = InterlockedCompareExchange(&g_irq_owner, 0, 0);
++
++    if (!owner || owner == me)
++        return;
++    /* Named for the first few. The guest stack pointer says whose thread it
++     * is (the lifter's return addresses on the guest stack do not). */
++    if (InterlockedIncrement(&s_irq_waits) <= 8) {
++        fprintf(stderr, "  [IRQL] tid %lu raise (guest esp %08X) waited for "
++                "tid %ld's ISR/DPC\n", (unsigned long)me, g_esp, (long)owner);
++        fflush(stderr);
++    }
++    /* The routine is short, and it never waits on a thread that is only now
++     * raising: on hardware that thread would not be running at all. */
++    while ((owner = InterlockedCompareExchange(&g_irq_owner, 0, 0)) != 0
++           && owner != me)
++        SwitchToThread();
++}
++
++/* Claim the processor for an ISR or the DPC queue on this host thread.
++ *
++ * Fails while any thread is at DISPATCH_LEVEL or above, or while another host
++ * thread holds the claim. `force` skips the depth check only: it is for a
++ * caller that has been held back so long that the depth must be a leaked raise
++ * rather than a critical section (see OHCI_IRQ_HOLDOFF), and raises that start
++ * during the forced routine still wait for it. Every success is paired with
++ * xbox_IrqlReleaseProcessor. */
++int xbox_IrqlClaimProcessor(int force)
++{
++    LONG me = (LONG)GetCurrentThreadId();
++
++    if (InterlockedCompareExchange(&g_irq_owner, me, 0) != 0)
++        return 0;
++    if (!force && InterlockedCompareExchange(&g_irql_raised_count, 0, 0) != 0) {
++        InterlockedExchange(&g_irq_owner, 0);
++        return 0;
++    }
++    return 1;
++}
++
++void xbox_IrqlReleaseProcessor(void)
++{
++    InterlockedExchange(&g_irq_owner, 0);
++}
++
++/* Raises that had to wait for a claimed ISR or DPC to return. Each one is a
++ * DISPATCH_LEVEL section that used to run alongside it. */
++int xbox_IrqlClaimWaits(void)
++{
++    return (int)InterlockedCompareExchange(&s_irq_waits, 0, 0);
++}
++
+ static int  s_trace = -1;
+ static volatile LONG s_traced = 0;
+ 
+@@ -179,6 +255,9 @@ static void irql_track(KIRQL old_level, KIRQL new_level, void *ra)
+ 
+     d = now ? InterlockedIncrement(&g_irql_raised_count)
+             : InterlockedDecrement(&g_irql_raised_count);
++    /* After the increment, never before: see g_irq_owner. */
++    if (now)
++        irql_wait_for_claim();
+     InterlockedIncrement(&s_transitions);
+     if (now)
+         irql_holder_add(ra);
+@@ -733,10 +812,24 @@ VOID __stdcall xbox_AvSendTVEncoderOption(
           *
           * HDTV pack keeps 480p/720p available to titles that offer them;
           * NTSC-M and 60Hz are the North American retail default, and match
@@ -2017,7 +2404,7 @@ index 3a09ca8..e09d521 100644
          break;
  
      case AV_OPTION_QUERY_MODE:
-@@ -1060,6 +1074,70 @@ uint64_t xbox_ReadTimeStampCounter(void)
+@@ -1060,6 +1153,70 @@ uint64_t xbox_ReadTimeStampCounter(void)
      }
  }
  
@@ -2191,7 +2578,7 @@ index 4ebdfb9..4e2a872 100644
              if (ResultLength) *ResultLength = sizeof(ULONG);
          }
 diff --git a/src/kernel/nv2a_backend.h b/src/kernel/nv2a_backend.h
-index 327f01d..b509c37 100644
+index 327f01d..fe80235 100644
 --- a/src/kernel/nv2a_backend.h
 +++ b/src/kernel/nv2a_backend.h
 @@ -20,6 +20,12 @@
@@ -2230,7 +2617,7 @@ index 327f01d..b509c37 100644
  } Nv2aSurface;
  
  /* A texture as the title programmed it. uv in Nv2aVertex are in texels. */
-@@ -51,6 +66,10 @@ typedef struct {
+@@ -51,6 +66,13 @@ typedef struct {
       * a linear texture) and the raw SET_TEXTURE_FILTER word (MIN in bits
       * 16-23). A back end that ignores them samples level 0. */
      uint32_t levels, filter;
@@ -2238,10 +2625,13 @@ index 327f01d..b509c37 100644
 +     * a palettised format, and whether uv is normalised (swizzled and DXT
 +     * formats) or in texels (linear formats). */
 +    uint32_t cube, face_stride, palette, normalized;
++    /* Extended: slices of a volume texture (DIMENSIONALITY 3), 1 for 2D; a
++     * volume has one level. 0 reads as 1. */
++    uint32_t depth;
  } Nv2aTexture;
  
  typedef struct {
-@@ -58,6 +77,12 @@ typedef struct {
+@@ -58,6 +80,12 @@ typedef struct {
      float    rhw;               /* 1/w, 1 for pre-transformed batches */
      uint32_t diffuse;           /* 0xAARRGGBB */
      float    u, v;              /* texels */
@@ -2254,7 +2644,7 @@ index 327f01d..b509c37 100644
  } Nv2aVertex;
  
  /* Render state as the title set it, in NV2A's own (OpenGL) enum values:
-@@ -80,6 +105,8 @@ typedef struct {
+@@ -80,6 +108,8 @@ typedef struct {
       * that ignores these draws that pass over the whole surface. */
      uint32_t stencil_enable, stencil_func, stencil_ref, stencil_func_mask;
      uint32_t stencil_write_mask, stencil_fail, stencil_zfail, stencil_zpass;
@@ -2263,7 +2653,7 @@ index 327f01d..b509c37 100644
  } Nv2aRenderState;
  
  typedef struct {
-@@ -87,15 +114,63 @@ typedef struct {
+@@ -87,15 +117,63 @@ typedef struct {
      uint32_t           count;
      const Nv2aTexture *texture;     /* NULL: untextured */
      const Nv2aRenderState *state;
@@ -2327,24 +2717,41 @@ index 327f01d..b509c37 100644
  } Nv2aBackend;
  
  /* Register (or, with NULL, remove) the back end. Call before the title starts
-@@ -107,6 +182,12 @@ void nv2a_backend_register(const Nv2aBackend *backend);
+@@ -106,6 +184,15 @@ void nv2a_backend_register(const Nv2aBackend *backend);
+  * Handles every format the executor can sample (swizzled, linear, DXT).
   * Returns 0 if the format is not supported. */
  int nv2a_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out);
- 
++/* Level 0 of a volume texture (tex->depth > 1): width*height*depth texels,
++ * slice after slice, as nv2a_backend_decode_texture decodes one image. */
++int nv2a_backend_decode_volume(const Nv2aTexture *tex, uint32_t *argb_out);
++
 +/* The guest address of the colour surface the current flip presents. */
 +uint32_t nv2a_backend_present_va(void);
 +
 +/* Size in bytes of level 0 of one face, for hashing texture memory. */
 +uint32_t nv2a_backend_texture_bytes(const Nv2aTexture *tex);
-+
+ 
  /* Where BACK_END_WRITE_SEMAPHORE_RELEASE (0x1D70) values land: the guest VA
   * of the semaphore the title reads GPU progress from (for XDK D3D, the
-  * pointer at device+0x30). The executor writes each release there once it
 diff --git a/src/kernel/nv2a_pb_exec.c b/src/kernel/nv2a_pb_exec.c
-index 1280565..45469e0 100644
+index 1280565..f46baf4 100644
 --- a/src/kernel/nv2a_pb_exec.c
 +++ b/src/kernel/nv2a_pb_exec.c
-@@ -767,6 +767,11 @@ void nv2a_backend_register(const Nv2aBackend *backend)
+@@ -262,9 +262,13 @@ typedef struct {
+     uint32_t levels;                    /* mip levels, from FORMAT       */
+     uint32_t filter;                    /* SET_TEXTURE_FILTER            */
+     int      cube;                      /* FORMAT: six faces, not one    */
++    uint32_t depth;                     /* FORMAT: slices of a volume, 0/1: 2D */
+     int      valid;
+ } Texture;
+ 
++/* The slice of a volume texture sample_tex reads (see swizzle_offset3). */
++static uint32_t s_tex_slice;
++
+ static struct {
+     VertexAttr attr[NV_VERTEX_ATTRS];
+     uint32_t   prim;                    /* SET_BEGIN_END parameter, 0 = ended */
+@@ -767,6 +771,11 @@ void nv2a_backend_register(const Nv2aBackend *backend)
      s_backend = backend;
  }
  
@@ -2356,7 +2763,7 @@ index 1280565..45469e0 100644
  static int backend_draws(void)
  {
      return s_backend && s_backend->draw;
-@@ -781,6 +786,36 @@ static void current_surface(Nv2aSurface *out)
+@@ -781,6 +790,36 @@ static void current_surface(Nv2aSurface *out)
      out->bytes_per_pixel = surface_bpp();
      out->aa_sx           = s_gpu.aa_sx > 1.5f ? 2 : 1;
      out->aa_sy           = s_gpu.aa_sy > 1.5f ? 2 : 1;
@@ -2393,7 +2800,7 @@ index 1280565..45469e0 100644
  }
  
  /* Render state in the NV2A's own values, gathered from what the executor
-@@ -814,6 +849,8 @@ static void current_render_state(Nv2aRenderState *r)
+@@ -814,6 +853,8 @@ static void current_render_state(Nv2aRenderState *r)
      r->stencil_fail      = s_reg[0x0370 / 4];        /* SET_STENCIL_OP_FAIL */
      r->stencil_zfail     = s_reg[0x0374 / 4];        /* SET_STENCIL_OP_ZFAIL */
      r->stencil_zpass     = s_reg[0x0378 / 4];        /* SET_STENCIL_OP_ZPASS */
@@ -2402,7 +2809,7 @@ index 1280565..45469e0 100644
  }
  
  static int sample_texture(uint32_t u, uint32_t v, uint32_t *argb);
-@@ -831,7 +868,7 @@ int nv2a_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out)
+@@ -831,10 +872,11 @@ int nv2a_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out)
      s_gpu.texs[0].color  = tex->color;
      s_gpu.texs[0].addr_u = 3;
      s_gpu.texs[0].addr_v = 3;
@@ -2411,26 +2818,66 @@ index 1280565..45469e0 100644
      s_gpu.texs[0].levels = 1;
      s_gpu.texs[0].filter = 0;
      s_gpu.texs[0].cube   = 0;
-@@ -846,6 +883,18 @@ int nv2a_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out)
++    s_gpu.texs[0].depth  = 1;
+     s_gpu.texs[0].valid  = 1;
+     for (y = 0; y < tex->height && ok; y++)
+         for (x = 0; x < tex->width; x++)
+@@ -846,6 +888,54 @@ int nv2a_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out)
      return ok;
  }
  
++/* Level 0 of a volume texture, slice after slice (width * height * depth
++ * texels, z outermost), through the same per-format decode. */
++int nv2a_backend_decode_volume(const Nv2aTexture *tex, uint32_t *argb_out)
++{
++    Texture saved = s_gpu.texs[0];
++    uint32_t x, y, z;
++    int ok = 1;
++
++    memset(&s_gpu.texs[0], 0, sizeof s_gpu.texs[0]);
++    s_gpu.texs[0].offset = tex->offset;
++    s_gpu.texs[0].width  = tex->width;
++    s_gpu.texs[0].height = tex->height;
++    s_gpu.texs[0].color  = tex->color;
++    s_gpu.texs[0].addr_u = 3;
++    s_gpu.texs[0].addr_v = 3;
++    s_gpu.texs[0].palette = tex->palette;
++    s_gpu.texs[0].levels = 1;
++    s_gpu.texs[0].depth  = tex->depth;
++    s_gpu.texs[0].valid  = 1;
++    for (z = 0; z < tex->depth && ok; z++) {
++        s_tex_slice = z;
++        for (y = 0; y < tex->height && ok; y++)
++            for (x = 0; x < tex->width; x++)
++                if (!sample_texture(x, y, &argb_out[((size_t)z * tex->height + y)
++                                                    * tex->width + x])) {
++                    ok = 0;
++                    break;
++                }
++    }
++    s_tex_slice = 0;
++    s_gpu.texs[0] = saved;
++    return ok;
++}
++
 +/* Bytes of level 0 (one face) of a texture, for a back end that hashes
 + * texture memory to notice when the title rewrites it. */
 +uint32_t nv2a_backend_texture_bytes(const Nv2aTexture *tex)
 +{
 +    uint32_t block = d3d8_format_dxt_block_bytes(tex->color);
 +    if (block)
-+        return ((tex->width + 3) / 4) * ((tex->height + 3) / 4) * block;
++        return ((tex->width + 3) / 4) * ((tex->height + 3) / 4) * block
++             * (tex->depth > 1 ? tex->depth : 1);
 +    if (tex->normalized)
-+        return tex->width * tex->height * tex_texel_bytes(tex->color);
++        return tex->width * tex->height * tex_texel_bytes(tex->color)
++             * (tex->depth > 1 ? tex->depth : 1);
 +    return tex->pitch * tex->height;
 +}
 +
  static void clear_surface(uint32_t param)
  {
      uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
-@@ -1064,6 +1113,8 @@ static uint32_t linear_twin(uint32_t fmt)
+@@ -1064,6 +1154,8 @@ static uint32_t linear_twin(uint32_t fmt)
      case 0x06: return 0x12;                /* A8R8G8B8  -> LIN_A8R8G8B8  */
      case 0x07: return 0x1E;                /* X8R8G8B8  -> LIN_X8R8G8B8  */
      case 0x19: return 0x1F;                /* A8        -> LIN_A8        */
@@ -2439,7 +2886,39 @@ index 1280565..45469e0 100644
      default:   return fmt;                 /* already linear, or unhandled */
      }
  }
-@@ -1200,6 +1251,25 @@ static int sample_tex(const Texture *t, uint32_t face_offset,
+@@ -1094,7 +1186,10 @@ static int sample_tex(const Texture *t, uint32_t face_offset,
+                         uint32_t px[16]; } cache[4096];
+         uint32_t bb = d3d8_format_dxt_block_bytes(fmt);
+         uint32_t bx = u >> 2, by = v >> 2, bw = (t->width + 3) >> 2;
+-        const uint8_t *blk = mem + base + ((size_t)by * bw + bx) * bb;
++        /* A compressed volume is its slices' block images back to back. */
++        size_t slice = t->depth > 1
++                     ? (size_t)s_tex_slice * bw * ((t->height + 3) >> 2) * bb : 0;
++        const uint8_t *blk = mem + base + slice + ((size_t)by * bw + bx) * bb;
+         uintptr_t key = (uintptr_t)blk;
+         size_t slot = ((key / bb) ^ (key >> 16)) & 4095;
+         uint64_t raw[2] = {0, 0};
+@@ -1103,7 +1198,7 @@ static int sample_tex(const Texture *t, uint32_t face_offset,
+             || cache[slot].raw[0] != raw[0] || cache[slot].raw[1] != raw[1]) {
+             uint32_t i;
+             for (i = 0; i < 16; i++)
+-                d3d8_dxt_decode_texel(mem + base, fmt, bx * 4 + (i & 3),
++                d3d8_dxt_decode_texel(mem + base + slice, fmt, bx * 4 + (i & 3),
+                                       by * 4 + (i >> 2), t->width,
+                                       &cache[slot].px[i]);
+             cache[slot].key = key;
+@@ -1121,7 +1216,9 @@ static int sample_tex(const Texture *t, uint32_t face_offset,
+          * index for every one of them. */
+         fmt = linear_twin(fmt);
+         p = mem + base;
+-        u = swizzle_offset(u, v, t->width, t->height);
++        u = t->depth > 1
++          ? swizzle_offset3(u, v, s_tex_slice, t->width, t->height, t->depth)
++          : swizzle_offset(u, v, t->width, t->height);
+     } else {
+         p = mem + base + (size_t)v * t->pitch;
+     }
+@@ -1200,6 +1297,25 @@ static int sample_tex(const Texture *t, uint32_t face_offset,
          return 1;
      }
  
@@ -2465,7 +2944,7 @@ index 1280565..45469e0 100644
      /* 8-bit. */
      case 0x13: {                                    /* LIN_L8 */
          uint32_t t = p[u];
-@@ -1920,37 +1990,80 @@ static void backend_from_xf(const Nv2aVshOutput *v, Nv2aVertex *o)
+@@ -1920,37 +2036,85 @@ static void backend_from_xf(const Nv2aVshOutput *v, Nv2aVertex *o)
      o->diffuse = pack_color(v->d0);
      o->u = v->tex[0][0] * su;
      o->v = v->tex[0][1] * sv;
@@ -2500,6 +2979,11 @@ index 1280565..45469e0 100644
 +    o->cube   = (uint32_t)t->cube;
 +    o->face_stride = t->cube ? tex_face_stride(t) : 0;
 +    o->palette = t->palette;
++    /* Only a swizzled format can be a volume; CONTROL1's pitch is left over
++     * from the last linear texture and says nothing here. */
++    o->depth  = t->depth > 1 && tex_size_from_format(t->color) ? t->depth : 1;
++    if (o->depth > 1)
++        o->levels = 1;                  /* level 0 of a volume only */
 +    o->normalized = (uint32_t)tex_size_from_format(t->color);
 +}
 +
@@ -2564,7 +3048,7 @@ index 1280565..45469e0 100644
      s_backend->draw(&surf, &batch);
      s_gpu.tris_drawn += s_bcount / 3;
      s_bcount = 0;
-@@ -1995,7 +2108,12 @@ static void raster_indexed(uint32_t i0, uint32_t i1, uint32_t i2, uint32_t argb)
+@@ -1995,7 +2159,12 @@ static void raster_indexed(uint32_t i0, uint32_t i1, uint32_t i2, uint32_t argb)
              o[k].diffuse = vertex_color(ix[k]);
              o[k].u = textured ? uv[k][0] : 0.0f;
              o[k].v = textured ? uv[k][1] : 0.0f;
@@ -2577,7 +3061,7 @@ index 1280565..45469e0 100644
          s_bcount += 3;
          return;
      }
-@@ -2106,7 +2224,7 @@ static uint32_t tex_texel_bytes(uint32_t fmt)
+@@ -2106,7 +2275,7 @@ static uint32_t tex_texel_bytes(uint32_t fmt)
      case 0x00: case 0x01: case 0x0B: case 0x13: case 0x19: case 0x1F:
          return 1;
      case 0x02: case 0x03: case 0x04: case 0x05: case 0x10: case 0x11:
@@ -2586,7 +3070,7 @@ index 1280565..45469e0 100644
          return 2;
      default:
          return 4;
-@@ -2388,12 +2506,65 @@ static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
+@@ -2388,12 +2557,65 @@ static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
  #define NV_RASTER_MAX_THREADS 16
  #define NV_RASTER_MT_MIN_PIXELS 8192
  
@@ -2652,7 +3136,7 @@ index 1280565..45469e0 100644
      XfCount cnt[NV_RASTER_MAX_THREADS];
  } s_pool;
  
-@@ -2403,7 +2574,12 @@ static DWORD WINAPI raster_worker(LPVOID arg)
+@@ -2403,7 +2625,12 @@ static DWORD WINAPI raster_worker(LPVOID arg)
      for (;;) {
          WaitForSingleObject(s_pool.start[k], INFINITE);
          memset(&s_pool.cnt[k], 0, sizeof s_pool.cnt[k]);
@@ -2666,7 +3150,7 @@ index 1280565..45469e0 100644
          if (InterlockedDecrement(&s_pool.pending) == 0)
              SetEvent(s_pool.done);
      }
-@@ -2462,11 +2638,83 @@ static void xf_rows_parallel(const XfTri *T, XfCount *total)
+@@ -2462,11 +2689,83 @@ static void xf_rows_parallel(const XfTri *T, XfCount *total)
          total->zpass += s_pool.cnt[k].zpass;
      }
  }
@@ -2750,7 +3234,7 @@ index 1280565..45469e0 100644
  #endif
  
  static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
-@@ -2564,6 +2812,20 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
+@@ -2564,6 +2863,20 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
      s_gpu.xf_drawn++;
      T.inv_area = 1.0f / area;
  
@@ -2771,7 +3255,7 @@ index 1280565..45469e0 100644
      xf_rows_parallel(&T, &cnt);
      s_gpu.xf_depth_fail += cnt.depth_fail;
      s_gpu.xf_pixels += cnt.pixels;
-@@ -2664,8 +2926,6 @@ static void raster_xf_clipped(const Nv2aVshOutput *a, const Nv2aVshOutput *b,
+@@ -2664,8 +2977,6 @@ static void raster_xf_clipped(const Nv2aVshOutput *a, const Nv2aVshOutput *b,
  
  /* About 7 MB, so allocated by the first batch that transforms rather than
   * carried in every build that never turns the executor on. */
@@ -2780,7 +3264,7 @@ index 1280565..45469e0 100644
  /* Does this batch run the title's vertex program? RECOMP_NO_VSH turns the
   * interpreter off (the batch then falls to the screen-space heuristics). */
  static int batch_uses_program(void)
-@@ -2721,15 +2981,172 @@ static void xf_set_viewport(void)
+@@ -2721,15 +3032,172 @@ static void xf_set_viewport(void)
      s_xf_o[2] = of[2];
  }
  
@@ -2956,7 +3440,59 @@ index 1280565..45469e0 100644
      xf_set_viewport();
      {
          const VertexAttr *tc = texcoord_attr();
-@@ -2828,6 +3245,19 @@ static void raster_batch_program(void)
+@@ -2815,6 +3283,51 @@ static void raster_batch_program(void)
+                         s_xf[i].pos[3]);
+         }
+     }
++    {
++        /* RECOMP_VTRACE_TEX=<hex address>[,...]: for the first four program batches
++         * that sample that texture on stage 0, each of the first 8 vertices:
++         * every attribute as fetched and what the program made of it
++         * (position, diffuse, texture 0). Needs the CPU vertex programs
++         * (RECOMP_D3D11_VSH=0 with RECOMP_D3D11). */
++        static int init, left = 4, nwant;
++        static uint32_t wants[8];
++        int hit = 0, wi;
++        if (!init) {
++            const char *t = getenv("RECOMP_VTRACE_TEX");
++            char *end;
++            while (t && *t && nwant < 8) {
++                wants[nwant++] = (uint32_t)strtoul(t, &end, 16) & 0x0FFFFFFFu;
++                t = (*end == ',') ? end + 1 : NULL;
++            }
++            init = 1;
++        }
++        for (wi = 0; wi < nwant; wi++)
++            if (s_gpu.texs[0].valid && (s_gpu.texs[0].offset & 0x0FFFFFFFu) == wants[wi])
++                hit = 1;
++        if (hit && left > 0) {
++            uint32_t v, k;
++            float in[4];
++            left--;
++            fprintf(stderr, "[VTEX] prim %u n %u tex %08X\n", s_gpu.prim, n,
++                    s_gpu.texs[0].offset);
++            for (v = 0; v < n && v < 8; v++) {
++                fprintf(stderr, "[VTEX]  v%u:", v);
++                for (k = 0; k < NV_VERTEX_ATTRS; k++) {
++                    const VertexAttr *at = &s_gpu.attr[k];
++                    if (!at->size)
++                        continue;
++                    fetch_attr(at, s_gpu.idx[v], in);
++                    fprintf(stderr, " a%u(%g %g %g %g)", k, in[0], in[1], in[2], in[3]);
++                }
++                fprintf(stderr, " -> pos(%g %g %g %g) d0(%g %g %g %g) t0(%g %g %g %g)\n",
++                        s_xf[v].pos[0], s_xf[v].pos[1], s_xf[v].pos[2], s_xf[v].pos[3],
++                        s_xf[v].d0[0], s_xf[v].d0[1], s_xf[v].d0[2], s_xf[v].d0[3],
++                        s_xf[v].tex[0][0], s_xf[v].tex[0][1], s_xf[v].tex[0][2],
++                        s_xf[v].tex[0][3]);
++            }
++            nv2a_vsh_dump_current();
++        }
++    }
+     for (i = 0; i < NV2A_VSH_INPUTS; i++) {
+         const VertexAttr *at = &s_gpu.attr[i];
+         uint32_t f = at->type | (at->size << 4) | (i << 8), j;
+@@ -2828,6 +3341,19 @@ static void raster_batch_program(void)
      if (s_gpu.texs[0].valid)
          note_texture_use();
  
@@ -2976,7 +3512,7 @@ index 1280565..45469e0 100644
      switch (s_gpu.prim) {
      case NV_PRIM_TRIANGLES:
          for (i = 0; i + 2 < n; i += 3)
-@@ -2857,6 +3287,10 @@ static void raster_batch_program(void)
+@@ -2857,6 +3383,10 @@ static void raster_batch_program(void)
      default:
          break;
      }
@@ -2987,7 +3523,75 @@ index 1280565..45469e0 100644
      if (backend_draws())
          backend_flush(!s_xf_no_tex);
  }
-@@ -3747,6 +4181,10 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -3186,22 +3716,54 @@ static void draw_inline_array(void)
+ 
+     memcpy(saved, s_gpu.attr, sizeof saved);
+ 
++    /* The inline vertex is the attributes back to back, each its own size
++     * and no padding, as xemu lays it out. Shorts (S1, S32K) are 2 bytes a
++     * component; they used to count 4 and each attribute was padded to a
++     * dword, so a vertex with short texture coordinates -- MechAssault 2's
++     * particles -- had every attribute after them read from the wrong bytes
++     * and the wrong number of vertices: stretched triangles across the
++     * screen, and the fill-rate cost of drawing them. */
+     for (a = 0; a < NV_VERTEX_ATTRS; a++) {
+         uint32_t bytes;
+         if (!s_gpu.attr[a].size)
+             continue;
+         switch (s_gpu.attr[a].type) {
+-        case 0:  bytes = 4;                        break;  /* D3DCOLOR   */
+-        case 2:  bytes = 4 * s_gpu.attr[a].size;   break;  /* float      */
+-        case 4:  bytes = s_gpu.attr[a].size;       break;  /* ubyte norm */
++        case 0:  bytes = 4;                        break;  /* D3DCOLOR     */
++        case 1:                                            /* S1 (norm)    */
++        case 5:  bytes = 2 * s_gpu.attr[a].size;   break;  /* S32K         */
++        case 2:  bytes = 4 * s_gpu.attr[a].size;   break;  /* float        */
++        case 4:  bytes = s_gpu.attr[a].size;       break;  /* ubyte norm   */
++        case 6:  bytes = 4;                        break;  /* CMP 11:11:10 */
+         default: bytes = 4 * s_gpu.attr[a].size;   break;
+         }
+         s_gpu.attr[a].offset = off;
+-        off += (bytes + 3u) & ~3u;
++        off += bytes;
+     }
+     vsize = off;
+     if (!vsize)
+         goto out;
++    {   /* the inline layouts a title draws with, once each */
++        static uint32_t seen[32];
++        static int nseen;
++        uint32_t key = 0;
++        int k;
++        for (a = 0; a < NV_VERTEX_ATTRS && a < 8; a++)
++            if (s_gpu.attr[a].size)
++                key |= ((s_gpu.attr[a].type & 7) << 1 | 1) << (a * 4);
++        for (k = 0; k < nseen && seen[k] != key; k++)
++            ;
++        if (k == nseen && nseen < 32) {
++            char desc[160];
++            int at = 0;
++            seen[nseen++] = key;
++            for (a = 0; a < NV_VERTEX_ATTRS && at < 140; a++)
++                if (s_gpu.attr[a].size)
++                    at += snprintf(desc + at, sizeof desc - at, " a%u=t%u*%u@%u", a,
++                                   s_gpu.attr[a].type, s_gpu.attr[a].size,
++                                   s_gpu.attr[a].offset);
++            fprintf(stderr, "  [GPU] inline vertex layout:%s (%u bytes)\n", desc, vsize);
++        }
++    }
+ 
+     count = (s_gpu.inline_count * 4) / vsize;
+     if (count < 3 || count > NV_MAX_INDICES)
+@@ -3406,6 +3968,8 @@ static void tex_stage_method(uint32_t method, uint32_t param)
+         t->color = (param >> 8) & 0xFF;
+         t->cube = (param >> 2) & 1;
+         t->levels = (param >> 16) & 0xF;
++        /* DIMENSIONALITY 3: a volume, BASE_SIZE_P (log2) slices deep. */
++        t->depth = ((param >> 4) & 0xF) == 3 ? 1u << ((param >> 28) & 0xF) : 1;
+         /* A swizzled texture carries its own dimensions here, as log2 in
+          * BASE_SIZE_U/V. It has to: IMAGE_RECT describes a linear image, and
+          * a title that only uses swizzled textures never sends one. */
+@@ -3747,6 +4311,10 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
          /* The stall ends when the buffer being read is the one just finished.
           * There is no scanout here to wait for, so that is now. */
          s_gpu.flip_read = s_gpu.flip_write;
@@ -2998,7 +3602,7 @@ index 1280565..45469e0 100644
          /* And this is a completed swap, which is what a title's own swap
           * counter counts -- see xbox_Nv2aFrameCounterFlip. */
          xbox_Nv2aFrameCounterFlip();
-@@ -3762,6 +4200,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -3762,6 +4330,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
              extern void xbox_FramebufferWindowFrameStats(uint32_t);
              static uint32_t draws_at_flip;
              xbox_FramebufferWindowFrameStats(s_gpu.draws - draws_at_flip);
@@ -3006,7 +3610,7 @@ index 1280565..45469e0 100644
              draws_at_flip = s_gpu.draws;
          }
          if (s_gpu.pitch) {
-@@ -3798,8 +4237,6 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -3798,8 +4367,6 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
              }
          }
          s_gpu.drawn_stale = 1;
@@ -3016,7 +3620,7 @@ index 1280565..45469e0 100644
          if (verbose) {
              static unsigned n;
 diff --git a/src/kernel/nv2a_vsh_interp.c b/src/kernel/nv2a_vsh_interp.c
-index c3fba75..611f355 100644
+index c3fba75..1786a4e 100644
 --- a/src/kernel/nv2a_vsh_interp.c
 +++ b/src/kernel/nv2a_vsh_interp.c
 @@ -39,6 +39,7 @@ static float    s_const[NV2A_VSH_CONSTANTS][4];
@@ -3067,7 +3671,37 @@ index c3fba75..611f355 100644
  /* ---- disassembly (RECOMP_VSH_DUMP) --------------------------------------- */
  
  static const char *const k_mac[16] = {
-@@ -192,6 +204,7 @@ void nv2a_vsh_constant_component(uint32_t index, uint32_t comp, uint32_t word)
+@@ -183,6 +195,29 @@ static void dump_program(uint32_t start)
+     fflush(stderr);
+ }
+ 
++/* The current program, disassembled, and every constant it names (with
++ * a0.x-relative reads marked), for a trace. */
++void nv2a_vsh_dump_current(void)
++{
++    uint32_t s, seen[NV2A_VSH_CONSTANTS / 32 + 1] = { 0 };
++    dump_program(s_start_slot);
++    for (s = s_start_slot; s < NV2A_VSH_SLOTS; s++) {
++        const uint32_t *ins = s_program[s];
++        uint32_t c = field(ins, 1, 13, 8);
++        int uses = field(ins, 2, 26, 2) == 3 || field(ins, 2, 11, 2) == 3
++                || field(ins, 3, 28, 2) == 3;
++        if (uses && c < NV2A_VSH_CONSTANTS && !(seen[c / 32] & (1u << (c % 32)))) {
++            seen[c / 32] |= 1u << (c % 32);
++            fprintf(stderr, "  [VSH]   c[%u]%s = %g %g %g %g\n", c,
++                    field(ins, 3, 1, 1) ? " (a0.x+)" : "",
++                    s_const[c][0], s_const[c][1], s_const[c][2], s_const[c][3]);
++        }
++        if (field(ins, 3, 0, 1))
++            break;
++    }
++    fflush(stderr);
++}
++
+ const float *nv2a_vsh_constant(uint32_t index)
+ {
+     return s_const[index < NV2A_VSH_CONSTANTS ? index : 0];
+@@ -192,6 +227,7 @@ void nv2a_vsh_constant_component(uint32_t index, uint32_t comp, uint32_t word)
  {
      if (index < NV2A_VSH_CONSTANTS && comp < 4)
          memcpy(&s_const[index][comp], &word, 4);
@@ -3075,7 +3709,7 @@ index c3fba75..611f355 100644
  }
  
  /* ---- execution ----------------------------------------------------------- */
-@@ -401,8 +414,10 @@ int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
+@@ -401,8 +437,10 @@ int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
          if (omask) {
              const vec4 *src = field(ins, 3, 2, 1) ? &ires : &mres;
              if (!field(ins, 3, 11, 1)) {                  /* to c[] */
@@ -3088,10 +3722,16 @@ index c3fba75..611f355 100644
                  write_masked(opos.v, src, omask);
              } else if (oaddr < 13) {
 diff --git a/src/kernel/nv2a_vsh_interp.h b/src/kernel/nv2a_vsh_interp.h
-index 8acb0af..2ce01a1 100644
+index 8acb0af..8cacb6b 100644
 --- a/src/kernel/nv2a_vsh_interp.h
 +++ b/src/kernel/nv2a_vsh_interp.h
-@@ -58,4 +58,15 @@ const float *nv2a_vsh_constant(uint32_t index);   /* for traces */
+@@ -53,9 +53,21 @@ int  nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out);
+ /* Direct access, for the self-test. */
+ void nv2a_vsh_set_constant(uint32_t index, const float v[4]);
+ const float *nv2a_vsh_constant(uint32_t index);   /* for traces */
++void nv2a_vsh_dump_current(void);                 /* for traces: program + its constants */
+ /* One component of a constant, raw bits: the viewport methods write c[58]
+  * (scale) and c[59] (offset) a word at a time rather than via _CONSTANT. */
  void nv2a_vsh_constant_component(uint32_t index, uint32_t comp, uint32_t word);
  void nv2a_vsh_set_instruction(uint32_t slot, const uint32_t words[4]);
  
@@ -3150,10 +3790,26 @@ index 362cefe..d1434f5 100644
  {
      static int frees = 0, matched = 0;
 diff --git a/src/usb/ohci.c b/src/usb/ohci.c
-index d45d8bb..5ebf8df 100644
+index d45d8bb..2fde8dc 100644
 --- a/src/usb/ohci.c
 +++ b/src/usb/ohci.c
-@@ -1017,7 +1017,9 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
+@@ -812,11 +812,13 @@ static int ohci_run_periodic_list(OhciController *hc, uint32_t *done_head)
+             last = now;
+             fprintf(stderr, "  [OHCI%d] stats: %u periodic transfers; "
+                     "reports %lu setups %lu out0 %lu outN %lu; "
+-                    "ctl=%08X ien=%08X ists=%08X irql-depth=%d",
++                    "ctl=%08X ien=%08X ists=%08X irql-depth=%d "
++                    "raises-waited=%d dpc-held=%d",
+                     hc->index, total, s_n_report, s_n_ctrl, s_n_out_ep0,
+                     s_n_out_other, hc->reg[HcControl / 4],
+                     hc->reg[HcInterruptEnable / 4],
+-                    hc->reg[HcInterruptStatus / 4], xbox_IrqlRaisedCount());
++                    hc->reg[HcInterruptStatus / 4], xbox_IrqlRaisedCount(),
++                    xbox_IrqlClaimWaits(), xbox_DpcHeldTicks());
+             {
+                 uint32_t c = hc->reg[HcControlHeadED / 4] & ED_PTR_MASK;
+                 int n;
+@@ -1017,12 +1019,14 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
       * dereferences null before it executes a line of its own body. That is
       * what killed the process here, two interrupts in, with no fault report
       * because the fault was in the runtime rather than in the title. */
@@ -3164,7 +3820,13 @@ index d45d8bb..5ebf8df 100644
      int plugged = 0;
      uint32_t last_status = 0;
      unsigned repeats = 0;
-@@ -1044,14 +1046,33 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
+     unsigned held_off = 0;
+-    int      held_off_warned = 0, held_off_forced = 0;
++    int      held_off_warned = 0, held_off_forced = 0, forced;
+     unsigned last_ack = 0;
+     unsigned first_port = 0, settle = 0;
+ 
+@@ -1044,14 +1048,33 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
          uint32_t pass_done = 0;     /* this pass's done queue, newest first */
  
          Sleep(OHCI_TICK_MS);
@@ -3201,7 +3863,7 @@ index d45d8bb..5ebf8df 100644
              continue;
          }
          if (!(enable & INTR_MIE))
-@@ -1075,8 +1096,9 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
+@@ -1075,8 +1098,9 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
              plugged = 1;
              s_plugged_pads = 1;
              first_port = port;
@@ -3213,6 +3875,51 @@ index d45d8bb..5ebf8df 100644
              fflush(stderr);
          }
  
+@@ -1205,7 +1229,18 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
+          * asserted anyway. The common case still holds the ISR out of the
+          * guest's critical section; the pathological case costs a delay
+          * instead of the device. */
+-        if (xbox_IrqlBlocksInterrupts() && ++held_off <= OHCI_IRQ_HOLDOFF) {
++        /* And the check and the delivery are one step. Asking
++         * xbox_IrqlBlocksInterrupts and then calling the ISR left a gap in
++         * which a guest thread could raise to DISPATCH_LEVEL and run beside
++         * the ISR anyway. xbox_IrqlClaimProcessor claims the processor and
++         * then checks the depth, and a raise that lands after that waits for
++         * xbox_IrqlReleaseProcessor. The DPC queue takes the same claim
++         * (kernel_dpc_claim), so the ISR also never runs beside a DPC --
++         * stricter than the console, where an ISR may interrupt one. */
++        forced = held_off >= OHCI_IRQ_HOLDOFF;
++        if (!xbox_IrqlClaimProcessor(forced)) {
++            if (held_off < OHCI_IRQ_HOLDOFF)
++                held_off++;
+             if (!held_off_warned) {
+                 held_off_warned = 1;
+                 fprintf(stderr, "  [OHCI%d] irq held off by guest IRQL "
+@@ -1215,7 +1250,7 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
+             }
+             continue;
+         }
+-        if (held_off > OHCI_IRQ_HOLDOFF && !held_off_forced) {
++        if (forced && !held_off_forced && xbox_IrqlBlocksInterrupts()) {
+             held_off_forced = 1;
+             fprintf(stderr, "  [OHCI%d] guest IRQL never dropped (depth %d); "
+                     "delivering anyway\n", hc->index, xbox_IrqlRaisedCount());
+@@ -1238,6 +1273,7 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
+          * register at all between one delivery and the next. */
+         if (status == last_status && hc->ack_seq == last_ack) {
+             if (++repeats > 200) {
++                xbox_IrqlReleaseProcessor();
+                 fprintf(stderr, "  [OHCI%d] status %08X delivered 200 times "
+                                 "with no acknowledgement; stopping\n",
+                         hc->index, status);
+@@ -1250,6 +1286,7 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
+             repeats     = 0;
+         }
+         ohci_raise(hc, status);
++        xbox_IrqlReleaseProcessor();
+     }
+     return 0;
+ }
 diff --git a/src/usb/usb_gamepad.c b/src/usb/usb_gamepad.c
 index bd00f3f..bde1eb7 100644
 --- a/src/usb/usb_gamepad.c
@@ -3615,10 +4322,10 @@ index 87b7ef7..e6c21cc 100644
  static void publish(uint32_t bpp)
 diff --git a/src/video/nv2a_d3d11.c b/src/video/nv2a_d3d11.c
 new file mode 100644
-index 0000000..b0ff4b5
+index 0000000..8789af6
 --- /dev/null
 +++ b/src/video/nv2a_d3d11.c
-@@ -0,0 +1,2984 @@
+@@ -0,0 +1,3168 @@
 +/*
 + * nv2a_d3d11.c -- a Direct3D 11 render back end for the pushbuffer executor.
 + *
@@ -3708,6 +4415,8 @@ index 0000000..b0ff4b5
 +"Texture2D T2 : register(t2); Texture2D T3 : register(t3);\n"
 +"TextureCube C0 : register(t4); TextureCube C1 : register(t5);\n"
 +"TextureCube C2 : register(t6); TextureCube C3 : register(t7);\n"
++"Texture3D V0 : register(t9); Texture3D V1 : register(t10);\n"
++"Texture3D V2 : register(t11); Texture3D V3 : register(t12);\n"
 +"SamplerState S0 : register(s0); SamplerState S1 : register(s1);\n"
 +"SamplerState S2 : register(s2); SamplerState S3 : register(s3);\n"
 +"struct VI { float4 pos : POSITION; float4 d0 : COLOR0; float4 d1 : COLOR1;\n"
@@ -3876,6 +4585,7 @@ index 0000000..b0ff4b5
 +"static const uint4 K_TF = SPEC_TF;\n"
 +"#define K_TFN(st) ((K_TF[st] & 1u) != 0)\n"
 +"#define K_TFC(st) ((K_TF[st] & 2u) != 0)\n"
++"#define K_TF3(st) ((K_TF[st] & 8u) != 0)\n"
 +"#define K_TFG(st) ((K_TF[st] & 4u) != 0)\n"
 +"#define K_TEXTURED SPEC_TEXTURED\n"
 +"#define STAGE_LOOP [unroll]\n"
@@ -3887,7 +4597,8 @@ index 0000000..b0ff4b5
 +"#define K_FIN g_fin\n"
 +"#define K_MISC uint4(g_misc.x, g_misc.y, (uint)g_surf.w, g_misc.w)\n"
 +"#define K_TFN(st) (g_tsz[st].z != 0.0)\n"
-+"#define K_TFC(st) (g_tsz[st].w != 0.0)\n"
++"#define K_TFC(st) (g_tsz[st].w == 1.0)\n"
++"#define K_TF3(st) (g_tsz[st].w == 2.0)\n"
 +"#define K_TFG(st) (((g_misc2.y >> (st)) & 1u) != 0)\n"
 +"#define K_TEXTURED g_misc2.x\n"
 +"#define STAGE_LOOP [loop]\n"
@@ -3944,6 +4655,12 @@ index 0000000..b0ff4b5
 +"  else v = TSAMPLE(T3, S3, uv, 3);\n"
 +"  return K_TFG(st) ? v.bgbg : v;\n"            /* LIN_G8B8 over a G8B8 target */
 +"}\n"
++"float4 tex3d(uint st, float3 d) {\n"
++"  if (st == 0) return V0.SampleLevel(S0, d, 0);\n"
++"  if (st == 1) return V1.SampleLevel(S1, d, 0);\n"
++"  if (st == 2) return V2.SampleLevel(S2, d, 0);\n"
++"  return V3.SampleLevel(S3, d, 0);\n"
++"}\n"
 +"float4 texcube(uint st, float3 d) {\n"
 +"  if (st == 0) return C0.SampleLevel(S0, d, 0);\n"
 +"  if (st == 1) return C1.SampleLevel(S1, d, 0);\n"
@@ -3954,6 +4671,10 @@ index 0000000..b0ff4b5
 +"  uint mode = (K_FIN.w >> (st * 5)) & 0x1F;\n"
 +"  float4 sz = g_tsz[st];\n"
 +"  if (mode == 0) return float4(0, 0, 0, 1);\n"
++"  if (mode == 2 && K_TF3(st)) {\n"
++"    float q = (c.w != 0.0) ? c.w : 1.0;\n"
++"    return tex3d(st, c.xyz / q);\n"
++"  }\n"
 +"  if (mode == 1 || mode == 2) {\n"
 +"    float q = (c.w != 0.0) ? c.w : 1.0;\n"
 +"    float2 uv = c.xy / q;\n"
@@ -4398,7 +5119,8 @@ index 0000000..b0ff4b5
 +    return a->offset == b->offset && a->width == b->width && a->height == b->height
 +        && a->pitch == b->pitch && a->color == b->color && a->cube == b->cube
 +        && a->palette == b->palette && a->face_stride == b->face_stride
-+        && (!s_af || a->levels == b->levels);
++        && (!s_af || a->levels == b->levels)
++        && (a->depth > 1 ? a->depth : 1) == (b->depth > 1 ? b->depth : 1);
 +}
 +
 +/* Levels a texture is made with: 1, or with RECOMP_D3D11_AF the mip levels
@@ -4408,7 +5130,7 @@ index 0000000..b0ff4b5
 +static uint32_t tex_levels(const Nv2aTexture *t)
 +{
 +    uint32_t n = 1, w = t->width, h = t->height;
-+    if (!s_af || t->cube || !t->normalized)
++    if (!s_af || t->cube || !t->normalized || t->depth > 1)
 +        return 1;
 +    while (n < t->levels && n < 13 && (w > 1 || h > 1)) {
 +        w = w > 1 ? w / 2 : 1;
@@ -4454,6 +5176,55 @@ index 0000000..b0ff4b5
 +
 +    if (!t->width || !t->height || t->width > 4096 || t->height > 4096)
 +        return NULL;
++    /* A volume (DIMENSIONALITY 3): a Texture3D of its level 0, decoded slice
++     * by slice; PROJECT3D stages sample it with (s, t, r) (K_TF3). It used to
++     * be read as one flat image, its slices interleaved into stripes. */
++    if (t->depth > 1) {
++        D3D11_TEXTURE3D_DESC d3;
++        D3D11_SUBRESOURCE_DATA s3;
++        ID3D11Texture3D *t3 = NULL;
++        size_t n = (size_t)t->width * t->height * t->depth;
++        if (t->depth > 512 || n > (size_t)16 << 20)
++            return NULL;
++        if (s_decode_cap < n) {
++            free(s_decode);
++            s_decode_cap = n;
++            s_decode = (uint32_t *)malloc(s_decode_cap * 4);
++            if (!s_decode) { s_decode_cap = 0; return NULL; }
++        }
++        if (!nv2a_backend_decode_volume(t, s_decode)) {
++            s_fmt_bad[t->color & 0xFF] = 1;
++            fprintf(stderr, "  [D3D11] volume texture format 0x%X not decodable:"
++                    " sampled as white\n", t->color);
++            return NULL;
++        }
++        memset(&d3, 0, sizeof d3);
++        d3.Width = t->width;
++        d3.Height = t->height;
++        d3.Depth = t->depth;
++        d3.MipLevels = 1;
++        d3.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
++        d3.Usage = D3D11_USAGE_IMMUTABLE;
++        d3.BindFlags = D3D11_BIND_SHADER_RESOURCE;
++        s3.pSysMem = s_decode;
++        s3.SysMemPitch = t->width * 4;
++        s3.SysMemSlicePitch = t->width * t->height * 4;
++        if (FAILED(ID3D11Device_CreateTexture3D(s_dev, &d3, &s3, &t3)))
++            return NULL;
++        memset(&vd, 0, sizeof vd);
++        vd.Format = d3.Format;
++        vd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE3D;
++        vd.Texture3D.MipLevels = 1;
++        ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)t3, &vd, &v);
++        ID3D11Texture3D_Release(t3);
++        {
++            static int shown;
++            if (shown++ < 4)
++                fprintf(stderr, "  [D3D11] volume texture %08X fmt %02X %ux%ux%u\n",
++                        t->offset, t->color, t->width, t->height, t->depth);
++        }
++        return v;
++    }
 +    for (l = 0; l < levels; l++) {
 +        Nv2aTexture lv = tex_level(t, l);
 +        texels += (size_t)lv.width * lv.height;
@@ -4463,6 +5234,46 @@ index 0000000..b0ff4b5
 +        s_decode_cap = texels * faces;
 +        s_decode = (uint32_t *)malloc(s_decode_cap * 4);
 +        if (!s_decode) { s_decode_cap = 0; return NULL; }
++    }
++    /* RECOMP_D3D11_TEX_DUMP also covers DXT: decoded on the CPU for the
++     * dump only, then uploaded as blocks below. */
++    if ((t->color == 0x0C || t->color == 0x0E || t->color == 0x0F)
++        && getenv("RECOMP_D3D11_TEX_DUMP")) {
++        const char *e = getenv("RECOMP_D3D11_TEX_DUMP");
++        char key[16];
++        snprintf(key, sizeof key, "%08X", t->offset & 0x0FFFFFFFu);
++        if (strstr(e, key) && s_decode_cap >= (size_t)t->width * t->height
++            && nv2a_backend_decode_texture(t, s_decode)) {
++            uint32_t w = t->width, h = t->height, x, y, row = ((w * 2 * 3) + 3) & ~3u;
++            uint8_t hdr[54] = { 'B', 'M' };
++            uint32_t sz = 54 + row * h, ww = w * 2;
++            int32_t hh = -(int32_t)h;
++            char name[96];
++            FILE *f;
++            snprintf(name, sizeof name, "d3d11_tex_%s_0.bmp", key);
++            if ((f = fopen(name, "wb")) != NULL) {
++                memcpy(hdr + 2, &sz, 4); hdr[10] = 54; hdr[14] = 40;
++                memcpy(hdr + 18, &ww, 4); memcpy(hdr + 22, &hh, 4);
++                hdr[26] = 1; hdr[28] = 24;
++                fwrite(hdr, 1, 54, f);
++                for (y = 0; y < h; y++) {
++                    static uint8_t line[8192 * 3 + 4];
++                    memset(line, 0, sizeof line);
++                    for (x = 0; x < w && x < 4096; x++) {
++                        uint32_t p = s_decode[(size_t)y * w + x];
++                        line[x * 3 + 0] = (uint8_t)p;
++                        line[x * 3 + 1] = (uint8_t)(p >> 8);
++                        line[x * 3 + 2] = (uint8_t)(p >> 16);
++                        line[(w + x) * 3 + 0] = line[(w + x) * 3 + 1] =
++                            line[(w + x) * 3 + 2] = (uint8_t)(p >> 24);
++                    }
++                    fwrite(line, 1, row, f);
++                }
++                fclose(f);
++                fprintf(stderr, "  [D3D11] texture %s fmt %02X (%ux%u, DXT) -> %s\n",
++                        key, t->color, w, h, name);
++            }
++        }
 +    }
 +    /* DXT goes to the GPU as it is: BC1/BC2/BC3 are the same blocks. */
 +    if ((t->color == 0x0C || t->color == 0x0E || t->color == 0x0F)
@@ -4549,6 +5360,62 @@ index 0000000..b0ff4b5
 +            return NULL;                /* unsupported format: white */
 +        }
 +    }
++    /* RECOMP_D3D11_TEX_DUMP=<hex address>[,...]: write the texture at that address
++     * as it goes to the GPU, every level, alpha in its own image beside the
++     * colour, to d3d11_tex_<address>_<level>.bmp in the working directory. */
++    {
++        static int init, nwant;
++        static uint32_t wants[16];
++        uint32_t want = 0;
++        int wi;
++        if (!init) {
++            const char *e = getenv("RECOMP_D3D11_TEX_DUMP");
++            char *end;
++            while (e && *e && nwant < 16) {
++                wants[nwant++] = (uint32_t)strtoul(e, &end, 16) & 0x0FFFFFFFu;
++                e = (*end == ',') ? end + 1 : NULL;
++            }
++            init = 1;
++        }
++        for (wi = 0; wi < nwant; wi++)
++            if ((t->offset & 0x0FFFFFFFu) == wants[wi])
++                want = wants[wi];
++        if (want) {
++            size_t lat = 0;
++            for (l = 0; l < levels; l++) {
++                Nv2aTexture lv = tex_level(t, l);
++                uint32_t w = lv.width, h = lv.height, x, y, row = ((w * 2 * 3) + 3) & ~3u;
++                char name[96];
++                FILE *f;
++                uint8_t hdr[54] = { 'B', 'M' };
++                uint32_t sz = 54 + row * h;
++                snprintf(name, sizeof name, "d3d11_tex_%08X_%u.bmp", want, l);
++                if ((f = fopen(name, "wb")) != NULL) {
++                    memcpy(hdr + 2, &sz, 4); hdr[10] = 54; hdr[14] = 40;
++                    { uint32_t ww = w * 2; int32_t hh = -(int32_t)h;
++                      memcpy(hdr + 18, &ww, 4); memcpy(hdr + 22, &hh, 4); }
++                    hdr[26] = 1; hdr[28] = 24;
++                    fwrite(hdr, 1, 54, f);
++                    for (y = 0; y < h; y++) {
++                        uint8_t line[8192 * 3 + 4] = { 0 };
++                        for (x = 0; x < w && x < 4096; x++) {
++                            uint32_t p = s_decode[lat + (size_t)y * w + x];
++                            line[x * 3 + 0] = (uint8_t)p;
++                            line[x * 3 + 1] = (uint8_t)(p >> 8);
++                            line[x * 3 + 2] = (uint8_t)(p >> 16);
++                            line[(w + x) * 3 + 0] = line[(w + x) * 3 + 1] =
++                                line[(w + x) * 3 + 2] = (uint8_t)(p >> 24);
++                        }
++                        fwrite(line, 1, row, f);
++                    }
++                    fclose(f);
++                    fprintf(stderr, "  [D3D11] texture %08X fmt %02X level %u (%ux%u) -> %s\n",
++                            want, t->color, l, w, h, name);
++                }
++                lat += (size_t)w * h;
++            }
++        }
++    }
 +    memset(&td, 0, sizeof td);
 +    td.Width = t->width;
 +    td.Height = t->height;
@@ -4600,7 +5467,7 @@ index 0000000..b0ff4b5
 +        return NULL;
 +    *w = (float)t->width;
 +    *h = (float)t->height;
-+    a = rt_alias(t, w, h, g8b8);
++    a = t->depth > 1 ? NULL : rt_alias(t, w, h, g8b8);
 +    s_tex_rt = a != NULL;
 +    if (a)
 +        return a;
@@ -5746,7 +6613,8 @@ index 0000000..b0ff4b5
 +        k.misc[2] = 1;
 +        k.misc[3] = cb->misc[3];
 +        for (st = 0; st < 4; st++)
-+            k.tf[st] = (cb->tsz[st][2] != 0.0f ? 1u : 0u) | (cb->tsz[st][3] != 0.0f ? 2u : 0u);
++            k.tf[st] = (cb->tsz[st][2] != 0.0f ? 1u : 0u) | (cb->tsz[st][3] == 1.0f ? 2u : 0u)
++                     | (cb->tsz[st][3] == 2.0f ? 8u : 0u);
 +    }
 +    for (st = 0; st < 4; st++)
 +        if ((cb->misc2[1] >> st) & 1)
@@ -5789,7 +6657,7 @@ index 0000000..b0ff4b5
 +    Target *t;
 +    CB cb;
 +    D3D11_MAPPED_SUBRESOURCE m;
-+    ID3D11ShaderResourceView *srv[8];
++    ID3D11ShaderResourceView *srv[13];     /* 2D t0-3, cube t4-7, volume t9-12 */
 +    ID3D11SamplerState *smp[4];
 +    const Nv2aRenderState *r = b->state;
 +    UINT i, st;
@@ -5810,6 +6678,7 @@ index 0000000..b0ff4b5
 +    cb.misc[2] = r->alpha_ref;
 +    cb.misc[3] = b->clip_plane_mode;
 +    for (st = 0; st < 8; st++) srv[st] = st < 4 ? s_white2d : s_whitecube;
++    for (st = 8; st < 13; st++) srv[st] = NULL;    /* t8 (the VS's), volumes */
 +    for (st = 0; st < 4; st++) smp[st] = sampler(NULL, 0);
 +    if (b->rc) {
 +        const Nv2aCombiner *rc = b->rc;
@@ -5836,11 +6705,11 @@ index 0000000..b0ff4b5
 +            if (!tx || sm < 1 || sm > 3)
 +                continue;
 +            cb.tsz[st][2] = tx->normalized ? 1.0f : 0.0f;
-+            cb.tsz[st][3] = tx->cube ? 1.0f : 0.0f;
++            cb.tsz[st][3] = tx->cube ? 1.0f : tx->depth > 1 ? 2.0f : 0.0f;
 +            {
 +                int g8;
 +                ID3D11ShaderResourceView *v = tex_get(tx, &cb.tsz[st][0], &cb.tsz[st][1], &g8);
-+                if (v) srv[tx->cube ? 4 + st : st] = v;
++                if (v) srv[tx->cube ? 4 + st : tx->depth > 1 ? 9 + st : st] = v;
 +                if (g8) cb.misc2[1] |= 1u << st;
 +            }
 +            smp[st] = sampler(tx, s_tex_rt);
@@ -5874,7 +6743,7 @@ index 0000000..b0ff4b5
 +        ID3D11DeviceContext_PSSetShader(s_ctx, ps ? ps : s_ps, NULL, 0);
 +    }
 +    ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 0, 1, &s_cb);
-+    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 8, srv);
++    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 13, srv);
 +    ID3D11DeviceContext_PSSetSamplers(s_ctx, 0, 4, smp);
 +    ID3D11DeviceContext_RSSetState(s_ctx, s_rs);
 +    unpack(r->blend_color, bf);
@@ -6165,6 +7034,28 @@ index 0000000..b0ff4b5
 +
 +    if ((ok = program_ok(p)) <= 0)
 +        return ok == 0;             /* -1: let the CPU run it */
++    /* RECOMP_D3D11_SKIP_TEX=<hex>[,...]: draws whose stage-0 texture is one
++     * of these are dropped -- for finding which pass draws an artefact. */
++    {
++        static int init, n;
++        static uint32_t skip[16];
++        if (!init) {
++            const char *e = getenv("RECOMP_D3D11_SKIP_TEX");
++            char *end;
++            while (e && *e && n < 16) {
++                skip[n++] = (uint32_t)strtoul(e, &end, 16) & 0x0FFFFFFFu;
++                e = (*end == ',') ? end + 1 : NULL;
++            }
++            init = 1;
++        }
++        if (n) {
++            const Nv2aTexture *t0 = b->stages[0] ? b->stages[0] : b->texture;
++            int k;
++            for (k = 0; t0 && k < n; k++)
++                if ((t0->offset & 0x0FFFFFFFu) == skip[k])
++                    return 1;
++        }
++    }
 +    /* RECOMP_D3D11_VSH=split: odd frames transform on the CPU, so frame
 +     * dumps alternate the two paths and any difference shows as flicker. */
 +    {
