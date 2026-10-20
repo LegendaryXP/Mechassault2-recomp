@@ -359,6 +359,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     if (!getenv("RECOMP_READ_PAD_EOF"))
         _putenv("RECOMP_READ_PAD_EOF=1");
 
+    /* In-world sound (people talking, everything else in the world) comes in
+     * through the APU's 3D submix voices at the game's distance falloff,
+     * ~15 dB under the radio. +9 dB brings it up; the output limiter keeps
+     * battles from clipping. RECOMP_APU_3D_GAIN_DB sets another (0 = as the
+     * game mixes it). */
+    if (!getenv("RECOMP_APU_3D_GAIN_DB"))
+        _putenv("RECOMP_APU_3D_GAIN_DB=9");
+
     printf("Initializing Xbox memory layout...\n");
     if (!xbox_MemoryLayoutInit(xbe_data, xbe_size)) {
         MessageBoxA(NULL, "Failed to initialize Xbox memory layout.\n"

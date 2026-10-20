@@ -13,11 +13,6 @@ have one. Fixed bugs move to MODLOG.md.
 - **Rare DirectSound crash at a mission load** (2 of ~12 test runs,
   2026-10-20): reads [0xFE000264 + 4] while walking its voice list
   (0x003AAD59). Not seen in play yet.
-- **In-world speech quiet** (user, 2026-10-20): the game's own 3D distance
-  falloff puts it near -22 dB against the radio's -7 dB; Speech is already at
-  100% (Environment and Music at 23%). No emulation fault found; a boost
-  would be a balance change (MODLOG).
-
 - **Water draws black** (night level by the water with a wrecked ship;
   screenshot analysis/bug_water_black.webp, 2026-10-19). The water surface is
   solid black, and a bright grainy white band (spray or mist?) lies across it
