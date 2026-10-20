@@ -327,7 +327,7 @@ static int look_bodies(uint32_t walker, uint32_t *a, uint32_t *b, int *flag)
  * last turn left them: a heading the game puts back shows there. */
 static void look_turn(uint32_t walker, float yaw, int dbg)
 {
-    static int shown, lines;
+    static int shown, lines, total;
     static uint32_t last_mech_cam, last_a;
     static float left_a, left_b;
     static DWORD next, first;
@@ -342,14 +342,14 @@ static void look_turn(uint32_t walker, float yaw, int dbg)
         last_mech_cam = walker;
         last_a = a;
         first = now;
-        if (lines++ < 200)
+        lines = 0;      /* each camera gets its minute; at most 3000 lines a run */
+        if (total++ < 3000)
             fprintf(stderr, "[LOOK] turning camera %08X: %s %08X flag %d, %s %08X, second body %08X%s\n",
                     walker, s_veh_names[kind],
                     kind != VEH_WALKER ? s_veh : walker == s_pilot_cam ? s_pilot_mech : 0, flag,
                     kind == VEH_TANK ? "turret" : "body", a, b,
                     known ? "" : " (none known: aim and camera only)");
-    } else if (now - first < 60000 && (int)(now - next) >= 0 && lines < 200) {
-        lines++;
+    } else if (now - first < 60000 && (int)(now - next) >= 0 && lines++ < 130 && total++ < 3000) {
         next = now + 500;
         if (kind == VEH_WALKER) {
             fprintf(stderr, "[LOOK] turn %+.2f: aim %.2f cam %.2f; body %.2f (left %.2f); second %.2f (left %.2f)\n",
@@ -539,13 +539,17 @@ static int look_on(void)
 /* Hand the mouse to the camera entity: when yaw_on, the sideways turn
  * (look_turn), and when pitch_on, the tilt -- walker+0x144 in the game's
  * own clamp. An axis not asked for stays on the stick. */
+static float s_yaw_taken;   /* the turn look_apply handed out this call */
+
 static void look_apply(uint32_t walker, float input, int pitch_on, int yaw_on)
 {
     static int shown;
     float yaw = 0.0f, up = 0.0f, p, lo, hi;
 
+    s_yaw_taken = 0.0f;
     if (!mkb_mouse_look_take(yaw_on ? &yaw : NULL, pitch_on ? &up : NULL))
         return;
+    s_yaw_taken = yaw;
     look_trace('y', yaw);
     look_trace('p', up);
     look_cam_dump(yaw != 0.0f);
@@ -638,6 +642,77 @@ static int look_vehicle(uint32_t pilot, uint32_t walker)
     return kind;
 }
 
+/* A tank's turret holds its heading in the world while the hull turns under
+ * it, so W A S D steer the hull without swinging the aim. The tank pilot's
+ * update steers the hull toward the Move stick taken relative to the camera
+ * (sub_00175715: the camera node's yaw plus the stick's angle; past 105
+ * degrees it backs up instead, sub_00109FF4) -- W drives where you look, A
+ * and D turn the hull to drive left or right of it, S backs up. The turret's
+ * heading (tank+0x4EC) is its angle from the hull, and the camera aims at
+ * hull + turret, so a hull turn swung the aim with it. The tank's own update
+ * takes the hull's turn off the turret (sub_0010A6B2: turret -= this
+ * frame's hull turn) when it runs for a player tank; this hold does the same
+ * from the pitch call, every frame, and does nothing where the game already
+ * has: it keeps the turret's world heading (hull + turret) where the mouse
+ * left it. While the pad's stick turns the turret (its controller's yaw
+ * rate, tank+0x538, nonzero) the hold follows the game instead.
+ * MA2_TANK_HOLD=0 turns the hold off (the log stays). The log, for the
+ * first minute in each tank, four lines a second: hull heading (last
+ * frame's, and where the steering points it), turret, their sum against the
+ * held heading and the correction, the camera's aim and yaw, the Move
+ * stick. */
+#define MA2_TANK_TURRET_CMD_RATE 0x538u   /* tank+0x488 body's +0xB0 */
+#define MA2_PILOT_MOVE_Y    0x8Cu         /* action 4 */
+#define MA2_PILOT_MOVE_X    0xFCu         /* action 8 */
+
+static void look_tank_hold(uint32_t cam, uint32_t tank, uint32_t pilot, float yaw)
+{
+    static int on = -1, lines;
+    static uint32_t held;
+    static DWORD at, first, next;
+    static float aim;
+    uint32_t body = LOOK_MEM32(tank + MA2_MECH_BODY);
+    DWORD now = GetTickCount();
+    float hull, turret, stick, fix = 0.0f;
+
+    if (on < 0) {
+        const char *e = getenv("MA2_TANK_HOLD");
+        on = !(e && *e == '0');
+    }
+    if (!look_va_ok(body))
+        return;
+    hull = LOOK_MEMF(body + MA2_BODY_HEADING);
+    turret = LOOK_MEMF(tank + MA2_TANK_TURRET + MA2_BODY_HEADING);
+    stick = LOOK_MEMF(tank + MA2_TANK_TURRET_CMD_RATE);
+    if (tank != held) {
+        first = now;
+        lines = 0;
+    }
+    /* The mouse's turn this frame is in the turret already (look_turn). */
+    if (tank != held || now - at > 500 || stick != 0.0f)
+        aim = hull + turret;
+    else
+        aim += yaw;
+    held = tank;
+    at = now;
+    if (on) {
+        fix = aim - hull - turret;
+        if (fix != 0.0f)
+            LOOK_MEMF(tank + MA2_TANK_TURRET + MA2_BODY_HEADING) = aim - hull;
+    }
+    if (now - first < 60000 && (int)(now - next) >= 0 && lines++ < 250) {
+        next = now + 250;
+        fprintf(stderr, "[LOOK] tank %08X: hull %.2f (last %.2f, steer %.2f) turret %.2f;"
+                        " world %.2f held %.2f fix %+.3f; aim %.2f cam %.2f; move %.2f %.2f stick %.1f%s\n",
+                tank, hull, LOOK_MEMF(body + MA2_BODY_LAST_HEADING), LOOK_MEMF(body + MA2_BODY_CMD_HEADING),
+                turret, hull + turret, aim, fix, LOOK_MEMF(cam + MA2_WALKER_CAM_TARGET),
+                LOOK_MEMF(cam + MA2_WALKER_CAM_YAW),
+                look_va_ok(pilot) ? LOOK_MEMF(pilot + MA2_PILOT_MOVE_X) : 0.0f,
+                look_va_ok(pilot) ? LOOK_MEMF(pilot + MA2_PILOT_MOVE_Y) : 0.0f, stick,
+                on ? "" : " (hold off)");
+    }
+}
+
 void ma2_mouse_look_pitch(uint32_t ret, uint32_t walker, float input, uint32_t pilot)
 {
     int kind;
@@ -659,6 +734,8 @@ void ma2_mouse_look_pitch(uint32_t ret, uint32_t walker, float input, uint32_t p
                     body_is_walkers(s_body, walker) ? "known" : "not known yet");
     }
     look_apply(walker, input, 1, kind != VEH_OTHER);
+    if (kind == VEH_TANK)
+        look_tank_hold(walker, s_veh, pilot, s_yaw_taken);
 }
 
 /* The mech pilot's update, sub_00172E96 (thiscall, this = pilot), runs every
