@@ -436,6 +436,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
         xbox_D3D11BackendInstall();
     }
 
+    /* Mouse and keyboard: key pictures over the pad's button icons
+     * (src/ma2_prompts.c). */
+    {
+        extern void ma2_PromptsStart(void);
+        ma2_PromptsStart();
+    }
+
     /* MA2_PROFILE=1: sampling profiler (src/ma2_profile.c). */
     {
         extern void ma2_ProfileStart(void);

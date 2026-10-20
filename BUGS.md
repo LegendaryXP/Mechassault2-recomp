@@ -33,3 +33,15 @@ have one. Fixed bugs move to MODLOG.md.
   hangars, and mottled sky-like patches on the rooftops (same screenshots).
   Suspect environment/cube-map reflections: face order or orientation, or a
   reflection texture that is a render target.
+
+## Later (features asked for, not started)
+
+- **Mouse in menus** (user, 2026-10-19): a visible cursor that highlights a
+  menu item on hover and selects it on click, in every menu. The menus are
+  pad-driven (MAMenu* classes, .ggf layouts), so this needs each item's
+  screen rectangle and the call that moves the focus; parked for more
+  important features.
+- **Y and Black button icons** still show the pad's picture: they did not
+  appear in any test run, so their texture hashes are unknown. Run with
+  `set RECOMP_TEX_HASHES=64` where one shows, and add its hash to k_icons in
+  src/ma2_prompts.c.
