@@ -253,11 +253,35 @@ static void draw_mouse(int part)
         label(L"\x25BC", 31, 42, 20, 16, 0x262626);
 }
 
+/* The canvas down to ICON x ICON, alpha-weighted. */
+static void resolve(uint32_t *out)
+{
+    int x, y, sx, sy;
+    for (y = 0; y < ICON; y++)
+        for (x = 0; x < ICON; x++) {
+            float r = 0, g = 0, b = 0, a = 0;
+            for (sy = 0; sy < SS; sy++)
+                for (sx = 0; sx < SS; sx++) {
+                    const float *p = s_rgba[(y * SS + sy) * BIG + x * SS + sx];
+                    r += p[0] * p[3];
+                    g += p[1] * p[3];
+                    b += p[2] * p[3];
+                    a += p[3];
+                }
+            if (a > 0.0f) {
+                r /= a; g /= a; b /= a;
+            }
+            a /= SS * SS;
+            out[y * ICON + x] = ((uint32_t)(a * 255.0f + 0.5f) << 24)
+                | ((uint32_t)(r * 255.0f + 0.5f) << 16)
+                | ((uint32_t)(g * 255.0f + 0.5f) << 8) | (uint32_t)(b * 255.0f + 0.5f);
+        }
+}
+
 static void make(int n)
 {
     const char *k = icon_key(k_icons[n].control);
     wchar_t buf[16];
-    int x, y, sx, sy;
 
     if (!k) {
         s_made[n] = -1;
@@ -276,35 +300,168 @@ static void make(int n)
         draw_mouse(4);
     else
         draw_key(cap_label(k, buf, 16));
-    /* Down to ICON x ICON, alpha-weighted. */
-    for (y = 0; y < ICON; y++)
-        for (x = 0; x < ICON; x++) {
-            float r = 0, g = 0, b = 0, a = 0;
-            for (sy = 0; sy < SS; sy++)
-                for (sx = 0; sx < SS; sx++) {
-                    const float *p = s_rgba[(y * SS + sy) * BIG + x * SS + sx];
-                    r += p[0] * p[3];
-                    g += p[1] * p[3];
-                    b += p[2] * p[3];
-                    a += p[3];
-                }
-            if (a > 0.0f) {
-                r /= a; g /= a; b /= a;
-            }
-            a /= SS * SS;
-            s_pic[n][y * ICON + x] = ((uint32_t)(a * 255.0f + 0.5f) << 24)
-                | ((uint32_t)(r * 255.0f + 0.5f) << 16)
-                | ((uint32_t)(g * 255.0f + 0.5f) << 8) | (uint32_t)(b * 255.0f + 0.5f);
-        }
+    resolve(s_pic[n]);
     s_made[n] = 1;
     fprintf(stderr, "[PROMPT] %s icon shows %s\n", k_icons[n].control, k);
+}
+
+/* ---- the NeuroHack diamond's buttons ---------------------------------------- *
+ *
+ * The hack HUD lights 32x32 DXT5 buttons with the pad's letters: discs for
+ * A B X Y (lit, and a paler "pressed" look), orange squares for the L and R
+ * triggers. These keep the game's picture -- the disc, its glow -- with the
+ * letter painted over in the disc's own colour and the key the "hack" mode
+ * binds written in its place, in the letter's colour: W A S D on the
+ * diamond, LMB and RMB on the triggers with this mkb.ini. Found with the
+ * bug-hunt launcher's RECOMP_TEX_HASHES pictures; the pressed Y and R were
+ * not among them.
+ */
+int nv2a_backend_decode_texture(const void *tex, uint32_t *argb_out);
+const char *mkb_mode_binding(const char *mode, const char *control, int n);
+
+static const struct { uint64_t hash; const char *control; int square; } k_hack[] = {
+    { 0x910A51806DAEE6A2ull, "A", 0 },  { 0xE214F3F00078CB64ull, "A", 0 },
+    { 0x6CFF8A5829769B47ull, "X", 0 },  { 0xAB65E9663EAD89D0ull, "X", 0 },
+    { 0x57F6204D4C529910ull, "B", 0 },  { 0x43728FDB67DCBDD2ull, "B", 0 },
+    { 0xA09DD1340BAF8C7Aull, "Y", 0 },
+    { 0xB8F71A2CBCA566C6ull, "LT", 1 }, { 0x9DA373EFE77FAF35ull, "LT", 1 },
+    { 0x33E337CD3BCDF5CCull, "RT", 1 },
+};
+#define NHACK (sizeof k_hack / sizeof k_hack[0])
+#define HSRC 32                         /* the game's buttons */
+
+static uint32_t s_hack_pic[NHACK][ICON * ICON];
+static int s_hack_made[NHACK];
+
+/* What a hack button says for its key. */
+static const wchar_t *hack_label(const char *k, wchar_t *buf, size_t n)
+{
+    if (!strcmp(k, "MOUSE1")) return L"LMB";
+    if (!strcmp(k, "MOUSE2")) return L"RMB";
+    if (!strcmp(k, "MOUSE3")) return L"MMB";
+    return cap_label(k, buf, n);
+}
+
+static float lum(uint32_t c)
+{
+    return (0.299f * ((c >> 16) & 0xFF) + 0.587f * ((c >> 8) & 0xFF)
+            + 0.114f * (c & 0xFF)) / 255.0f;
+}
+
+/* src: the game's 32x32 button, 0xAARRGGBB. Draws the relabelled one on the
+ * canvas; 0 when the picture is not one it understands. */
+static int draw_hack(const uint32_t *src, int square, const wchar_t *text)
+{
+    int x, y, x0 = HSRC, y0 = HSRC, x1 = -1, y1 = -1, i, j;
+    float cx, cy, hw, hh, r, k = (float)ICON / HSRC, d, dl = 0.0f, fl;
+    uint32_t fill, ink = 0, ring[48], t;
+
+    /* The opaque body: its box, in the game's pixels. */
+    for (y = 0; y < HSRC; y++)
+        for (x = 0; x < HSRC; x++)
+            if ((src[y * HSRC + x] >> 24) >= 240) {
+                if (x < x0) x0 = x;
+                if (x > x1) x1 = x;
+                if (y < y0) y0 = y;
+                if (y > y1) y1 = y;
+            }
+    if (x1 < x0 + 6 || y1 < y0 + 6)
+        return 0;
+    cx = (x0 + x1 + 1) * 0.5f * k;
+    cy = (y0 + y1 + 1) * 0.5f * k;
+    hw = (x1 - x0 + 1) * 0.5f * k;
+    hh = (y1 - y0 + 1) * 0.5f * k;
+    r = hw < hh ? hw : hh;
+    /* The game's picture, scaled up (bilinear, alpha-weighted). */
+    for (y = 0; y < BIG; y++)
+        for (x = 0; x < BIG; x++) {
+            float u = (x + 0.5f) * HSRC / BIG - 0.5f, v = (y + 0.5f) * HSRC / BIG - 0.5f;
+            int u0 = (int)floorf(u), v0 = (int)floorf(v), c;
+            float fu = u - u0, fv = v - v0, acc[4] = { 0, 0, 0, 0 }, *o;
+            for (c = 0; c < 4; c++) {
+                int uu = u0 + (c & 1), vv = v0 + (c >> 1);
+                float wgt = ((c & 1) ? fu : 1 - fu) * ((c >> 1) ? fv : 1 - fv);
+                uint32_t p;
+                uu = uu < 0 ? 0 : uu > HSRC - 1 ? HSRC - 1 : uu;
+                vv = vv < 0 ? 0 : vv > HSRC - 1 ? HSRC - 1 : vv;
+                p = src[vv * HSRC + uu];
+                acc[3] += wgt * (p >> 24);
+                acc[0] += wgt * ((p >> 16) & 0xFF) * (p >> 24);
+                acc[1] += wgt * ((p >> 8) & 0xFF) * (p >> 24);
+                acc[2] += wgt * (p & 0xFF) * (p >> 24);
+            }
+            o = s_rgba[y * BIG + x];
+            o[3] = acc[3] / 255.0f;
+            o[0] = acc[3] > 0 ? acc[0] / acc[3] / 255.0f : 0;
+            o[1] = acc[3] > 0 ? acc[1] / acc[3] / 255.0f : 0;
+            o[2] = acc[3] > 0 ? acc[2] / acc[3] / 255.0f : 0;
+        }
+    /* The body's colour: the middle brightness on a ring just outside the
+     * letter. The letter's: the inner pixel furthest from it. */
+    for (i = 0; i < 48; i++) {
+        float a = i * 6.2831853f / 48;
+        float rx = (square ? hw * 0.80f : r * 0.80f) / k, ry = (square ? hh * 0.82f : r * 0.80f) / k;
+        int sx = (int)(cx / k + cosf(a) * rx), sy = (int)(cy / k + sinf(a) * ry);
+        sx = sx < 0 ? 0 : sx > HSRC - 1 ? HSRC - 1 : sx;
+        sy = sy < 0 ? 0 : sy > HSRC - 1 ? HSRC - 1 : sy;
+        ring[i] = src[sy * HSRC + sx];
+    }
+    for (i = 1; i < 48; i++) {
+        t = ring[i];
+        for (j = i; j > 0 && lum(ring[j - 1]) > lum(t); j--)
+            ring[j] = ring[j - 1];
+        ring[j] = t;
+    }
+    fill = ring[24];
+    fl = lum(fill);
+    for (y = y0; y <= y1; y++)
+        for (x = x0; x <= x1; x++) {
+            float px = (x + 0.5f) * k - cx, py = (y + 0.5f) * k - cy;
+            if (px * px + py * py > r * r * 0.36f)
+                continue;
+            d = fabsf(lum(src[y * HSRC + x]) - fl);
+            if (d > dl) {
+                dl = d;
+                ink = src[y * HSRC + x];
+            }
+        }
+    if (dl < 0.15f)
+        return 0;
+    /* Paint the letter out, then write the key. */
+    if (square)
+        rrect(cx - hw * 0.70f, cy - hh * 0.74f, cx + hw * 0.70f, cy + hh * 0.74f,
+              2.0f, fill & 0xFFFFFF, fill & 0xFFFFFF, 1.0f);
+    else
+        rrect(cx - r * 0.80f, cy - r * 0.80f, cx + r * 0.80f, cy + r * 0.80f,
+              r * 0.80f, fill & 0xFFFFFF, fill & 0xFFFFFF, 1.0f);
+    if (square)
+        label(text, cx, cy, hw * 1.75f, wcslen(text) > 1 ? hh * 1.0f : hh * 1.3f, ink & 0xFFFFFF);
+    else
+        label(text, cx, cy + r * 0.02f, r * 1.4f, r * 1.4f, ink & 0xFFFFFF);
+    return 1;
+}
+
+static void make_hack(int n, const void *tex)
+{
+    uint32_t src[HSRC * HSRC];
+    const char *k = mkb_mode_binding("hack", k_hack[n].control, 0);
+    wchar_t buf[16];
+
+    s_hack_made[n] = -1;
+    if (!k || !nv2a_backend_decode_texture(tex, src))
+        return;
+    memset(s_rgba, 0, sizeof s_rgba);
+    if (!draw_hack(src, k_hack[n].square, hack_label(k, buf, 16)))
+        return;
+    resolve(s_hack_pic[n]);
+    s_hack_made[n] = 1;
+    fprintf(stderr, "[PROMPT] hack %s button shows %s\n", k_hack[n].control, k);
 }
 
 static int ma2_prompt_tex(uint64_t hash, const void *tex, const uint32_t **argb,
                           uint32_t *w, uint32_t *h)
 {
     size_t n;
-    (void)tex;
     for (n = 0; n < NICONS; n++)
         if (k_icons[n].hash == hash) {
             if (!s_made[n])
@@ -312,6 +469,16 @@ static int ma2_prompt_tex(uint64_t hash, const void *tex, const uint32_t **argb,
             if (s_made[n] < 0)
                 return 0;
             *argb = s_pic[n];
+            *w = *h = ICON;
+            return 1;
+        }
+    for (n = 0; n < NHACK; n++)
+        if (k_hack[n].hash == hash) {
+            if (!s_hack_made[n])
+                make_hack((int)n, tex);
+            if (s_hack_made[n] < 0)
+                return 0;
+            *argb = s_hack_pic[n];
             *w = *h = ICON;
             return 1;
         }
