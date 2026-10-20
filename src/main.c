@@ -351,6 +351,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
         if (mb > 64 && mb <= 512)
             xbox_SetMapSize((size_t)mb << 20);
     }
+    /* The game streams its archives in 16 KB blocks from 2 KB boundaries and
+     * calls any short read a dirty disc; Mission 5's cache file ends 4 KB
+     * into its last block. Reads that run past the end of a file come back
+     * full length (zeros past the end), as the console evidently does.
+     * RECOMP_READ_PAD_EOF=0 turns it off. */
+    if (!getenv("RECOMP_READ_PAD_EOF"))
+        _putenv("RECOMP_READ_PAD_EOF=1");
+
     printf("Initializing Xbox memory layout...\n");
     if (!xbox_MemoryLayoutInit(xbe_data, xbe_size)) {
         MessageBoxA(NULL, "Failed to initialize Xbox memory layout.\n"

@@ -8,7 +8,8 @@ param(
     [string]$DumpWhile = "",
     [switch]$NoKeyboard,
     [switch]$NoUsb,
-    [switch]$SeparateSave
+    [switch]$SeparateSave,
+    [string]$SaveSeed = 'testsave_seed'
 )
 $root = 'C:\Mechassault2\ma2-recomp'
 Set-Location $root
@@ -48,9 +49,11 @@ $env:RECOMP_MUTE = '1'          # test runs are silent; play.bat is not
 $xr = "$env:LOCALAPPDATA\xboxrecomp"
 if ($SeparateSave) {
     $env:RECOMP_SAVE_DIR = "$root\analysis\testsave"
-    if (Test-Path "$root\analysis\testsave_seed") {
+    # -SaveSeed usersave_seed: the player's save, copied by "Copy save for
+    # testing.bat" (test runs cannot read the player's own save folder).
+    if (Test-Path "$root\analysis\$SaveSeed") {
         Remove-Item "$root\analysis\testsave" -Recurse -Force -ErrorAction SilentlyContinue
-        Copy-Item "$root\analysis\testsave_seed" "$root\analysis\testsave" -Recurse
+        Copy-Item "$root\analysis\$SaveSeed" "$root\analysis\testsave" -Recurse
     }
 } else {
     $env:RECOMP_SAVE_DIR = $null
