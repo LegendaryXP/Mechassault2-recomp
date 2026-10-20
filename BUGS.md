@@ -28,10 +28,6 @@ have one. Fixed bugs move to MODLOG.md.
   the voices"). The radio speech now plays at unity through its FX send
   (toolkit 5825f42). The game has its own volume menu (MAMenuInGameVolume,
   pause menu); try the voice slider there before changing the mix.
-- **Jump-jet exhaust draws as a black square** under the mech, the plume's
-  tail (screenshot 2026-10-18). Suspect a texture the renderer can't decode,
-  or a heat-haze effect sampling the frame it is drawing into. The log names
-  only the first 4 volume textures, so this one isn't in it.
 - **Lighting goes very dark in later parts of the first jump-jet level**, the
   roads nearly black (2 screenshots, 2026-10-18). Suspect lightmaps, vertex
   lights past some count, fog, or a combiner stage the shaders get wrong.
