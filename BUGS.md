@@ -5,13 +5,6 @@ have one. Fixed bugs move to MODLOG.md.
 
 ## Open
 
-- **Tank main cannon draws nothing** (user, 2026-10-19; the tank is in a
-  later mission, not reachable by test runs). Found meanwhile: the renderer
-  dropped every line and point the game drew; lines draw now (toolkit
-  b5a4622 -- the tutorial text box's border was one), points are still
-  dropped and logged. Next: fire the cannon in the bug-hunt build and press
-  F8 right after; logs\bughunt_stderr.txt shows whether "[PB] points ... not
-  drawn" lines come with it.
 - **Water draws black** (night level by the water with a wrecked ship;
   screenshot analysis/bug_water_black.webp, 2026-10-19). The water surface is
   solid black, and a bright grainy white band (spray or mist?) lies across it
