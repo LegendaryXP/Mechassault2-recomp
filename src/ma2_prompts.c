@@ -789,7 +789,11 @@ static void scan_range(uint8_t *base, size_t size)
 
 static void scan_guest(void)
 {
-    uint8_t *base = (uint8_t *)g_xbox_mem_offset, *at = base, *end = base + 0x04000000;
+    /* Guest RAM and the heap's share of the mapped range above it (main.c
+     * maps 128 MB). */
+    extern size_t g_xbox_map_size;
+    uint8_t *base = (uint8_t *)g_xbox_mem_offset, *at = base,
+            *end = base + (g_xbox_map_size ? g_xbox_map_size : 0x04000000);
     MEMORY_BASIC_INFORMATION mbi;
     while (at < end && VirtualQuery(at, &mbi, sizeof mbi)) {
         uint8_t *rs = (uint8_t *)mbi.BaseAddress, *re = rs + mbi.RegionSize;

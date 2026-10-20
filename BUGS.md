@@ -5,6 +5,14 @@ have one. Fixed bugs move to MODLOG.md.
 
 ## Open
 
+- **"There's a problem with the disc" after a few missions** (user,
+  2026-10-19 screenshot; the game then rebooted itself). Likely cause found
+  and fixed, needs your play: after several missions the game heap was too
+  fragmented for a 16 MB reservation, the toolkit cut it to 8 MB and the game
+  used all 16 -- over other memory -- before the next mission load failed.
+  The guest map is now 128 MB, so the heap has room. If it happens again,
+  keep logs\last_stderr.txt and look for "clamped" or "out of memory".
+
 - **Water draws black** (night level by the water with a wrecked ship;
   screenshot analysis/bug_water_black.webp, 2026-10-19). The water surface is
   solid black, and a bright grainy white band (spray or mist?) lies across it

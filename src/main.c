@@ -334,7 +334,23 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     }
     printf("XBE loaded: %zu bytes\n", xbe_size);
 
-    /* Step 2: Initialize Xbox memory layout */
+    /* Step 2: Initialize Xbox memory layout.
+     *
+     * Map 128 MB of guest address space over the 64 MB of RAM. MechAssault 2
+     * reserves 16 MB at a mission load; after a few missions the heap is too
+     * fragmented to hold that in one piece, and the toolkit cut the
+     * reservation to 8 MB, which the game then used in full -- over whatever
+     * came next. With the larger map the toolkit's heap serves the whole
+     * mapped range (112 MB from 0x00F80000), so the reservation fits; what
+     * the game is told about RAM stays 64 MB. MA2_MAP_MB sets another size;
+     * 64 restores the old layout. */
+    {
+        extern void xbox_SetMapSize(size_t bytes);
+        const char *e = getenv("MA2_MAP_MB");
+        long mb = e ? atol(e) : 128;
+        if (mb > 64 && mb <= 512)
+            xbox_SetMapSize((size_t)mb << 20);
+    }
     printf("Initializing Xbox memory layout...\n");
     if (!xbox_MemoryLayoutInit(xbe_data, xbe_size)) {
         MessageBoxA(NULL, "Failed to initialize Xbox memory layout.\n"
