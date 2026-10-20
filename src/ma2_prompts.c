@@ -656,6 +656,34 @@ static DWORD WINAPI text_thread(void *arg)
     return 0;
 }
 
+/* ---- NeuroHack and bucking ------------------------------------------------- *
+ *
+ * The minigame lights buttons on the pad's face diamond (Y top, X left, B
+ * right, A bottom) to press fast, sometimes two at once -- E, Z, F and G on
+ * the normal layout, nowhere near each other. While the HUD shows the
+ * diamond (recomp_manual.c's sub_0018EC9D hook, every frame) the layout's
+ * "hack" mode is on: mkb.ini binds W A S D (and the arrows) to the button in
+ * the same place, and Move stops for as long. It lapses 250 ms after the HUD
+ * stops asking.
+ */
+void mkb_set_mode(const char *mode, int ms);
+
+void ma2_hack_hud_seen(uint32_t session, uint32_t bit, uint32_t state)
+{
+    static uint32_t last_session;
+    static int lines;
+    mkb_set_mode("hack", 250);
+    if (session != last_session) {
+        last_session = session;
+        lines = 0;
+        fprintf(stderr, "[HACK] diamond on the HUD (session %08X)\n", session);
+    }
+    if (lines < 24 && state) {
+        lines++;
+        fprintf(stderr, "[HACK] button bit %02X state %u\n", bit, state);
+    }
+}
+
 void ma2_PromptsStart(void)
 {
     const char *e = getenv("MA2_PROMPTS");

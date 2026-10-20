@@ -928,6 +928,29 @@ void recomp_icall_not_code_log(uint32_t va)
     fflush(stderr);
 }
 
+/* ── NeuroHack / bucking: the button diamond on the HUD ─────────────────
+ *
+ * Hijacking a 'Mech (NeuroHack) or shaking off a hijacker (bucking) runs a
+ * session object, [mech+0x274] (0xC8 bytes; jack sub_0018E923, buck
+ * sub_0018E996, freed by sub_00103D4E): it lights buttons of the pad's face
+ * diamond and counts the presses (sub_0018EBFA, by way of the mech's
+ * sub_00103B5F). The HUD's button components (MAComponentJackingGameButton,
+ * update sub_0021E7D8) find the session through the player's mech and ask
+ * it, every frame, what one button (bl, a bit) shows: sub_0018EC9D, edx the
+ * session, eax back the button's state (0 not in play, ...). That call is
+ * the HUD showing the diamond, so ma2_prompts.c turns the "hack" key layout
+ * on while it keeps coming. Its only caller is 0x0021E801. */
+extern void sub_0018EC9D_gen(void);
+void ma2_hack_hud_seen(uint32_t session, uint32_t bit, uint32_t state);
+
+void sub_0018EC9D(void)
+{
+    extern __declspec(thread) uint32_t g_eax, g_ebx, g_edx;
+    uint32_t session = g_edx, bit = g_ebx & 0xFFu;
+    sub_0018EC9D_gen();
+    ma2_hack_hud_seen(session, bit, g_eax);
+}
+
 /* ── Untranslated instructions ───────────────────────────────────────────
  *
  * The lifter emits RECOMP_UNIMPL(text, va) at every instruction it has no
