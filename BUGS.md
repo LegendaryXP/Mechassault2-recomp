@@ -9,7 +9,8 @@ have one. Fixed bugs move to MODLOG.md.
   copy of the 'Mech 40 px to its left. The water reads a 640x480 copy of the
   scene with 720-wide screen coordinates; clean in 4:3. Looks like the game's
   own 480p-widescreen limitation (MODLOG). Options: live with it, play 4:3,
-  or patch the game to size that copy 720x480.
+  or patch the game. Update: the screen copy is ruled out; next suspect
+  is a 512x512 shadow/light texture projected on stages 2-3 (MODLOG).
 - **Water draws black** (night level by the water with a wrecked ship;
   screenshot analysis/bug_water_black.webp, 2026-10-19). The water surface is
   solid black, and a bright grainy white band (spray or mist?) lies across it
