@@ -732,6 +732,13 @@ static int ma2_is_skipped(uint32_t va)
  *                   cmp [ecx+0x38], 0 / je none
  *                   mov ecx, [ecx+0x38] / mov eax, [ecx] / jmp [eax+slot]
  *                   none: (xor al, al) ret
+ *   0x00109FAE  add ecx, 0x4C8 / mov eax, [ecx] / jmp [eax+0x20] -- MATank's
+ *               vt+0x19C, the turret's heading from the hull (the state block
+ *               of the turret's body, tank+0x488 + 0x40). The third-person
+ *               camera adds it to the hull's heading for its aim
+ *               (sub_0011F506); failing, the view stayed on the hull whatever
+ *               the turret did (user, first tank drive: "you didnt change a
+ *               thing"), a failed call every frame in a tank.
  *
  * A few instructions each, so written here rather than seeded and the whole
  * title regenerated. MA2_SKIP_ICALL=<va> makes one fail again, as before.
@@ -776,6 +783,28 @@ static void ma2_forward(uint32_t slot, int clear_al)
     }
 }
 
+/* add ecx, 0x4C8 / mov eax, [ecx] / jmp [eax+0x20]: a tail call, like the
+ * forwards above. */
+static void ma2_tank_turret_00109FAE(void)
+{
+    uint32_t va;
+    recomp_func_t fn;
+
+    g_ecx += 0x4C8u;
+    g_eax = MA2_MEM32(g_ecx);
+    va = MA2_MEM32(g_eax + 0x20);
+    fn = recomp_lookup_manual(va);
+    if (!fn) fn = recomp_lookup(va);
+    if (!fn) fn = recomp_lookup_kernel(va);
+    if (fn) {
+        fn();
+    } else {
+        recomp_icall_fail_log(va);
+        g_esp += 4;
+        g_eax = 0;
+    }
+}
+
 static void ma2_forward_001C4EC6(void) { ma2_forward(0x3C, 0); }
 static void ma2_forward_001C4F66(void) { ma2_forward(0x48, 1); }
 static void ma2_forward_001C4FAE(void) { ma2_forward(0x24, 0); }
@@ -791,6 +820,7 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va)
     case 0x001C4F66u: return ma2_forward_001C4F66;
     case 0x001C4FAEu: return ma2_forward_001C4FAE;
     case 0x001C5275u: return ma2_forward_001C5275;
+    case 0x00109FAEu: return ma2_tank_turret_00109FAE;
     default: break;
     }
     return (recomp_func_t)0;
