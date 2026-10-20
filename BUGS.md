@@ -5,6 +5,19 @@ have one. Fixed bugs move to MODLOG.md.
 
 ## Open
 
+- **Ghost 'Mech on the water in 16:9** (user, 2026-10-20, Mission 5): a dark
+  copy of the 'Mech 40 px to its left. The water reads a 640x480 copy of the
+  scene with 720-wide screen coordinates; clean in 4:3. Looks like the game's
+  own 480p-widescreen limitation (MODLOG). Options: live with it, play 4:3,
+  or patch the game to size that copy 720x480.
+- **Rare DirectSound crash at a mission load** (2 of ~12 test runs,
+  2026-10-20): reads [0xFE000264 + 4] while walking its voice list
+  (0x003AAD59). Not seen in play yet.
+- **In-world speech quiet** (user, 2026-10-20): the game's own 3D distance
+  falloff puts it near -22 dB against the radio's -7 dB; Speech is already at
+  100% (Environment and Music at 23%). No emulation fault found; a boost
+  would be a balance change (MODLOG).
+
 - **Water draws black** (night level by the water with a wrecked ship;
   screenshot analysis/bug_water_black.webp, 2026-10-19). The water surface is
   solid black, and a bright grainy white band (spray or mist?) lies across it
