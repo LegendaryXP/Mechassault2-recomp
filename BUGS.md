@@ -10,9 +10,6 @@ have one. Fixed bugs move to MODLOG.md.
   scene with 720-wide screen coordinates; clean in 4:3. Looks like the game's
   own 480p-widescreen limitation (MODLOG). Options: live with it, play 4:3,
   or patch the game to size that copy 720x480.
-- **Rare DirectSound crash at a mission load** (2 of ~12 test runs,
-  2026-10-20): reads [0xFE000264 + 4] while walking its voice list
-  (0x003AAD59). Not seen in play yet.
 - **Water draws black** (night level by the water with a wrecked ship;
   screenshot analysis/bug_water_black.webp, 2026-10-19). The water surface is
   solid black, and a bright grainy white band (spray or mist?) lies across it

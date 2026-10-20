@@ -810,6 +810,51 @@ static void ma2_forward_001C4F66(void) { ma2_forward(0x48, 1); }
 static void ma2_forward_001C4FAE(void) { ma2_forward(0x24, 0); }
 static void ma2_forward_001C5275(void) { ma2_forward(0x40, 1); }
 
+/* A DirectSound voice deleted while still queued on the APU's notify list
+ * (core+0x4A0, linked at voice+0x54).
+ *
+ * The voice destructor (sub_003AE58F) never unlinks it from there: on the
+ * console DirectSound's DPC always runs between its ISR queuing a voice and
+ * the title's next DirectSound call. When that ordering broke here (toolkit,
+ * apu_deliver_irq), the DPC later popped the freed voice and called its
+ * method through the base vtable the destructor leaves, 0x00453448 -- slot
+ * 0x18 there is a Release (sub_003A89C5), which took the caller's saved edi,
+ * the KeSynchronizeExecution thunk 0xFE000264, for `this` and faulted
+ * reading 0xFE000268. Logged here, at the delete, where the cause still is:
+ * the crash comes later on another thread. Reached through the scalar
+ * deleting destructors in the voice vtables (slot 0), all called indirectly
+ * (sub_003A6659), so no regeneration is needed. */
+extern void sub_003AE793(void);
+extern void sub_003AC3FF(void);
+extern void sub_003AF48A(void);
+extern int  xbox_IrqlRaisedCount(void);
+extern void xbox_IrqlDumpHolders(void);
+extern __declspec(thread) uint32_t g_fs_base;
+#define MA2_MEM8(va) (*(volatile uint8_t *)((uint8_t *)g_xbox_mem_offset + (va)))
+
+static void ma2_voice_probe(uint32_t vt)
+{
+    static volatile LONG n;
+    uint32_t x = g_ecx, core = MA2_MEM32(x + 8);
+
+    if (MA2_MEM32(x + 0x54) == x + 0x54)
+        return;
+    if (InterlockedIncrement(&n) > 20)
+        return;
+    fprintf(stderr, "  [DSVOICE] voice %08X (vt %08X) deleted while queued "
+            "for DirectSound's DPC, which will call it after it is freed: "
+            "tid %lu esp %08X irql %u, core %08X dpc queued %u busy %u, "
+            "depth %d\n", x, vt, (unsigned long)GetCurrentThreadId(), g_esp,
+            g_fs_base ? MA2_MEM8(g_fs_base + 0x24) : 0xFFu, core,
+            core ? MA2_MEM8(core + 0x4C8 + 2) : 0u,
+            core ? MA2_MEM32(core + 0x84) : 0u, xbox_IrqlRaisedCount());
+    xbox_IrqlDumpHolders();
+}
+
+static void ma2_voice_del_003AE793(void) { ma2_voice_probe(0x453588u); sub_003AE793(); }
+static void ma2_voice_del_003AC3FF(void) { ma2_voice_probe(0x45354Cu); sub_003AC3FF(); }
+static void ma2_voice_del_003AF48A(void) { ma2_voice_probe(0x4535B0u); sub_003AF48A(); }
+
 recomp_func_t recomp_lookup_manual(uint32_t xbox_va)
 {
     if (ma2_is_skipped(xbox_va))
@@ -821,6 +866,9 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va)
     case 0x001C4FAEu: return ma2_forward_001C4FAE;
     case 0x001C5275u: return ma2_forward_001C5275;
     case 0x00109FAEu: return ma2_tank_turret_00109FAE;
+    case 0x003AE793u: return ma2_voice_del_003AE793;
+    case 0x003AC3FFu: return ma2_voice_del_003AC3FF;
+    case 0x003AF48Au: return ma2_voice_del_003AF48A;
     default: break;
     }
     return (recomp_func_t)0;
