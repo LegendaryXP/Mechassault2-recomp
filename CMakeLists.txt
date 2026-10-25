@@ -60,6 +60,7 @@ set(GAME_SOURCES
     src/ma2_ground.c
     src/ma2_music.c
     src/ma2_prompts.c
+    src/ma2_setup.c
     # Add game-specific sources here, e.g.:
     # src/asset_loader.c
     # src/custom_renderer.c
@@ -93,6 +94,9 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     dxguid
     xinput
     winmm
+    # The setup window's folder and file pickers (ma2_setup.c).
+    ole32
+    uuid
     # Lets the fault handler resolve the host RIP back to the generated
     # function's symbol, i.e. to the guest function that faulted.
     dbghelp

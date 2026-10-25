@@ -85,9 +85,8 @@ extern ptrdiff_t g_xbox_mem_offset;
  * Run: py -3 -m tools.xbe_parser game/default.xbe
  */
 #define YOUR_GAME_ENTRY_POINT   0x002B94F2  /* XBE entry point VA (ma2.xbe) */
-/* default.xbe on the disc is only a launcher that starts D:\MA2.xbe */
-#define YOUR_GAME_XBE_PATH      "game\\ma2.xbe"
-#define YOUR_GAME_DIR            "game"
+/* default.xbe on the disc is only a launcher that starts D:\MA2.xbe. Where
+ * the game files are is ma2_setup.c's business (game\ by default). */
 
 /* ── Forward declarations ──────────────────────────────────── */
 
@@ -297,10 +296,17 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     void *xbe_data = NULL;
     size_t xbe_size = 0;
 
+    char game_dir[MAX_PATH], save_dir[MAX_PATH], xbe_path[MAX_PATH];
+    extern void ma2_EarlyInit(void);
+    extern int ma2_SetupPaths(char *game, char *saves, const char *cmdline);
+
     (void)hInstance;
     (void)hPrevInstance;
-    (void)lpCmdLine;
     (void)nCmdShow;
+
+    /* The base folder, play.bat's settings when started without it, and the
+     * log -- before anything prints or reads a setting. */
+    ma2_EarlyInit();
 
     /* 1 ms timer resolution for the whole process. Windows' default is
      * 15.6 ms, so every Sleep(1), timed wait and KeDelayExecutionThread the
@@ -325,11 +331,15 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     SymInitialize(GetCurrentProcess(), NULL, TRUE);
     AddVectoredExceptionHandler(1, veh_handler);
 
-    /* Step 1: Load XBE */
-    if (!load_xbe(YOUR_GAME_XBE_PATH, &xbe_data, &xbe_size)) {
-        MessageBoxA(NULL, "Failed to load game\\ma2.xbe.\n"
-                    "Place the game files in the 'game' subdirectory.",
-                    "Recomp", MB_ICONERROR);
+    /* Step 1: Find the game files (asking the first time) and load the XBE */
+    if (!ma2_SetupPaths(game_dir, save_dir, lpCmdLine))
+        return 0;
+    snprintf(xbe_path, sizeof xbe_path, "%s\\ma2.xbe", game_dir);
+    if (!load_xbe(xbe_path, &xbe_data, &xbe_size)) {
+        char m[MAX_PATH + 128];
+        snprintf(m, sizeof m, "Failed to load %s.\n"
+                 "Run ma2.exe --setup to choose the game files again.", xbe_path);
+        MessageBoxA(NULL, m, "MechAssault 2", MB_ICONERROR);
         return 1;
     }
     printf("XBE loaded: %zu bytes\n", xbe_size);
@@ -409,7 +419,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     /* Step 4: Set game directory for file I/O path translation */
     {
         extern void xbox_path_init(const char *game_dir, const char *save_dir);
-        xbox_path_init(YOUR_GAME_DIR, NULL);
+        xbox_path_init(game_dir, save_dir[0] ? save_dir : NULL);
     }
 
     /* Step 5: Initialize kernel bridge (thunk table in Xbox memory) */

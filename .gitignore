@@ -33,6 +33,10 @@ src/recomp/gen/
 
 # Game files (user must provide their own legally-owned copies)
 game/
+game.partial/
+game_old_*/
+# Where the setup window saved the player's paths (ma2_setup.c)
+ma2_settings.ini
 *.xbe
 *.iso
 *.xiso
