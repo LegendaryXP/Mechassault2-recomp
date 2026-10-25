@@ -2,13 +2,13 @@
   "apps": [
     {
       "name": "MechAssault 2: Lone Wolf",
-      "project": "ma2-recomp",
-      "repository": "OWNER/ma2-recomp",
+      "project": "LegendaryXP",
+      "repository": "LegendaryXP/Mechassault2-recomp",
       "repositorySource": "github",
-      "folderName": "MechAssault2-ma2recomp",
+      "folderName": "MechAssault2-LegendaryXP",
       "releaseAssetFilter": "win-x64.zip",
       "tags": ["recomp", "xbox", "windows"],
-      "appIconUrl": "https://github.com/OWNER/ma2-recomp/releases/latest/download/icon.png"
+      "appIconUrl": "https://github.com/LegendaryXP/Mechassault2-recomp/releases/latest/download/icon.png"
     }
   ]
 }

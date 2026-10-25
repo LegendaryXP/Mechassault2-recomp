@@ -1,5 +1,5 @@
 # Make the release zip in dist\ (nothing is uploaded or published):
-#   powershell -File scripts\package.ps1 [-RepoUrl https://github.com/you/ma2-recomp] [-Build]
+#   powershell -File scripts\package.ps1 [-RepoUrl https://github.com/LegendaryXP/Mechassault2-recomp] [-Build]
 #
 # The zip holds ma2.exe and what it needs to start on a clean PC, laid out
 # for Quiver Launcher (one .exe and no .bat at the top, which is what it
@@ -11,7 +11,7 @@
 # the source release needs for the LGPL parts, and writes dist\icon.png and
 # the zip's SHA-256 for the release page and Quiver's catalog entry.
 param(
-    [string]$RepoUrl = 'https://github.com/OWNER/ma2-recomp',
+    [string]$RepoUrl = 'https://github.com/LegendaryXP/Mechassault2-recomp',
     [switch]$Build
 )
 $ErrorActionPreference = 'Stop'

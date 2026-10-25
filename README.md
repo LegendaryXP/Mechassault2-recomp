@@ -34,12 +34,14 @@ Open bugs are in [BUGS.md](BUGS.md).
 Needs Windows 10/11 x64, Visual Studio 2022 (C++ workload, MSVC), CMake 3.20+,
 Python 3.10+ with `capstone`, and your MechAssault 2 disc image.
 
-1. **Toolkit.** Clone xboxrecomp next to this folder at the commit this port
-   was built on, and apply this project's runtime changes:
+1. **Source.** Clone this repository into a folder named `ma2-recomp` (the
+   steps below use that name), and xboxrecomp next to it at the commit this
+   port was built on, then apply this project's runtime changes:
 
    ```bat
-   git clone https://github.com/sp00nznet/xboxrecomp ..\xboxrecomp
-   cd ..\xboxrecomp
+   git clone https://github.com/LegendaryXP/Mechassault2-recomp ma2-recomp
+   git clone https://github.com/sp00nznet/xboxrecomp xboxrecomp
+   cd xboxrecomp
    git checkout eb0aa1d
    git apply ..\ma2-recomp\patches\xboxrecomp-ma2-runtime.patch
    pip install capstone
