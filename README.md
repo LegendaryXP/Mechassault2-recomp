@@ -20,8 +20,7 @@ play-tested by the maintainer.
 
 ## Playing
 
-Download the release zip, unpack it anywhere (or install it with
-[Quiver Launcher](https://github.com/tgeorgiadis/quiver-launcher)), and run
+Download the release zip, unpack it anywhere, and run
 `ma2.exe`. The setup window asks for your disc image (`.iso`/`.xiso`) or a
 folder with `ma2.xbe`, and where to keep saves (default
 `Documents\MechAssault2`). The release's `README.txt` has the controls, files,
