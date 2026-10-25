@@ -27,6 +27,8 @@ Makefile
 Debug/
 Release/
 x64/
+# ...but release/ (case-blind on Windows) is the release's README and notices
+!/release/
 
 # Generated recompiled code (regenerate from XBE with the recomp pipeline)
 src/recomp/gen/
@@ -37,6 +39,10 @@ game.partial/
 game_old_*/
 # Where the setup window saved the player's paths (ma2_setup.c)
 ma2_settings.ini
+# The icon: the game's own title image, made at build time (scripts/make_icon.py)
+assets/
+# Release zips (scripts/package.ps1)
+dist/
 *.xbe
 *.iso
 *.xiso

@@ -1,0 +1,2 @@
+# Keep the toolkit patch byte for byte (git apply needs its exact line endings).
+patches/*.patch -text

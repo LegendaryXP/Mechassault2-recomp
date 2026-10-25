@@ -1,0 +1,91 @@
+MechAssault 2 PC -- third-party notices
+=======================================
+
+ma2.exe is built from this project's source (MIT, see LICENSE.txt) and the
+parts below, which keep their own licenses and copyrights.
+
+
+1. xboxrecomp -- MIT
+--------------------
+
+  https://github.com/sp00nznet/xboxrecomp
+  Copyright (c) 2026 sp00nz
+
+  The static recompilation toolkit and runtime (Xbox kernel, memory, GPU,
+  audio and input replacement) that ma2.exe is built on, at commit eb0aa1d
+  with this project's changes (patches/xboxrecomp-ma2-runtime.patch in the
+  source).
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy
+  of this software and associated documentation files (the "Software"), to
+  deal in the Software without restriction, including without limitation the
+  rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+  sell copies of the Software, and to permit persons to whom the Software is
+  furnished to do so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in
+  all copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+  FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+  IN THE SOFTWARE.
+
+
+2. xemu -- LGPL-2.1-or-later
+----------------------------
+
+  https://github.com/xemu-project/xemu
+
+  Parts of the toolkit's audio (MCPX APU) and GPU (NV2A) emulation are
+  extracted or adapted from xemu, and are linked into ma2.exe:
+
+    src/apu/apu_core.c, apu_dsp.c, apu_vp.c, apu_regs.h, apu_state.h,
+    apu_debug.h, fpconv.h (and apu_shim.h, released under the same license)
+      (c) 2012 espes; 2018-2019 Jannik Vogel; 2019-2025 Matt Borgerson
+    src/nv2a/nv2a_regs.h, nv2a_core.c, nv2a_state.h
+      (c) 2012 espes; 2015 Jannik Vogel; 2018-2025 Matt Borgerson
+
+  They are licensed under the GNU Lesser General Public License, version 2.1
+  or (at your option) any later version; the full text is in LGPL-2.1.txt.
+  This project changed some of them (apu_core.c, apu_vp.c and others; see the
+  patch named above).
+
+  Source, and relinking with a changed version: the complete source of these
+  files as used, with every change, and of everything else that goes into
+  ma2.exe apart from the game itself, is at
+
+    @REPO_URL@
+
+  (the toolkit as sp00nznet/xboxrecomp commit eb0aa1d plus
+  patches/xboxrecomp-ma2-runtime.patch). Its README explains how to build
+  ma2.exe from it -- including with your own changes to these files -- using
+  your own copy of the game, from which the recompiler regenerates the
+  game-derived part of the program. If that link ever stops working, ask the
+  maintainer of this release for the source.
+
+
+3. Microsoft Visual C++ runtime
+-------------------------------
+
+  vcruntime140.dll is Microsoft's C runtime library, included unmodified so
+  the game starts on PCs without the Visual C++ Redistributable. It is
+  redistributed under the Microsoft Visual Studio license terms and remains
+  Microsoft's property.
+
+
+4. MechAssault 2: Lone Wolf
+---------------------------
+
+  MechAssault, MechWarrior and BattleTech are trademarks of Microsoft
+  Corporation and/or its licensors. The game, its program, data, art and
+  audio are theirs. This release includes none of the game's data files
+  (levels, art, audio, movies) and needs your own copy of the game to run.
+  ma2.exe does contain program code that the recompiler translated from the
+  game's own executable; that code remains theirs and is not covered by this
+  project's license. The icon is the game's own Xbox dashboard image, used
+  only to identify the game. This is an unofficial fan project, not
+  affiliated with or endorsed by Microsoft or Day 1 Studios.

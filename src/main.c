@@ -321,6 +321,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     setvbuf(stderr, NULL, _IONBF, 0);
 
     printf("=== MechAssault 2: Lone Wolf - Static Recompilation ===\n");
+    fprintf(stderr, "[BOOT] MechAssault 2 PC v%s\n", MA2_VERSION);
     printf("Loading XBE...\n");
 
     /* Install VEH handler (first handler in chain) */

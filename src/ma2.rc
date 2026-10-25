@@ -1,0 +1,28 @@
+// ma2.exe's icon and file properties. MA2_VERSION* come from CMakeLists.txt.
+#include <winver.h>
+
+1 ICON "../assets/icon.ico"
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION     MA2_VERSION_MAJOR, MA2_VERSION_MINOR, MA2_VERSION_PATCH, 0
+PRODUCTVERSION  MA2_VERSION_MAJOR, MA2_VERSION_MINOR, MA2_VERSION_PATCH, 0
+FILEOS          VOS_NT_WINDOWS32
+FILETYPE        VFT_APP
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "FileDescription", "MechAssault 2: Lone Wolf (unofficial PC recompilation)"
+            VALUE "ProductName", "MechAssault 2 PC"
+            VALUE "FileVersion", MA2_VERSION
+            VALUE "ProductVersion", MA2_VERSION
+            VALUE "OriginalFilename", "ma2.exe"
+            VALUE "Comments", "Needs your own copy of the game. Not affiliated with Microsoft or Day 1 Studios."
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

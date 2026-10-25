@@ -10,7 +10,9 @@ cmake_minimum_required(VERSION 3.20)
 #   4. Add any game-specific compile definitions or link libraries
 # ============================================================================
 
-project(ma2 C)
+# The release version: scripts\package.ps1 names the zip after it, and the
+# exe's log and file properties show it.
+project(ma2 VERSION 0.1.0 LANGUAGES C RC)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -75,6 +77,30 @@ set(GAME_SOURCES
 add_executable(${PROJECT_NAME} WIN32
     ${GAME_SOURCES}
     ${RECOMP_GEN_SOURCES}
+    src/ma2.rc                  # icon and version info
+)
+# The icon is the game's own dashboard picture, taken from game\ma2.xbe at
+# build time (the build needs that file anyway), so no game art is kept in
+# the source tree.
+find_package(Python3 COMPONENTS Interpreter REQUIRED)
+add_custom_command(
+    OUTPUT ${CMAKE_CURRENT_SOURCE_DIR}/assets/icon.ico ${CMAKE_CURRENT_SOURCE_DIR}/assets/icon.png
+    COMMAND ${Python3_EXECUTABLE} scripts/make_icon.py game/ma2.xbe
+    DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/game/ma2.xbe ${CMAKE_CURRENT_SOURCE_DIR}/scripts/make_icon.py
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    COMMENT "Icon from game/ma2.xbe's title image")
+add_custom_target(ma2_icon DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/assets/icon.ico)
+add_dependencies(${PROJECT_NAME} ma2_icon)
+set_source_files_properties(src/ma2.rc PROPERTIES
+    OBJECT_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/assets/icon.ico)
+
+# On the two files that use it only: a definition on the whole target would
+# recompile every generated file at each version bump.
+set_property(SOURCE src/main.c src/ma2.rc APPEND PROPERTY COMPILE_DEFINITIONS
+    MA2_VERSION="${PROJECT_VERSION}"
+    MA2_VERSION_MAJOR=${PROJECT_VERSION_MAJOR}
+    MA2_VERSION_MINOR=${PROJECT_VERSION_MINOR}
+    MA2_VERSION_PATCH=${PROJECT_VERSION_PATCH}
 )
 
 # Link against the xboxrecomp umbrella target (all 6 runtime libraries)

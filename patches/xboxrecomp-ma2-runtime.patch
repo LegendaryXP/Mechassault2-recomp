@@ -1,5 +1,5 @@
 diff --git a/src/apu/apu_core.c b/src/apu/apu_core.c
-index 1f664a3..214e161 100644
+index 1f664a3..9daab39 100644
 --- a/src/apu/apu_core.c
 +++ b/src/apu/apu_core.c
 @@ -155,6 +155,23 @@ const char *mcpx_apu_phys_class(uint64_t addr)
@@ -63,7 +63,159 @@ index 1f664a3..214e161 100644
  /* The interrupt line, as the frame thread sees it. update_irq used to call
   * pci_irq_assert, which is an empty stub here, so DirectSound's service
   * routine never ran and no voice completion ever reached it. */
-@@ -1042,12 +1089,52 @@ static void apu_irq_stats_line(void)
+@@ -219,6 +266,11 @@ extern void xbox_worker_stack_free(int slot);
+ extern uint32_t xbox_GetConnectedInterrupt(uint32_t vector);
+ extern uint32_t xbox_AllocThreadTib(void);
+ extern int xbox_IrqlBlocksInterrupts(void);
++extern int xbox_IrqlRaisedCount(void);
++extern int xbox_IrqlClaimProcessor(int force);
++extern int xbox_IrqlClaimProcessorWait(int max_ms);
++extern void xbox_IrqlReleaseProcessor(void);
++extern void xbox_KernelRunQueuedDpcs(void);
+ extern int xbox_IrqlEnterInterrupt(int level);
+ extern void xbox_IrqlLeaveInterrupt(int saved);
+ #if defined(_MSC_VER)
+@@ -229,12 +281,53 @@ extern void xbox_IrqlLeaveInterrupt(int saved);
+ extern APU_TLS uint32_t g_eax, g_ecx, g_edx, g_esp, g_ebx, g_esi, g_edi;
+ extern APU_TLS uint32_t g_fs_base;
+ 
++/* How long the frame thread waits for the guest threads at DISPATCH_LEVEL to
++ * lower before it takes the processor for the ISR: a DirectSound critical
++ * section is microseconds. And the frames (32 samples, 0.67 ms each) after
++ * which the interrupt is delivered anyway: a raise held 500 ms has leaked. */
++#define APU_IRQ_WAIT_MS 4
++#define APU_IRQ_HOLDOFF 750
++
+ /* Call the connected service routine while the line is up, from the frame
+  * thread, the way the OHCI model delivers USB interrupts (ohci_call_isr):
+- * a worker stack for the call, a TIB of this thread's own, and a hold-off
+- * while a guest thread sits at raised IRQL, which is when the single-CPU
+- * console could not have taken the interrupt. The routine acknowledges by
+- * writing ISTS, which drops the line through update_irq. */
++ * a worker stack for the call, a TIB of this thread's own, and the processor
++ * claimed (xbox_IrqlClaimProcessor) for the routine and the DPCs it queues.
++ * The routine acknowledges by writing ISTS, which drops the line through
++ * update_irq.
++ *
++ * The claim, not a look at the depth, because the guest threads run beside
++ * this one. DirectSound's service routine (MA2 0x003AB500) and its DPC
++ * (0x003AB3BC) keep their lists the way the console allows: the ISR takes a
++ * voice the hardware stopped off the active list and queues it on a notify
++ * list (core+0x4A0, voice+0x54), the DPC pops it and calls the voice, and
++ * the title's threads touch both lists only at DISPATCH_LEVEL. On one
++ * processor that is enough: the ISR never runs inside the title's
++ * DISPATCH_LEVEL section, it runs between two instructions, and the DPC runs
++ * as soon as IRQL drops below DISPATCH_LEVEL -- before the title's next
++ * DirectSound call. A voice's destructor (0x003AE58F) does not unlink it
++ * from the notify list, because by then the DPC has always run.
++ *
++ * Here neither held. xbox_IrqlBlocksInterrupts and then the call left a gap
++ * a raise could land in, and after 50 frames of hold-off (33 ms) the routine
++ * ran anyway: in every Mission 5 load probed, the ISR ran beside the game
++ * thread at DISPATCH_LEVEL several times (5 to 7 in the first 10 deliveries
++ * that had company). And the DPC waited for the timer thread, a millisecond
++ * or more, while the title went on. Either way a voice the ISR had queued
++ * could be freed before the DPC got to it; the DPC then popped the freed
++ * voice and called its method through the base vtable the destructor leaves
++ * (0x00453448) -- slot 0x18 there is a Release (0x003A89C5), which took the
++ * caller's saved edi, the KeSynchronizeExecution thunk 0xFE000264, for `this`
++ * and faulted reading 0xFE000268. MechAssault 2 crashed so in 2 of 12
++ * Mission 5 loads.
++ *
++ * So the routine runs with the processor claimed, waiting for the sections
++ * already at DISPATCH_LEVEL to end and holding new raises back meanwhile
++ * (xbox_IrqlClaimProcessorWait) -- the console takes an interrupt at the next
++ * instruction, not at the next moment no thread is raised, and a busy game
++ * thread left none for 80 ms and more. A raise that comes while it runs
++ * waits for it, and the DPCs it queued run here under the same claim before
++ * any raise is let in, as the console's DPC dispatch would. Only a raise
++ * that has leaked (500 ms) still sees the routine run beside it. */
+ static void apu_deliver_irq(MCPXAPUState *d)
+ {
+     /* Per thread, like the g_fs_base it guards: a new instance's frame
+@@ -242,15 +335,13 @@ static void apu_deliver_irq(MCPXAPUState *d)
+      * cannot tell, as every thread starts at the main thread's TIB. */
+     static APU_TLS int tib_ready;
+     static unsigned held_off;
+-    uint32_t kint, routine, context;
++    static int forced_warned;
++    uint32_t kint, routine, context, isr_result;
+     apu_guest_fn fn;
+-    int slot;
++    int slot, forced;
+ 
+     if (!InterlockedCompareExchange(&s_irq_line, 0, 0))
+         return;
+-    if (xbox_IrqlBlocksInterrupts() && ++held_off <= 50)
+-        return;
+-    held_off = 0;
+     kint = xbox_GetConnectedInterrupt(APU_VECTOR);
+     if (!kint)
+         return;
+@@ -266,9 +357,41 @@ static void apu_deliver_irq(MCPXAPUState *d)
+         g_fs_base = tib;
+         tib_ready = 1;
+     }
++    forced = 0;
++    if (!xbox_IrqlClaimProcessor(0)) {
++        int ok = 0;
++        /* Wait for the sections running now -- not holding d->lock, which a
++         * raised thread's VOICE_ON/OFF needs (voice_lock). After a wait that
++         * timed out, only every 16th frame, so a raise that leaked costs the
++         * title a millisecond in sixteen frames rather than every frame. */
++        if (held_off % 16 == 0) {
++            qemu_mutex_unlock(&d->lock);
++            ok = xbox_IrqlClaimProcessorWait(APU_IRQ_WAIT_MS);
++            qemu_mutex_lock(&d->lock);
++        }
++        if (!ok) {
++            if (held_off < APU_IRQ_HOLDOFF) {
++                held_off++;
++                return;
++            }
++            if (!xbox_IrqlClaimProcessor(1))
++                return;
++            forced = 1;
++        }
++    }
++    if (forced && !forced_warned && xbox_IrqlBlocksInterrupts()) {
++        forced_warned = 1;
++        fprintf(stderr, "  [APU] guest IRQL held for %d frames (depth %d); "
++                "delivering the interrupt anyway\n", APU_IRQ_HOLDOFF,
++                xbox_IrqlRaisedCount());
++        fflush(stderr);
++    }
++    held_off = 0;
+     slot = xbox_worker_stack_alloc();
+-    if (slot < 0)
++    if (slot < 0) {
++        xbox_IrqlReleaseProcessor();
+         return;
++    }
+ 
+     qemu_mutex_unlock(&d->lock);
+     g_esp = XBOX_WORKER_STACK_TOP(slot);
+@@ -277,14 +400,18 @@ static void apu_deliver_irq(MCPXAPUState *d)
+     g_esp -= 4; *(uint32_t *)(g_apu_ram_ptr + g_esp) = kint;
+     g_esp -= 4; *(uint32_t *)(g_apu_ram_ptr + g_esp) = 0xDEADBEEFu;
+     { int _irql = xbox_IrqlEnterInterrupt(16); fn(); xbox_IrqlLeaveInterrupt(_irql); }
++    isr_result = g_eax;
++    /* The DPCs it queued, on this stack, before the claim is let go. */
++    xbox_KernelRunQueuedDpcs();
+     xbox_worker_stack_free(slot);
++    xbox_IrqlReleaseProcessor();
+     qemu_mutex_lock(&d->lock);
+ 
+     {
+         static unsigned n;
+         if (n++ < 3) {
+             fprintf(stderr, "[APU] interrupt delivered to 0x%08X -> %s\n",
+-                    routine, (g_eax & 1) ? "claimed" : "declined");
++                    routine, (isr_result & 1) ? "claimed" : "declined");
+             fflush(stderr);
+         }
+     }
+@@ -1042,12 +1169,52 @@ static void apu_irq_stats_line(void)
      if (now < s_irq_next_ns)
          return;
      if (s_irq_next_ns)
@@ -118,7 +270,7 @@ index 1f664a3..214e161 100644
  static void *mcpx_apu_frame_thread(void *arg)
  {
      MCPXAPUState *d = MCPX_APU_DEVICE(arg);
-@@ -1077,6 +1164,7 @@ static void *mcpx_apu_frame_thread(void *arg)
+@@ -1077,6 +1244,7 @@ static void *mcpx_apu_frame_thread(void *arg)
           * forever to post its next command: Burnout 3 stalls in
           * sub_002F805E polling the same doorbell it was acked on at init. */
          mcpx_apu_dsp_ack_poll(d);
@@ -126,7 +278,7 @@ index 1f664a3..214e161 100644
  
          int xcntmode = GET_MASK(qatomic_read(&d->regs[NV_PAPU_SECTL]),
                                  NV_PAPU_SECTL_XCNTMODE);
-@@ -1113,6 +1201,9 @@ static void *mcpx_apu_frame_thread(void *arg)
+@@ -1113,6 +1281,9 @@ static void *mcpx_apu_frame_thread(void *arg)
              apu_irq_stats.fe_trapped_frames++;
          } else {
              /* Lightweight: just monitor frame (test tone + software mixer) */
@@ -136,21 +288,33 @@ index 1f664a3..214e161 100644
              mcpx_apu_monitor_frame(d);
              d->ep_frame_div++;
          }
-@@ -1137,8 +1228,10 @@ static void *mcpx_apu_frame_thread(void *arg)
+@@ -1131,11 +1302,23 @@ static void *mcpx_apu_frame_thread(void *arg)
+         {
+             uint32_t sectl = qatomic_read(&d->regs[NV_PAPU_SECTL]);
+             uint32_t ssl = qatomic_read(&d->regs[NV_PAPU_SSL]);
++            /* The count restarts only with the tick it belongs to. Where the
++             * tick is held back (RECOMP_APU_SSL_IRQ=0, MechAssault 2, whose
++             * service routine reads bit 3 as a panic and restarts the DSPs)
++             * it runs on, as a free 32-bit sample counter: XACT's audio
++             * clock (MA2 0x003E73D1) reads XGSCNT directly, accumulates the
++             * difference between reads, and handles only the wrap at 2^32 --
++             * any other step back it takes for a reset and adds nothing. A
++             * count that fell back to 0 every 2048 samples kept that clock
++             * losing time against the system clock it is converted to, so
++             * XACT's timed events came due at nonsense times, and MA2's
++             * mission music played its intro and never the track after it. */
+             d->sample_count += NUM_SAMPLES_PER_FRAME;
+             if (ssl
+                     && d->sample_count >= ssl
                      && (sectl & NV_PAPU_SECTL_XCNTMODE)
-                            != NV_PAPU_SECTL_XCNTMODE_OFF) {
+-                           != NV_PAPU_SECTL_XCNTMODE_OFF) {
++                           != NV_PAPU_SECTL_XCNTMODE_OFF
++                    && ssl_irq_allowed()) {
                  d->sample_count -= ssl;
--                qatomic_or(&d->regs[NV_PAPU_ISTS], NV_PAPU_ISTS_SSLINTSTS);
--                d->set_irq = true;
-+                if (ssl_irq_allowed()) {
-+                    qatomic_or(&d->regs[NV_PAPU_ISTS], NV_PAPU_ISTS_SSLINTSTS);
-+                    d->set_irq = true;
-+                }
-             }
-         }
- 
+                 qatomic_or(&d->regs[NV_PAPU_ISTS], NV_PAPU_ISTS_SSLINTSTS);
+                 d->set_irq = true;
 diff --git a/src/apu/apu_dsp.c b/src/apu/apu_dsp.c
-index bd36f2a..bd4b2de 100644
+index bd36f2a..706c5f2 100644
 --- a/src/apu/apu_dsp.c
 +++ b/src/apu/apu_dsp.c
 @@ -25,6 +25,8 @@
@@ -181,7 +345,7 @@ index bd36f2a..bd4b2de 100644
  /* GPRST (GP region + 0xFFFC): the GP runs only with both reset bits set, as
   * in xemu's gp_write. Nothing else models the GP, so this is kept for the
   * =auto ack alone. Before the first write the GP counts as running: a title
-@@ -229,9 +243,66 @@ void mcpx_apu_update_dsp_preference(MCPXAPUState *d)
+@@ -229,9 +243,86 @@ void mcpx_apu_update_dsp_preference(MCPXAPUState *d)
      (void)d;
  }
  
@@ -199,13 +363,33 @@ index bd36f2a..bd4b2de 100644
 +}
 +
 +static void binstat_frame(float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME],
-+                          unsigned clipped)
++                          unsigned clipped, const float (*out)[2],
++                          const float (*dry)[3])
 +{
 +    static float peak[NUM_MIXBINS];
 +    static double sq[NUM_MIXBINS];
 +    static double x04, x15, x01;      /* front/rear and left/right products */
 +    static unsigned n, clips;
 +    int b, i;
++
++    /* [APU-LEVEL] once a second: the left output's RMS before the limiter,
++     * and the part of it from send-only voices (s_send_dry), in dBFS. */
++    {
++        static double so, sd;
++        static unsigned m, secs;
++        for (i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
++            so += (double)out[i][0] * out[i][0];
++            sd += (double)dry[i][0] * dry[i][0];
++        }
++        m += NUM_SAMPLES_PER_FRAME;
++        if (m >= 48000) {
++            fprintf(stderr, "[APU-LEVEL] %us out %.1f send-only %.1f dBFS\n",
++                    ++secs, so > 0 ? 10.0 * log10(so / m) : -99.0,
++                    sd > 0 ? 10.0 * log10(sd / m) : -99.0);
++            so = sd = 0.0;
++            m = 0;
++        }
++    }
 +
 +    for (b = 0; b < NUM_MIXBINS; b++)
 +        for (i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
@@ -248,7 +432,7 @@ index bd36f2a..bd4b2de 100644
      /* Bypass DSP: take mixbin 0 (front-left) and mixbin 1 (front-right)
       * and write them directly to the monitor frame buffer as the final
       * EP output.
-@@ -249,6 +320,8 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
+@@ -249,6 +340,8 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
      int off = (d->ep_frame_div % 8) * NUM_SAMPLES_PER_FRAME;
  
      if (d->monitor.point != MCPX_APU_DEBUG_MON_VP) {
@@ -257,7 +441,7 @@ index bd36f2a..bd4b2de 100644
          for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
              /* Bins 2..31 used to be computed and then dropped on the floor.
               * On hardware the GP and EP mix the submixes down; here they are
-@@ -273,33 +346,96 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
+@@ -273,32 +366,117 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
               * Gating the HRTF submix override was tried first and did not fix
               * it, so the defect is the width of this mixdown and nothing else.
               *
@@ -289,7 +473,12 @@ index bd36f2a..bd4b2de 100644
 -                    if (b & 1) right += mixbins[b][i];
 -                    else       left  += mixbins[b][i];
 -                }
-+                float sends = 0.0f;
++                /* Except a voice heard through nothing but its sends (the
++                 * VP keeps those apart, s_send_dry): its sends are its dry
++                 * signal, so they come out of the quarter-level sum and go
++                 * in at full level. MechAssault 2's radio speech. */
++                const float (*dry)[3] = mcpx_apu_vp_send_dry();
++                float sends = -dry[i][2];
 +                for (int b = 10; b < NUM_MIXBINS; ++b)
 +                    sends += mixbins[b][i];
 +                left  = mixbins[0][i] + mixbins[6][i]
@@ -298,6 +487,8 @@ index bd36f2a..bd4b2de 100644
 +                      + 0.707f * (mixbins[5][i] + mixbins[9][i]);
 +                left  += 0.707f * mixbins[2][i] + 0.5f * mixbins[3][i] + 0.25f * sends;
 +                right += 0.707f * mixbins[2][i] + 0.5f * mixbins[3][i] + 0.25f * sends;
++                left  += dry[i][0];
++                right += dry[i][1];
              } else {
                  left = mixbins[0][i];
                  right = mixbins[1][i];
@@ -326,11 +517,7 @@ index bd36f2a..bd4b2de 100644
 +            if (fabsf(left) > peak) peak = fabsf(left);
 +            if (fabsf(right) > peak) peak = fabsf(right);
 +        }
- 
--            /* Convert to 16-bit and write (not accumulate) into frame buffer.
--             * Each of the 8 sub-frames writes its own 32-sample slice. */
--            d->monitor.frame_buf[off + i][0] = (int16_t)(left * 32767.0f);
--            d->monitor.frame_buf[off + i][1] = (int16_t)(right * 32767.0f);
++
 +        /* A peak limiter instead of flat clipping (RECOMP_APU_LIMITER=0 turns
 +         * it off). The gain drops at once, for the whole frame, to what keeps
 +         * this frame's peak under full scale (ramping it down across the
@@ -360,19 +547,37 @@ index bd36f2a..bd4b2de 100644
 +                if (left < -1.0f) left = -1.0f;
 +                if (right > 1.0f) right = 1.0f;
 +                if (right < -1.0f) right = -1.0f;
-+
+ 
+-            /* Convert to 16-bit and write (not accumulate) into frame buffer.
+-             * Each of the 8 sub-frames writes its own 32-sample slice. */
+-            d->monitor.frame_buf[off + i][0] = (int16_t)(left * 32767.0f);
+-            d->monitor.frame_buf[off + i][1] = (int16_t)(right * 32767.0f);
 +                /* Convert to 16-bit and write (not accumulate) into frame
 +                 * buffer. Each of the 8 sub-frames writes its own 32-sample
 +                 * slice. */
 +                d->monitor.frame_buf[off + i][0] = (int16_t)(left * 32767.0f);
 +                d->monitor.frame_buf[off + i][1] = (int16_t)(right * 32767.0f);
 +            }
++        }
++        if (binstat_on()) {
++            /* The submix headroom per bin (the right shift the VP mixes
++             * into each bin with), whenever it changes. */
++            static uint8_t last[NUM_MIXBINS];
++            static int shown;
++            if (!shown || memcmp(last, d->vp.submix_headroom, sizeof last)) {
++                shown = 1;
++                memcpy(last, d->vp.submix_headroom, sizeof last);
++                fprintf(stderr, "[APU-BINSTAT] headroom (hrtf %u):",
++                        d->vp.hrtf_headroom);
++                for (int b = 0; b < NUM_MIXBINS; b++)
++                    fprintf(stderr, " %u", last[b]);
++                fprintf(stderr, "\n");
++            }
++            binstat_frame(mixbins, clipped, (const float (*)[2])out,
++                          mcpx_apu_vp_send_dry());
          }
-+        if (binstat_on())
-+            binstat_frame(mixbins, clipped);
      }
  
-     g_dbg.gp.cycles = 0;
 diff --git a/src/apu/apu_shim.h b/src/apu/apu_shim.h
 index 5f3f665..a29fb0e 100644
 --- a/src/apu/apu_shim.h
@@ -388,10 +593,20 @@ index 5f3f665..a29fb0e 100644
  /* Little-endian physical memory reads */
  static inline uint32_t ldl_le_phys(void *as, hwaddr addr) {
 diff --git a/src/apu/apu_state.h b/src/apu/apu_state.h
-index f4fca14..0a303fc 100644
+index f4fca14..8050f2f 100644
 --- a/src/apu/apu_state.h
 +++ b/src/apu/apu_state.h
-@@ -586,5 +586,7 @@ typedef struct {
+@@ -532,6 +532,9 @@ void mcpx_apu_vp_init(MCPXAPUState *d);
+ void mcpx_apu_vp_finalize(MCPXAPUState *d);
+ void mcpx_apu_vp_frame(MCPXAPUState *d, float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME]);
+ void mcpx_apu_vp_reset(MCPXAPUState *d);
++/* This frame's send-only voices: [i][0] left, [1] right, [2] their plain sum
++ * in the FX send bins (apu_vp.c, s_send_dry). */
++const float (*mcpx_apu_vp_send_dry(void))[3];
+ 
+ /* DSP functions (stubbed) */
+ void mcpx_apu_dsp_init(MCPXAPUState *d);
+@@ -586,5 +589,7 @@ typedef struct {
      unsigned traps;             /* front-end traps latched (fe_method) */
      unsigned se_frames;         /* VP/DSP frames run (se_frame), cumulative */
      unsigned fe_trapped_frames; /* frames that found FECTL trapped */
@@ -400,10 +615,84 @@ index f4fca14..0a303fc 100644
  } ApuIrqStats;
  extern ApuIrqStats apu_irq_stats;
 diff --git a/src/apu/apu_vp.c b/src/apu/apu_vp.c
-index 128d86f..6cbb56d 100644
+index 128d86f..9220c3f 100644
 --- a/src/apu/apu_vp.c
 +++ b/src/apu/apu_vp.c
-@@ -1067,6 +1067,56 @@ static void vp_ring_report(unsigned secs)
+@@ -58,6 +58,19 @@ static void set_notify_status(MCPXAPUState *d, uint32_t v, int notifier,
+     stb_phys(address_space_memory, notify_offset, (uint8_t)status);
+     stb_phys(address_space_memory, notify_offset - 1, 1);
+ 
++    /* RECOMP_APU_NOTIFY_TRACE=1: every notification, and which copy of its
++     * address it went to. */
++    {
++        static int on = -1;
++        if (on < 0)
++            on = apu_env_on("RECOMP_APU_NOTIFY_TRACE");
++        if (on)
++            fprintf(stderr, "[APU-NOTIFY] v=%u notifier=%d status=%d at %08X %s%s\n",
++                    (unsigned)v, notifier, status, (uint32_t)notify_offset,
++                    mcpx_apu_phys_class(notify_offset),
++                    mcpx_apu_phys_alias(notify_offset) ? " ALIASED" : "");
++    }
++
+     qatomic_or(&d->regs[NV_PAPU_ISTS],
+                NV_PAPU_ISTS_FEVINTSTS | NV_PAPU_ISTS_FENINTSTS);
+     d->set_irq = true;
+@@ -752,6 +765,8 @@ struct VpVoiceStat {
+     uint32_t addr, fmt;
+     uint16_t vol0, vol1;
+     uint8_t  bin0, bin1;
++    uint16_t vols[8];   /* all eight routes: a voice can send past its first two */
++    uint8_t  bins[8];
+     const char *cls;
+ };
+ static struct VpVoiceStat s_vstat[MCPX_HW_MAX_VOICES];
+@@ -843,12 +858,30 @@ static void vp_stat_report(void)
+         if (s_vdump_all[v]) fflush(s_vdump_all[v]);
+     if (s_vstat_on <= 0) return;
+     s_vstat_secs++;
++    {
++        /* Where the driver's tables resolve, when they change: a table whose
++         * number also names a heap page is read and written in one copy
++         * only (mcpx_apu_phys), and the driver may be using the other. */
++        static uint32_t last[3];
++        static const char *const name[3] = { "FENADDR", "VPVADDR", "VPSSLADDR" };
++        const hwaddr reg[3] = { NV_PAPU_FENADDR, NV_PAPU_VPVADDR, NV_PAPU_VPSSLADDR };
++        for (int k = 0; k < 3; k++) {
++            uint32_t a = (uint32_t)g_state->regs[reg[k]];
++            if (a == last[k])
++                continue;
++            last[k] = a;
++            fprintf(stderr, "[APU-VSTAT] %s=%08X %s%s\n", name[k], a,
++                    mcpx_apu_phys_class(a),
++                    mcpx_apu_phys_alias(a) ? " (aliased: the window holds it too)" : "");
++        }
++    }
+     for (unsigned v = 0; v < MCPX_HW_MAX_VOICES; v++) {
+         struct VpVoiceStat *s = &s_vstat[v];
+         if (!s->frames) continue;
+         fprintf(stderr, "[APU-VSTAT] t=%us v=%u fmt=%08X stream=%u st=%u ss=%u cs=%u spb=%u"
+                 " rate=%.3f ea=%.2f vol=%03X/%03X bin=%u/%u addr=%08X %s"
+-                " frames=%u rms=%.0f zcr=%.2f\n",
++                " frames=%u rms=%.0f zcr=%.2f routes=%u:%03X %u:%03X %u:%03X %u:%03X"
++                " %u:%03X %u:%03X %u:%03X %u:%03X\n",
+                 s_vstat_secs, v, s->fmt,
+                 (unsigned)((s->fmt & NV_PAVS_VOICE_CFG_FMT_DATA_TYPE) != 0),
+                 (unsigned)((s->fmt & NV_PAVS_VOICE_CFG_FMT_STEREO) != 0),
+@@ -857,7 +890,11 @@ static void vp_stat_report(void)
+                 (unsigned)((s->fmt & NV_PAVS_VOICE_CFG_FMT_SAMPLES_PER_BLOCK) >> ctz32(NV_PAVS_VOICE_CFG_FMT_SAMPLES_PER_BLOCK)),
+                 s->rate, s->ea, s->vol0, s->vol1, s->bin0, s->bin1, s->addr,
+                 s->cls ? s->cls : "?", s->frames,
+-                sqrt(s->sq / s->frames) * 32768.0, (double)s->zc / s->frames);
++                sqrt(s->sq / s->frames) * 32768.0, (double)s->zc / s->frames,
++                s->bins[0], s->vols[0], s->bins[1], s->vols[1],
++                s->bins[2], s->vols[2], s->bins[3], s->vols[3],
++                s->bins[4], s->vols[4], s->bins[5], s->vols[5],
++                s->bins[6], s->vols[6], s->bins[7], s->vols[7]);
+         s->frames = 0; s->zc = 0; s->sq = 0;
+     }
+ }
+@@ -1067,6 +1104,56 @@ static void vp_ring_report(unsigned secs)
   * Sample fetching from voice buffers
   * ============================================================ */
  
@@ -460,7 +749,7 @@ index 128d86f..6cbb56d 100644
  static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
                         int num_samples_requested)
  {
-@@ -1191,7 +1241,7 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
+@@ -1191,7 +1278,7 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
                  uint32_t linear_addr = block_index * (uint32_t)block_size;
                  if (stream) {
                      hwaddr addr = segment_offset + linear_addr;
@@ -469,6 +758,137 @@ index 128d86f..6cbb56d 100644
                             block_size);
                  } else {
                      linear_addr += ba;
+@@ -1385,6 +1472,28 @@ done:
+     return out;
+ }
+ 
++/* The FX sends of voices heard only through them (voice_process), this
++ * frame: [i][0] left, [1] right, [2] the plain sum the sends also hold, so
++ * the mixdown can take them out of its quarter-level sends. Cleared by
++ * mcpx_apu_vp_frame; read by mcpx_apu_dsp_frame. RECOMP_APU_SEND_DRY=0
++ * leaves it empty (the sends at a quarter for everyone, as before). */
++static float s_send_dry[NUM_SAMPLES_PER_FRAME][3];
++
++static int vp_send_dry_on(void)
++{
++    static int on = -1;
++    if (on < 0) {
++        const char *e = getenv("RECOMP_APU_SEND_DRY");
++        on = (e && *e) ? (atoi(e) != 0) : 1;
++    }
++    return on;
++}
++
++const float (*mcpx_apu_vp_send_dry(void))[3]
++{
++    return (const float (*)[3])s_send_dry;
++}
++
+ /* ============================================================
+  * Voice processing (main per-voice function)
+  * ============================================================ */
+@@ -1449,6 +1558,9 @@ static void voice_process(MCPXAPUState *d,
+             samples[i][0] = mixbins[mp_bin][i];
+             samples[i][1] = mixbins[mp_bin][i];
+         }
++        /* RECOMP_APU_TRACE counts a submix voice too (its "addr" is 0). */
++        vp_stat_samples(v, samples, NUM_SAMPLES_PER_FRAME, 0,
++                        (uint32_t)voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT, 0xFFFFFFFFu));
+         bool clear_mix = voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT,
+                                         NV_PAVS_VOICE_CFG_FMT_CLEAR_MIX) != 0;
+         if (clear_mix) {
+@@ -1517,6 +1629,10 @@ static void voice_process(MCPXAPUState *d,
+         s_vstat[v].rate = rate;
+         s_vstat[v].vol0 = vol[0]; s_vstat[v].vol1 = vol[1];
+         s_vstat[v].bin0 = (uint8_t)bin[0]; s_vstat[v].bin1 = (uint8_t)bin[1];
++        for (int i = 0; i < 8; i++) {
++            s_vstat[v].bins[i] = (uint8_t)bin[i];
++            s_vstat[v].vols[i] = vol[i];
++        }
+     }
+ 
+     if (voice_should_mute(v)) return;
+@@ -1559,9 +1675,48 @@ static void voice_process(MCPXAPUState *d,
+         }
+     }
+ 
++    /* Heard only through effect sends? Such a voice routes nothing to a
++     * speaker bin (0-9) or to the multipass bin a submix voice reads, and
++     * something to an FX send (11-30): on hardware a GP effect takes it from
++     * there to the speakers, and the send IS its dry signal. MechAssault 2's
++     * radio speech is one: mono, FXSEND_0 alone, into the game's own DSP
++     * image (ma2dspfx.bin). The stub mixdown adds the sends at a quarter,
++     * as wet copies of voices already heard dry, so the speech played
++     * ~12 dB under everything else. */
++    int send_only = 0;
++    if (vp_send_dry_on()) {
++        int dry = 0, fx = 0;
++        for (int b = 0; b < 8; b++) {
++            if ((vol[b] & 0xFFF) == 0xFFF)
++                continue;
++            if (bin[b] <= 9 || bin[b] == MULTIPASS_BIN)
++                dry = 1;
++            else if (bin[b] >= 11)
++                fx = 1;
++        }
++        send_only = fx && !dry;
++    }
++
++    /* RECOMP_APU_3D_GAIN_DB=<dB>: extra gain on submix (multipass) voices,
++     * which in MechAssault 2 carry every in-world sound -- the sources send
++     * to bin 31 at the game's distance falloff and 3D voices 0-63 take it to
++     * the 3D front pair. A player's balance control (people talking in the
++     * world sat ~15 dB under the radio), not hardware behaviour; the output
++     * limiter catches what it pushes too far. Default 0. */
++    static float s_mp_gain = -1.0f;
++    if (s_mp_gain < 0.0f) {
++        const char *e = getenv("RECOMP_APU_3D_GAIN_DB");
++        float db = e ? (float)atof(e) : 0.0f;
++        if (db < -40.0f) db = -40.0f;
++        if (db > 24.0f) db = 24.0f;
++        s_mp_gain = powf(10.0f, db / 20.0f);
++        if (e)
++            fprintf(stderr, "[APU] in-world (submix voice) gain %+.1f dB\n", db);
++    }
++
+     /* Mix into bins */
+     for (int b = 0; b < 8; b++) {
+-        float g = ea_value;
++        float g = multipass ? ea_value * s_mp_gain : ea_value;
+         float hr;
+         if ((v < MCPX_HW_MAX_3D_VOICES) && (b < 4)) {
+             hr = (float)(1 << d->vp.hrtf_headroom);
+@@ -1572,6 +1727,22 @@ static void voice_process(MCPXAPUState *d,
+         for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+             mixbins[bin[b]][i] += g * samples[i][b % channels];
+         }
++        if (send_only && bin[b] >= 11 && bin[b] < MULTIPASS_BIN) {
++            /* Mono goes to both sides at full level, a stereo voice's
++             * channels to their own: the effect's output, taken as unity
++             * into the front pair. MA2 gives its speech and its music the
++             * same voice volume (0x276), and the music reaches the front
++             * pair at full level, so this keeps the two as balanced as the
++             * game set them. */
++            float l = channels == 1 ? 1.0f : (b % 2 == 0 ? 1.0f : 0.0f);
++            float r = channels == 1 ? 1.0f : (b % 2 == 0 ? 0.0f : 1.0f);
++            for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
++                float s = g * samples[i][b % channels];
++                s_send_dry[i][0] += l * s;
++                s_send_dry[i][1] += r * s;
++                s_send_dry[i][2] += s;
++            }
++        }
+     }
+ 
+     /* VP monitor mix */
+@@ -1633,6 +1804,7 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
+                         float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
+ {
+     memset(d->vp.sample_buf, 0, sizeof(d->vp.sample_buf));
++    memset(s_send_dry, 0, sizeof(s_send_dry));
+ 
+     for (int list = 0; list < 3; list++) {
+         hwaddr top, current, next;
 diff --git a/src/apu/apu_xaudio2.c b/src/apu/apu_xaudio2.c
 index e725646..ef7947b 100644
 --- a/src/apu/apu_xaudio2.c
@@ -521,7 +941,7 @@ index 281b4d2..32e4d68 100644
  /**
   * Unswizzle a texture from Xbox swizzled (Z-order/Morton) layout
 diff --git a/src/input/mkb_input.c b/src/input/mkb_input.c
-index d6f0042..827d6eb 100644
+index d6f0042..9ccdb0e 100644
 --- a/src/input/mkb_input.c
 +++ b/src/input/mkb_input.c
 @@ -9,10 +9,14 @@
@@ -543,7 +963,7 @@ index d6f0042..827d6eb 100644
   *
   * Small movements get a floor of RECOMP_MKB_DZ of full throw, because
   * every console title applies its own dead zone to the stick, and a
-@@ -36,6 +40,128 @@
+@@ -36,6 +40,270 @@
  #include <stdlib.h>
  #include <string.h>
  #include <math.h>
@@ -576,6 +996,20 @@ index d6f0042..827d6eb 100644
 +
 +static MkbAction s_bind[IN_MAX];
 +static int s_bind_custom;               /* a layout replaced the built-in one */
++static unsigned short s_bind_order[IN_MAX], s_bind_seq; /* layout order, for prompts */
++
++/* Layout modes: "mode.<name>.<KEY> = <CONTROL>" binds a key differently
++ * while a title has that mode on (mkb_set_mode) -- a minigame that wants its
++ * buttons under the player's fingers. Keys a mode does not name keep their
++ * normal binding. */
++#define MKB_MODES 4
++static struct {
++    char name[16];
++    MkbAction act[IN_MAX];
++    unsigned short order[IN_MAX];       /* 0: not bound in this mode */
++} s_modes[MKB_MODES];
++static int s_nmodes;
++static volatile LONG s_mode_on;         /* bit per mode (mkb_modes_now) */
 +
 +static const struct { const char *name; MkbAction act; } k_actions[] = {
 +    {"A", {ACT_ANALOG, XBOX_BUTTON_A}},      {"B", {ACT_ANALOG, XBOX_BUTTON_B}},
@@ -644,12 +1078,140 @@ index d6f0042..827d6eb 100644
 +        if (!_stricmp(action, k_actions[i].name)) {
 +            if (!s_bind_custom) {           /* the first binding replaces them all */
 +                memset(s_bind, 0, sizeof s_bind);
++                memset(s_bind_order, 0, sizeof s_bind_order);
 +                s_bind_custom = 1;
 +            }
 +            s_bind[in] = k_actions[i].act;
++            s_bind_order[in] = ++s_bind_seq;
 +            return 1;
 +        }
 +    return 0;
++}
++
++/* "mode.<name>.<KEY> = <CONTROL>". Returns 1 when all three were understood. */
++static int mkb_mode_bind(const char *spec, const char *action)
++{
++    const char *dot = strchr(spec, '.');
++    size_t i, nl = dot ? (size_t)(dot - spec) : 0;
++    int m, in;
++    if (!dot || !nl || nl >= sizeof s_modes[0].name || (in = mkb_parse_input(dot + 1)) < 0
++        || in == MKB_TOGGLE_VK)
++        return 0;
++    for (m = 0; m < s_nmodes; m++)
++        if (strlen(s_modes[m].name) == nl && !_strnicmp(s_modes[m].name, spec, nl))
++            break;
++    if (m == s_nmodes) {
++        if (s_nmodes == MKB_MODES)
++            return 0;
++        memcpy(s_modes[m].name, spec, nl);
++        s_modes[m].name[nl] = 0;
++        s_nmodes++;
++    }
++    for (i = 0; i < sizeof k_actions / sizeof k_actions[0]; i++)
++        if (!_stricmp(action, k_actions[i].name)) {
++            s_modes[m].act[in] = k_actions[i].act;
++            s_modes[m].order[in] = ++s_bind_seq;
++            return 1;
++        }
++    return 0;
++}
++
++static int mkb_mode_index(const char *mode)
++{
++    int m;
++    for (m = 0; m < s_nmodes; m++)
++        if (!_stricmp(s_modes[m].name, mode))
++            return m;
++    return -1;
++}
++
++/* When each mode lapses (GetTickCount64 ms; ~0 = until turned off, 0 = off). */
++static volatile ULONGLONG s_mode_until[MKB_MODES];
++
++void mkb_set_mode(const char *mode, int ms)
++{
++    int m;
++    mkb_enabled();
++    if ((m = mkb_mode_index(mode)) < 0)
++        return;
++    s_mode_until[m] = ms < 0 ? ~0ull : ms == 0 ? 0 : GetTickCount64() + (ULONGLONG)ms;
++}
++
++/* The modes on now, a bit each; logs each change. */
++static LONG mkb_modes_now(void)
++{
++    ULONGLONG now = GetTickCount64();
++    LONG on = 0, was;
++    int m;
++    for (m = 0; m < s_nmodes; m++)
++        if (s_mode_until[m] && now < s_mode_until[m])
++            on |= 1L << m;
++    was = InterlockedExchange(&s_mode_on, on);
++    for (m = 0; m < s_nmodes; m++)
++        if (((was ^ on) >> m) & 1) {
++            fprintf(stderr, "  [MKB] %s keys %s\n", s_modes[m].name, (on >> m & 1) ? "on" : "off");
++            fflush(stderr);
++        }
++    return on;
++}
++
++/* The n-th input (layout order) bound to a pad control, by its layout name,
++ * in a mode's own bindings or (mode NULL) the normal ones. */
++static const char *mkb_binding_in(const char *mode, const char *control, int n)
++{
++    static char names[IN_MAX][12];
++    const MkbAction *want = NULL, *tab = s_bind;
++    const unsigned short *order = s_bind_order;
++    size_t i;
++    int in, best, k, m;
++    unsigned short last = 0;
++
++    mkb_enabled();                      /* loads the layout */
++    if (mode) {
++        if ((m = mkb_mode_index(mode)) < 0)
++            return NULL;
++        tab = s_modes[m].act;
++        order = s_modes[m].order;
++    }
++    for (i = 0; i < sizeof k_actions / sizeof k_actions[0]; i++)
++        if (!_stricmp(control, k_actions[i].name))
++            want = &k_actions[i].act;
++    if (!want || want->kind == ACT_NONE)
++        return NULL;
++    for (k = 0; k <= n; k++) {
++        best = -1;
++        for (in = 0; in < IN_MAX; in++)
++            if (tab[in].kind == want->kind && tab[in].idx == want->idx
++                && order[in] > last
++                && (best < 0 || order[in] < order[best]))
++                best = in;
++        if (best < 0)
++            return NULL;
++        last = order[best];
++    }
++    if (!names[best][0]) {
++        if ((best >= 'A' && best <= 'Z') || (best >= '0' && best <= '9'))
++            names[best][0] = (char)best;
++        else if (best >= VK_F1 && best <= VK_F12)
++            snprintf(names[best], sizeof names[best], "F%d", best - VK_F1 + 1);
++        else
++            for (i = 0; i < sizeof k_inputs / sizeof k_inputs[0]; i++)
++                if (k_inputs[i].in == best) {
++                    snprintf(names[best], sizeof names[best], "%s", k_inputs[i].name);
++                    break;
++                }
++    }
++    return names[best][0] ? names[best] : NULL;
++}
++
++const char *mkb_binding(const char *control, int n)
++{
++    return mkb_binding_in(NULL, control, n);
++}
++
++const char *mkb_mode_binding(const char *mode, const char *control, int n)
++{
++    return mkb_binding_in(mode, control, n);
 +}
 +
 +static void mkb_default_bindings(void)
@@ -672,7 +1234,7 @@ index d6f0042..827d6eb 100644
  
  /* ---- configuration ----------------------------------------------------- */
  
-@@ -43,12 +169,16 @@ typedef struct {
+@@ -43,12 +311,17 @@ typedef struct {
      double sens;        /* multiplier on the aim deflection          */
      double dz;          /* assumed game deadzone, 0..1               */
      double acc;         /* aim acceleration exponent, 1 = linear     */
@@ -682,16 +1244,17 @@ index d6f0042..827d6eb 100644
      int    swap_sticks; /* mouse aims with the left stick instead    */
 +    double smooth;      /* ms over which the mouse speed is averaged */
 +    int    click_capture; /* a click in the window locks the mouse too */
++    int    auto_capture;  /* locked while a title hook takes direct look */
 +    double look_deg;    /* degrees per count, for a title's direct look */
 +    int    look_invert_y; /* direct look: mouse up looks down */
  } MkbConfig;
  
 -static MkbConfig s_cfg = { 1.0, 0.18, 1.0, 8, 0, 0 };
-+static MkbConfig s_cfg = { 1.0, 0.18, 1.0, 20, 0, 0, 25.0, 0, 0.05, 0 };
++static MkbConfig s_cfg = { 1.0, 0.18, 1.0, 20, 0, 0, 25.0, 0, 1, 0.05, 0 };
  
  /* One "key=value" line; returns 1 when the key was recognised. */
  static int mkb_apply_kv(const char *key, const char *val)
-@@ -64,10 +194,21 @@ static int mkb_apply_kv(const char *key, const char *val)
+@@ -64,10 +337,26 @@ static int mkb_apply_kv(const char *key, const char *val)
          d = strtod(val, NULL); if (d > 0.0 && d < 10.0) s_cfg.acc = d;
      } else if (!strcmp(key, "full")) {
          l = strtol(val, NULL, 0); if (l > 0 && l < 1000) s_cfg.full = l;
@@ -699,6 +1262,8 @@ index d6f0042..827d6eb 100644
 +        d = strtod(val, NULL); if (d >= 1.0 && d <= 500.0) s_cfg.smooth = d;
 +    } else if (!strcmp(key, "click_capture")) {
 +        s_cfg.click_capture = atoi(val) != 0;
++    } else if (!strcmp(key, "auto_capture")) {
++        s_cfg.auto_capture = atoi(val) != 0;
 +    } else if (!strcmp(key, "look_deg")) {
 +        d = strtod(val, NULL); if (d > 0.0 && d < 10.0) s_cfg.look_deg = d;
 +    } else if (!strcmp(key, "look_invert_y")) {
@@ -707,13 +1272,16 @@ index d6f0042..827d6eb 100644
          s_cfg.invert_y = atoi(val) != 0;
      } else if (!strcmp(key, "swap_sticks")) {
          s_cfg.swap_sticks = atoi(val) != 0;
++    } else if (!_strnicmp(key, "mode.", 5)) {
++        if (!mkb_mode_bind(key + 5, val))
++            fprintf(stderr, "  [MKB] unknown mode binding %s = %s\n", key + 5, val);
 +    } else if (!_strnicmp(key, "bind.", 5)) {
 +        if (!mkb_bind(key + 5, val))
 +            fprintf(stderr, "  [MKB] unknown binding %s = %s\n", key + 5, val);
      } else {
          return 0;
      }
-@@ -81,6 +222,8 @@ static void mkb_load_config(void)
+@@ -81,6 +370,8 @@ static void mkb_load_config(void)
          "RECOMP_MKB_DZ",   "dz",
          "RECOMP_MKB_ACC",  "acc",
          "RECOMP_MKB_FULL", "full",
@@ -722,7 +1290,7 @@ index d6f0042..827d6eb 100644
          "RECOMP_MKB_INVERT_Y",  "invert_y",
          "RECOMP_MKB_SWAP_STICKS", "swap_sticks",
          NULL
-@@ -91,6 +234,7 @@ static void mkb_load_config(void)
+@@ -91,6 +382,7 @@ static void mkb_load_config(void)
      FILE *f;
      int i;
  
@@ -730,7 +1298,7 @@ index d6f0042..827d6eb 100644
      for (i = 0; kv[i]; i += 2) {
          const char *v = getenv(kv[i]);
          if (v && *v)
-@@ -114,6 +258,9 @@ static void mkb_load_config(void)
+@@ -114,6 +406,9 @@ static void mkb_load_config(void)
          while (fgets(line, sizeof line, f)) {
              char *eq = strchr(line, '=');
              char *k, *v;
@@ -740,7 +1308,7 @@ index d6f0042..827d6eb 100644
              if (!eq) continue;
              *eq = 0;
              k = line; v = eq + 1;
-@@ -128,22 +275,144 @@ static void mkb_load_config(void)
+@@ -128,22 +423,179 @@ static void mkb_load_config(void)
      fclose(f);
  }
  
@@ -787,11 +1355,16 @@ index d6f0042..827d6eb 100644
 + * (hidden, held at the window's centre, every movement turning the camera),
 + * and F9 again, Esc (the game pauses as well) or leaving the window free
 + * it. With click_capture = 1 a left click inside the client area locks it
-+ * too (that click does not fire). The keyboard works whenever the game's
-+ * window is in front. */
++ * too (that click does not fire). With auto_capture = 1 (the default) it
++ * locks by itself while the title is in gameplay -- a title hook keeps
++ * taking direct look (mkb_mouse_look_take) -- and is handed back when that
++ * stops: a menu, the pause screen, a cutscene. The keyboard works whenever
++ * the game's window is in front. */
 +static volatile LONG s_captured;
 +static volatile LONG s_swallow_click;   /* the capturing click, until released */
  static volatile LONG s_thread_up;
++static int s_auto_play;     /* auto_capture: gameplay as last seen */
++static int s_auto_away;     /* ... the window was left since */
  
 -/* F9 is read on the input thread, so the toggle works even while the
 - * game is stalled on the poll side. */
@@ -817,6 +1390,37 @@ index d6f0042..827d6eb 100644
 +    }
 +}
 +
++/* Direct look asks (mkb_mouse_look_take), when each axis was last asked
++ * for; the auto lock below reads them. */
++static volatile ULONGLONG s_look_asked[2];
++
++/* auto_capture, once a poll with the game's window in front: lock the mouse
++ * when the title starts taking direct look (gameplay) and free it when the
++ * title stops (no ask for 300 ms: a menu or the pause screen took over).
++ * Only on those edges, and on coming back to the window in gameplay, so F9
++ * still frees or locks it in between. A click that brought the window back
++ * does not fire. */
++static void mkb_auto_capture(void)
++{
++    ULONGLONG at = GetTickCount64(), a0 = s_look_asked[0], a1 = s_look_asked[1];
++    ULONGLONG last = a0 > a1 ? a0 : a1;
++    /* A layout mode on (a minigame) is gameplay too. */
++    int play = (last && at - last < 300) || InterlockedCompareExchange(&s_mode_on, 0, 0);
++
++    if (!s_cfg.auto_capture)
++        return;
++    if (play && (!s_auto_play || s_auto_away) && !s_captured) {
++        mkb_set_captured(1, s_auto_play ? "back in the window, in gameplay" : "gameplay");
++        if (InterlockedCompareExchange(&s_mouse_btn, 0, 0) & 1)
++            InterlockedExchange(&s_swallow_click, 1);
++        InterlockedAnd(&s_mouse_tap, ~1);
++    } else if (!play && s_auto_play && s_captured) {
++        mkb_set_captured(0, "menu");
++    }
++    s_auto_play = play;
++    s_auto_away = 0;
++}
++
 +/* F8 presses not yet taken by a title hook (mkb_take_mark), and in all. */
 +static volatile LONG s_marks_pending, s_marks_made;
 +
@@ -835,7 +1439,6 @@ index d6f0042..827d6eb 100644
 + * (GetTickCount64 ms; 0 = never). The axes are asked for separately: a
 + * title may turn and tilt in two different places, each once a frame. */
 +static volatile LONG s_look_dx, s_look_dy, s_look_live;
-+static volatile ULONGLONG s_look_asked[2];
 +
 +/* The script clock (ms since the first pad poll; 0 = not started) and the
 + * scripted mouse travel due by a time, for whoever asks first. */
@@ -890,7 +1493,7 @@ index d6f0042..827d6eb 100644
  
  static void mkb_handle_raw(HRAWINPUT h)
  {
-@@ -155,6 +424,8 @@ static void mkb_handle_raw(HRAWINPUT h)
+@@ -155,6 +607,8 @@ static void mkb_handle_raw(HRAWINPUT h)
              == (UINT)-1)
          return;
  
@@ -899,7 +1502,7 @@ index d6f0042..827d6eb 100644
      if (ri->header.dwType == RIM_TYPEMOUSE) {
          const RAWMOUSE *m = &ri->data.mouse;
  
-@@ -162,6 +433,27 @@ static void mkb_handle_raw(HRAWINPUT h)
+@@ -162,6 +616,27 @@ static void mkb_handle_raw(HRAWINPUT h)
              if (m->lLastX) InterlockedAdd(&s_dx, m->lLastX);
              if (m->lLastY) InterlockedAdd(&s_dy, m->lLastY);
          }
@@ -927,7 +1530,7 @@ index d6f0042..827d6eb 100644
          if (m->usButtonFlags & RI_MOUSE_LEFT_BUTTON_DOWN)
              InterlockedOr(&s_mouse_btn, 1);
          if (m->usButtonFlags & RI_MOUSE_LEFT_BUTTON_UP)
-@@ -190,20 +482,42 @@ static void mkb_handle_raw(HRAWINPUT h)
+@@ -190,20 +665,42 @@ static void mkb_handle_raw(HRAWINPUT h)
          const RAWKEYBOARD *k = &ri->data.keyboard;
          UINT vk = k->VKey;
  
@@ -979,7 +1582,7 @@ index d6f0042..827d6eb 100644
          }
      }
  }
-@@ -256,9 +570,17 @@ static DWORD WINAPI mkb_thread(LPVOID unused)
+@@ -256,9 +753,18 @@ static DWORD WINAPI mkb_thread(LPVOID unused)
      }
  
      InterlockedExchange(&s_thread_up, 1);
@@ -990,9 +1593,10 @@ index d6f0042..827d6eb 100644
 +        int n = 0, i;
 +        for (i = 0; i < IN_MAX; i++)
 +            n += s_bind[i].kind != ACT_NONE;
-+        fprintf(stderr, "  [MKB] mouse+keyboard %s (F9 locks the mouse%s, F9/Esc"
++        fprintf(stderr, "  [MKB] mouse+keyboard %s (%sF9 locks the mouse%s, F9/Esc"
 +                " frees it; sens=%.2f dz=%.2f full=%ld; %d bindings, %s)\n",
 +                s_scripted ? "scripted (real devices ignored)" : "ready",
++                s_cfg.auto_capture ? "locked in gameplay, free in menus; " : "",
 +                s_cfg.click_capture ? ", so does a click in the window" : "",
 +                s_cfg.sens, s_cfg.dz, s_cfg.full, n,
 +                s_bind_custom ? "from the layout file" : "built-in layout");
@@ -1000,7 +1604,7 @@ index d6f0042..827d6eb 100644
      fflush(stderr);
  
      while (GetMessageA(&msg, NULL, 0, 0) > 0) {
-@@ -281,7 +603,9 @@ int mkb_enabled(void)
+@@ -281,7 +787,9 @@ int mkb_enabled(void)
          const char *v = getenv("RECOMP_MKB");
          on = v && *v && *v != '0';
          if (on) {
@@ -1010,7 +1614,7 @@ index d6f0042..827d6eb 100644
              if (InterlockedCompareExchange(&s_thread_up, 0, 0) == 0) {
                  static LONG started = 0;
                  if (InterlockedCompareExchange(&started, 1, 0) == 0)
-@@ -312,23 +636,38 @@ static int game_is_foreground(void)
+@@ -312,23 +820,38 @@ static int game_is_foreground(void)
   * end up clicking other apps' title bars. */
  static void mkb_manage_cursor(int capture)
  {
@@ -1062,7 +1666,7 @@ index d6f0042..827d6eb 100644
      }
  }
  
-@@ -356,86 +695,669 @@ static void mkb_aim_vector(double ax, double ay, SHORT *out_x, SHORT *out_y)
+@@ -356,86 +879,686 @@ static void mkb_aim_vector(double ax, double ay, SHORT *out_x, SHORT *out_y)
  
  #define MK_VK(k)  ((unsigned)(k) < 256 && s_vk_down[(k)])
  
@@ -1437,11 +2041,13 @@ index d6f0042..827d6eb 100644
 +
 +/* RECOMP_MEMPOKE=<t>:<hex addr>:<float>[:<ms>],...: from script time t, add
 + * <float> to the float at that guest address -- once, or spread over <ms>
-+ * milliseconds (a steady drift). For proving which variable a camera reads. */
++ * milliseconds (a steady drift). For proving which variable a camera reads.
++ * "=<float>" sets it instead, every poll until <ms> runs out (once without
++ * one): a teleport, to put the player where a bug was reported. Up to 256. */
 +static void mkb_mempoke(unsigned long last, unsigned long t)
 +{
 +    static int init, n;
-+    static struct { unsigned long at, len; uint32_t addr; float v; } pk[16];
++    static struct { unsigned long at, len; uint32_t addr; float v; int set; } pk[256];
 +    extern ptrdiff_t xbox_GetMemoryOffset(void);
 +    int k;
 +
@@ -1449,12 +2055,13 @@ index d6f0042..827d6eb 100644
 +        const char *e = getenv("RECOMP_MEMPOKE");
 +        char *end;
 +        init = 1;
-+        while (e && *e && n < 16) {
++        while (e && *e && n < 256) {
 +            pk[n].at = strtoul(e, &end, 10);
 +            if (*end != ':') break;
 +            pk[n].addr = (uint32_t)strtoul(end + 1, &end, 16);
 +            if (*end != ':') break;
-+            pk[n].v = (float)strtod(end + 1, &end);
++            pk[n].set = end[1] == '=';
++            pk[n].v = (float)strtod(end + 1 + pk[n].set, &end);
 +            pk[n].len = 0;
 +            if (*end == ':')
 +                pk[n].len = strtoul(end + 1, &end, 10);
@@ -1469,7 +2076,10 @@ index d6f0042..827d6eb 100644
 +        if (b <= a || pk[k].addr < 0x10000u || pk[k].addr >= 0x04000000u)
 +            continue;
 +        f = (float *)((char *)xbox_GetMemoryOffset() + pk[k].addr);
-+        *f += pk[k].len ? pk[k].v * (float)(b - a) / (float)pk[k].len : pk[k].v;
++        if (pk[k].set)
++            *f = pk[k].v;
++        else
++            *f += pk[k].len ? pk[k].v * (float)(b - a) / (float)pk[k].len : pk[k].v;
 +    }
 +}
 +
@@ -1571,6 +2181,7 @@ index d6f0042..827d6eb 100644
 +        if (!game_is_foreground()) {
 +            if (s_captured)
 +                mkb_set_captured(0, "window left");
++            s_auto_away = 1;
 +            mkb_manage_cursor(0);
 +            s_aim_vx = s_aim_vy = 0.0;
 +            InterlockedExchange(&s_dx, 0);
@@ -1583,6 +2194,7 @@ index d6f0042..827d6eb 100644
 +            memset((void *)s_vk_tap, 0, sizeof s_vk_tap);
 +            return 0;
 +        }
++        mkb_auto_capture();
 +        mkb_manage_cursor(s_captured);
 +        if (!s_captured) {                  /* keys yes, the mouse no */
 +            InterlockedExchange(&s_dx, 0);
@@ -1591,6 +2203,8 @@ index d6f0042..827d6eb 100644
 +            InterlockedExchange(&s_mouse_tap, 0);
 +            InterlockedExchange(&s_mouse_btn, 0);
 +        }
++    } else {
++        mkb_auto_capture();                 /* logged, for scripted checks */
      }
 -    mkb_manage_cursor(1);
  
@@ -1646,8 +2260,14 @@ index d6f0042..827d6eb 100644
  
      memset(analog, 0, sizeof analog);
 +    memset(ax, 0, sizeof ax);
++    {
++        LONG on = mkb_modes_now();
++        int m;
 +    for (i = 0; i < IN_MAX; i++) {
 +        const MkbAction *a = &s_bind[i];
++        for (m = 0; on && m < s_nmodes; m++)
++            if ((on >> m & 1) && s_modes[m].order[i])
++                a = &s_modes[m].act[i];
 +        if (!down[i] || a->kind == ACT_NONE)
 +            continue;
 +        if (a->kind == ACT_BTN)
@@ -1656,6 +2276,7 @@ index d6f0042..827d6eb 100644
 +            analog[a->idx] = 255;
 +        else if (a->kind == ACT_AXIS)
 +            ax[a->idx] = 1;
++    }
 +    }
  
 -    /* ---- mouse buttons, as the Xbox pad sees them ---- */
@@ -1790,10 +2411,10 @@ index d6f0042..827d6eb 100644
      /* ---- merge on top of whatever the host pad produced ---- */
      if (b)        { pState->Gamepad.wButtons |= b; any = 1; }
 diff --git a/src/input/mkb_input.h b/src/input/mkb_input.h
-index 664efad..a80a137 100644
+index 664efad..c3f3dd5 100644
 --- a/src/input/mkb_input.h
 +++ b/src/input/mkb_input.h
-@@ -18,11 +18,23 @@
+@@ -18,11 +18,26 @@
   *   RECOMP_MKB_DZ=f       assumed game deadzone    (default 0.18)
   *   RECOMP_MKB_ACC=f      aim acceleration         (default 1.0 = off)
   *   RECOMP_MKB_INVERT_Y=1 invert vertical aim      (default off)
@@ -1817,11 +2438,14 @@ index 664efad..a80a137 100644
 + * The mouse starts free and is never confined while free. F9 locks it to
 + * the game (hidden, held at the window's centre); F9 again, Esc and leaving
 + * the window free it. click_capture = 1 makes a left click in the window
-+ * lock it too. The keyboard works whenever the game's window is in front.
++ * lock it too. auto_capture = 1 (default) locks it by itself while a title
++ * hook keeps calling mkb_mouse_look_take (gameplay) and frees it once the
++ * hook stops (a menu, the pause screen). The keyboard works whenever the
++ * game's window is in front.
   */
  
  #ifndef XBOXRECOMP_MKB_INPUT_H
-@@ -51,6 +63,32 @@ int mkb_enabled(void);
+@@ -51,6 +66,51 @@ int mkb_enabled(void);
   */
  int mkb_merge(DWORD dwPort, XBOX_INPUT_STATE *pState);
  
@@ -1846,6 +2470,25 @@ index 664efad..a80a137 100644
 + */
 +int mkb_mouse_look_take(float *yaw_deg, float *pitch_deg);
 +
++/* Keyboard prompts: the n-th key or mouse button (0 first, in layout-file
++ * order) bound to a pad control given by its layout name ("A", "RT",
++ * "WHITE", "DPAD_UP", "MOVE_FORWARD", ...), named as the layout names it
++ * ("E", "ENTER", "MOUSE1", "WHEELUP", "F5"); NULL past the last or for an
++ * unknown control. For a title that shows the player's keys in place of the
++ * pad's buttons. */
++const char *mkb_binding(const char *control, int n);
++
++/* Layout modes: "mode.<name>.<KEY> = <CONTROL>" lines in the layout bind
++ * keys differently while the title has that mode on -- a minigame that
++ * wants its buttons under the player's fingers. Keys the mode does not name
++ * keep their normal binding. mkb_set_mode turns one on for the next `ms`
++ * milliseconds (a title that sees its minigame every frame keeps calling
++ * it, and the mode lapses when it stops), on until further notice (ms < 0)
++ * or off (0); unknown names are ignored. mkb_mode_binding is mkb_binding
++ * over a mode's own lines. */
++void mkb_set_mode(const char *mode, int ms);
++const char *mkb_mode_binding(const char *mode, const char *control, int n);
++
 +/* F8 (bug hunting): the layer logs "[MARK] F8 #n" when the player presses
 + * it; this returns how many presses a title hook has not yet taken, so the
 + * title can log its own state (the player's position) beside each mark. */
@@ -1855,10 +2498,10 @@ index 664efad..a80a137 100644
  }
  #endif
 diff --git a/src/kernel/kernel.h b/src/kernel/kernel.h
-index 564c0bf..fafd285 100644
+index 564c0bf..6767c7d 100644
 --- a/src/kernel/kernel.h
 +++ b/src/kernel/kernel.h
-@@ -823,6 +823,14 @@ int     xbox_IrqlBlocksInterrupts(void);
+@@ -823,6 +823,21 @@ int     xbox_IrqlBlocksInterrupts(void);
  int     xbox_IrqlRaisedCount(void);
  int     xbox_IrqlEnterInterrupt(int level);     /* around host-run ISRs and DPCs */
  void    xbox_IrqlLeaveInterrupt(int saved);
@@ -1867,13 +2510,20 @@ index 564c0bf..fafd285 100644
 + * DISPATCH_LEVEL until xbox_IrqlReleaseProcessor. Returns 0 (run it later)
 + * while a thread is raised, unless force is set. */
 +int     xbox_IrqlClaimProcessor(int force);
++/* The same, but waits up to max_ms for the raised threads to lower, holding
++ * new raises back meanwhile. 0: nothing claimed. */
++int     xbox_IrqlClaimProcessorWait(int max_ms);
 +void    xbox_IrqlReleaseProcessor(void);
 +int     xbox_IrqlClaimWaits(void);      /* raises that waited for a claim */
 +int     xbox_DpcHeldTicks(void);        /* DPC drains put off by a raise */
++/* Run the DPCs this host thread queued, now, on a thread that holds the claim
++ * and a guest stack and TIB: a device thread straight after its ISR, as the
++ * console would. Other threads' DPCs stay queued for the timer thread. */
++void    xbox_KernelRunQueuedDpcs(void);
  
  /* Total crossings of the DISPATCH boundary, and who is holding it up.
   * A depth that is non-zero while this stops moving is stuck, not busy. */
-@@ -1078,11 +1086,30 @@ NTSTATUS __stdcall xbox_ExSaveNonVolatileSetting(ULONG ValueIndex, ULONG Type, P
+@@ -1078,11 +1093,31 @@ NTSTATUS __stdcall xbox_ExSaveNonVolatileSetting(ULONG ValueIndex, ULONG Type, P
  #define XC_PARENTAL_CONTROL       XC_P_CONTROL_GAMES
  #define XC_PARENTAL_PASSWORD      XC_P_CONTROL_PASSWORD
  
@@ -1904,11 +2554,12 @@ index 564c0bf..fafd285 100644
 + * console is set up for a 16:9 TV on component (dashboard Widescreen + 480p,
 + * HDTV AV pack) or for a 4:3 TV on SCART, as before. kernel_xbox.c. */
 +int xbox_VideoWidescreen(void);
++int xbox_Video480p(void);   /* RECOMP_VIDEO_480P, default 1 */
  
  /* Unknown ordinals - stub */
  VOID    __stdcall xbox_Unknown_8(void);
 diff --git a/src/kernel/kernel_bridge.c b/src/kernel/kernel_bridge.c
-index 965dd08..0b7eb76 100644
+index 965dd08..ff8fe87 100644
 --- a/src/kernel/kernel_bridge.c
 +++ b/src/kernel/kernel_bridge.c
 @@ -44,6 +44,9 @@
@@ -2173,7 +2824,7 @@ index 965dd08..0b7eb76 100644
      xbox_MmSetAddressProtect(XBOX_TO_NATIVE(addr), size, prot);
      g_eax = 0;
  }
-@@ -2335,8 +2487,24 @@ static void bridge_AvSetDisplayMode(void)
+@@ -2335,8 +2487,26 @@ static void bridge_AvSetDisplayMode(void)
           * start it on the first display mode -- before that there is nothing
           * to show and no pitch to interpret it with. */
          extern void xbox_FramebufferWindowSet(uint32_t, uint32_t);
@@ -2193,12 +2844,14 @@ index 965dd08..0b7eb76 100644
 +        h = w >= 1920 ? 1080 : w >= 1280 ? 720 : 480;
 +        /* A 16:9 TV shows a widescreen title's 720x480 (and any HD mode)
 +         * full width; 640x480 is what a title that ignores the setting
-+         * draws, and that stays 4:3 (pillarboxed). */
-+        int wide = xbox_VideoWidescreen() && w > 640;
++         * draws, and that stays 4:3 (pillarboxed) -- unless 480p is off
++         * (RECOMP_VIDEO_480P=0), where 640x480 is the title's squeezed
++         * widescreen picture. */
++        int wide = xbox_VideoWidescreen() && (w > 640 || !xbox_Video480p());
  
          /* AvSetDisplayMode reports the scanout address the way the CRTC wants
           * it -- a physical address. The window has to read it the way the CPU
-@@ -2350,6 +2518,8 @@ static void bridge_AvSetDisplayMode(void)
+@@ -2350,6 +2520,8 @@ static void bridge_AvSetDisplayMode(void)
              fb_va = XBOX_CONTIG_BASE + fb_va;
  
          xbox_FramebufferWindowSet(fb_va, pitch);
@@ -2207,7 +2860,7 @@ index 965dd08..0b7eb76 100644
          xbox_FramebufferWindowStart();
  
          /* Record the resolved address, not the physical one the title passed.
-@@ -2433,11 +2603,8 @@ static void bridge_HalReadSMCTrayState(void)
+@@ -2433,11 +2605,8 @@ static void bridge_HalReadSMCTrayState(void)
   * interrupt enable and queues here, and the enumeration it should have started
   * lives entirely in the deferred routine.
   *
@@ -2221,7 +2874,25 @@ index 965dd08..0b7eb76 100644
   */
  /* Run a DPC's deferred routine on the calling thread.
   *
-@@ -2698,6 +2865,30 @@ static int kernel_raise_interrupt(uint32_t vector)
+@@ -2550,7 +2719,8 @@ static void bridge_KeRemoveQueueDpc(void);   /* defined with the queue */
+  * DPC ordering beyond "after the ISR".
+  */
+ #define XBOX_MAX_PENDING_DPC 64
+-typedef struct { uint32_t dpc, arg1, arg2; } PendingDpc;
++/* tid: the host thread that queued it (xbox_KernelRunQueuedDpcs). */
++typedef struct { uint32_t dpc, arg1, arg2; DWORD tid; } PendingDpc;
+ static PendingDpc g_dpc_queue[XBOX_MAX_PENDING_DPC];
+ static volatile LONG g_dpc_head, g_dpc_tail;
+ 
+@@ -2608,6 +2778,7 @@ static void bridge_KeInsertQueueDpc(void)
+     g_dpc_queue[tail].dpc  = dpc;
+     g_dpc_queue[tail].arg1 = arg1;
+     g_dpc_queue[tail].arg2 = arg2;
++    g_dpc_queue[tail].tid  = GetCurrentThreadId();
+     BRIDGE_MEM8(dpc + 2) = 1;
+     g_dpc_tail = next;
+     LeaveCriticalSection(&g_dpc_lock);
+@@ -2698,6 +2869,30 @@ static int kernel_raise_interrupt(uint32_t vector)
  
  static volatile LONG g_vblank_total;
  
@@ -2252,7 +2923,7 @@ index 965dd08..0b7eb76 100644
  uint32_t xbox_VblankCount(void)
  {
      return (uint32_t)g_vblank_total;
-@@ -2706,18 +2897,26 @@ uint32_t xbox_VblankCount(void)
+@@ -2706,18 +2901,26 @@ uint32_t xbox_VblankCount(void)
  static void kernel_vblank_tick(void)
  {
      static int enabled = -1;
@@ -2283,10 +2954,47 @@ index 965dd08..0b7eb76 100644
      InterlockedIncrement(&g_vblank_total);
  
      if (!xbox_GetConnectedInterrupt(NV2A_VECTOR))
-@@ -2760,6 +2959,53 @@ static void kernel_drain_dpcs(void)
+@@ -2760,6 +2963,90 @@ static void kernel_drain_dpcs(void)
      }
  }
  
++/* The DPCs this host thread queued, run by a device thread straight after the
++ * ISR it delivered, with the processor still claimed and the ISR's guest
++ * stack and TIB. On the console the DPCs an ISR queues run as soon as IRQL
++ * drops below DISPATCH_LEVEL, before the interrupted code resumes; left to the
++ * timer thread they run a millisecond or more later, and the title's threads,
++ * which do not stop for an interrupt here, act in between (see
++ * apu_deliver_irq).
++ *
++ * Only its own: the rest stay for the timer thread. D3D's vblank DPC (MA2
++ * 0x00414C80) spins until the pushbuffer thread clears the interrupt bits,
++ * tens of milliseconds at times, and on the APU's frame thread that would be
++ * tens of milliseconds of no audio. Taken out of the ring the way
++ * KeRemoveQueueDpc does it, as an entry the drain skips. */
++void xbox_KernelRunQueuedDpcs(void)
++{
++    DWORD me = GetCurrentThreadId();
++
++    for (;;) {
++        PendingDpc d;
++        LONG i;
++
++        dpc_lock();
++        for (i = g_dpc_head; i != g_dpc_tail; i = (i + 1) % XBOX_MAX_PENDING_DPC)
++            if (g_dpc_queue[i].dpc && g_dpc_queue[i].tid == me)
++                break;
++        if (i == g_dpc_tail) {
++            LeaveCriticalSection(&g_dpc_lock);
++            return;
++        }
++        d = g_dpc_queue[i];
++        g_dpc_queue[i].dpc = 0;
++        BRIDGE_MEM8(d.dpc + 2) = 0;
++        LeaveCriticalSection(&g_dpc_lock);
++        kernel_run_dpc(d.dpc, d.arg1, d.arg2);
++    }
++}
++
 +/* DPCs run with the processor claimed (xbox_IrqlClaimProcessor), never beside
 + * a guest thread at DISPATCH_LEVEL.
 + *
@@ -2337,7 +3045,24 @@ index 965dd08..0b7eb76 100644
  /* ── KeInitializeDpc (ordinal 107) ────────────────────────
   * VOID KeInitializeDpc(PKDPC Dpc, PKDEFERRED_ROUTINE DeferredRoutine,
   *                       PVOID DeferredContext)
-@@ -2992,6 +3238,20 @@ static XboxTimer g_timers[XBOX_MAX_TIMERS];
+@@ -2972,9 +3259,13 @@ static void bridge_KeInitializeTimerEx(void)
+  * during XInitDevices and enumerates from it.
+  *
+  * A due time is in 100 ns units, negative for relative and positive for an
+- * absolute time since 1601. Only the relative form is honoured here; an
+- * absolute due time is treated as immediate, which is wrong in principle and
+- * has not come up in practice.
++ * absolute time since 1601, on the clock KeQuerySystemTime reads. Both are
++ * honoured. The absolute form used to be treated as immediate, and it does
++ * come up: XACT keeps its timed events (MechAssault 2's music moving from a
++ * cue's intro to the track after it, 9.6 s in) on a queue that it arms with
++ * KeSetTimer at the absolute time of the earliest one. Fired at once, its DPC
++ * found nothing due yet, nothing re-armed the timer, and the event never ran:
++ * the music stopped when the intro did.
+  *
+  * ponytail: one thread, a fixed table, and a 10 ms tick, so a due time is late
+  * by up to a tick and a periodic timer drifts. Nothing here is scheduling
+@@ -2992,6 +3283,20 @@ static XboxTimer g_timers[XBOX_MAX_TIMERS];
  static CRITICAL_SECTION g_timer_lock;
  static int g_timer_started;
  
@@ -2358,7 +3083,7 @@ index 965dd08..0b7eb76 100644
  static DWORD WINAPI kernel_timer_thread(LPVOID unused)
  {
      int slot = xbox_worker_stack_alloc();
-@@ -3021,12 +3281,23 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
+@@ -3021,12 +3326,23 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
  
      for (;;) {
          long long now;
@@ -2386,7 +3111,7 @@ index 965dd08..0b7eb76 100644
  
          for (i = 0; i < XBOX_MAX_TIMERS; i++) {
              uint32_t dpc, fired_va;
-@@ -3036,6 +3307,12 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
+@@ -3036,6 +3352,12 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
                  LeaveCriticalSection(&g_timer_lock);
                  continue;
              }
@@ -2399,7 +3124,7 @@ index 965dd08..0b7eb76 100644
              fired_va = g_timers[i].timer_va;
              dpc = g_timers[i].dpc_va;
              if (g_timers[i].period_ms > 0)
-@@ -3058,6 +3335,8 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
+@@ -3058,6 +3380,8 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
                  }
              }
          }
@@ -2408,7 +3133,30 @@ index 965dd08..0b7eb76 100644
      }
  }
  
-@@ -3083,7 +3362,7 @@ static void kernel_set_timer(uint32_t timer_va, long long due_100ns,
+@@ -3069,6 +3393,22 @@ static void kernel_set_timer(uint32_t timer_va, long long due_100ns,
+     int i, free_slot = -1;
+     uint32_t was_set = 0;
+ 
++    if (due_100ns > 0) {
++        /* Absolute: how far ahead of the guest's own clock, rounded up so the
++         * DPC never runs before its due time -- one that runs early finds
++         * nothing due and, like XACT's, may not arm itself again. */
++        LARGE_INTEGER now;
++        static int trace = -1, shown;
++        xbox_KeQuerySystemTime(&now);
++        if (due_100ns > now.QuadPart)
++            delay_ms = (due_100ns - now.QuadPart + 9999) / 10000;
++        if (trace < 0)
++            trace = getenv("RECOMP_TIMER_TRACE") != NULL;
++        if (trace && shown++ < 2000)
++            fprintf(stderr, "  [TIMER] %08X absolute due %lld, now %lld: in %lld ms (dpc %08X)\n",
++                    timer_va, due_100ns, (long long)now.QuadPart, delay_ms, dpc_va);
++    }
++
+     if (!g_timer_started) {
+         InitializeCriticalSection(&g_timer_lock);
+         g_timer_started = 1;
+@@ -3083,7 +3423,7 @@ static void kernel_set_timer(uint32_t timer_va, long long due_100ns,
      if (free_slot >= 0) {
          g_timers[free_slot].timer_va  = timer_va;
          g_timers[free_slot].dpc_va    = dpc_va;
@@ -2417,7 +3165,20 @@ index 965dd08..0b7eb76 100644
          g_timers[free_slot].period_ms = period_ms;
      }
      LeaveCriticalSection(&g_timer_lock);
-@@ -3923,6 +4202,9 @@ static int bridge_handle_is_async(uint32_t token)
+@@ -3515,9 +3855,10 @@ static NTSTATUS bridge_create_file_impl(
+                 xbox_missing_note(gpath, status, (uint32_t)access,
+                                   (uint32_t)disposition, (uint32_t)options, 0);
+         } else if (ntcreate || xbox_missing_verbose())
+-            fprintf(stderr, "  [FILE] %s (disp %u opts 0x%X from 0x%08X) -> 0x%08X\n",
++            fprintf(stderr, "  [FILE] %s (disp %u opts 0x%X from 0x%08X) -> 0x%08X"
++                    " handle 0x%X\n",
+                     gpath, (unsigned)disposition, (unsigned)options,
+-                    g_xbox_kernel_caller, status);
++                    g_xbox_kernel_caller, status, BRIDGE_MEM32(handle_va));
+     }
+     fflush(stderr);
+     return st;
+@@ -3923,6 +4264,9 @@ static int bridge_handle_is_async(uint32_t token)
      return 0;
  }
  
@@ -2427,7 +3188,7 @@ index 965dd08..0b7eb76 100644
  /* Off unless RECOMP_ASYNC_IO is set, so the two behaviours stay comparable
   * rather than one being swapped in blind. */
  static int bridge_async_io_enabled(void)
-@@ -3951,6 +4233,8 @@ static void bridge_NtReadFile(void)
+@@ -3951,6 +4295,8 @@ static void bridge_NtReadFile(void)
          g_eax = 0xC0000005u;                 /* STATUS_ACCESS_VIOLATION */
          return;
      }
@@ -2436,7 +3197,7 @@ index 965dd08..0b7eb76 100644
      if (offset_va) {
          off.LowPart  = BRIDGE_MEM32(offset_va);
          off.HighPart = (LONG)BRIDGE_MEM32(offset_va + 4);
-@@ -3958,11 +4242,19 @@ static void bridge_NtReadFile(void)
+@@ -3958,11 +4304,19 @@ static void bridge_NtReadFile(void)
      }
      g_eax = (uint32_t)xbox_NtReadFile(handle, NULL, NULL, NULL, &ios,
                  XBOX_TO_NATIVE(buffer_va), length, poff);
@@ -2458,10 +3219,34 @@ index 965dd08..0b7eb76 100644
          const uint8_t *p = (const uint8_t *)XBOX_TO_NATIVE(buffer_va);
          uint32_t got = (uint32_t)ios.Information;
          /* The offset matters as much as the length. A title streaming a pack
-@@ -3985,9 +4277,35 @@ static void bridge_NtReadFile(void)
+@@ -3971,8 +4325,8 @@ static void bridge_NtReadFile(void)
+          * early looks identical to one that never started -- until you can
+          * see where each one landed. */
+         if (poff)
+-            fprintf(stderr, "  [READ] from=0x%08X ev=%08X apc=%08X @%lld want=%u got=%u st=0x%08X  %02X %02X %02X %02X\n",
+-                    g_xbox_kernel_caller, STACK_ARG(1), STACK_ARG(2),
++            fprintf(stderr, "  [READ] h=0x%X from=0x%08X ev=%08X apc=%08X @%lld want=%u got=%u st=0x%08X  %02X %02X %02X %02X\n",
++                    STACK_ARG(0), g_xbox_kernel_caller, STACK_ARG(1), STACK_ARG(2),
+                     (long long)off.QuadPart, length, got,
+                     (uint32_t)ios.Status,
+                     got > 0 ? p[0] : 0, got > 1 ? p[1] : 0,
+@@ -3985,9 +4339,48 @@ static void bridge_NtReadFile(void)
                      got > 2 ? p[2] : 0, got > 3 ? p[3] : 0);
          fflush(stderr);
      }
++    /* Failed and short reads, always (the first 40): a title that gets one
++     * usually says no more than "the disc is dirty". */
++    {
++        static int shown;
++        uint32_t st = (uint32_t)ios.Status, got = (uint32_t)ios.Information;
++        if ((st >= 0xC0000000u || (got < length && st != 0x00000103u)) && shown < 40) {
++            shown++;
++            fprintf(stderr, "  [READ] FAILED or short: h=0x%X from=0x%08X @%lld want=%u got=%u st=0x%08X\n",
++                    STACK_ARG(0), g_xbox_kernel_caller, poff ? (long long)off.QuadPart : -1LL,
++                    length, got, st);
++            fflush(stderr);
++        }
++    }
 +    QueryPerformanceCounter(&rp2);
      bridge_write_iostatus(iostatus, ios.Status, (uint32_t)ios.Information);
      bridge_complete_file_io(STACK_ARG(1), STACK_ARG(2), STACK_ARG(3),
@@ -2494,7 +3279,7 @@ index 965dd08..0b7eb76 100644
  
      /* An asynchronous request returns STATUS_PENDING, even when the data was
       * already there.
-@@ -4036,6 +4354,20 @@ static void bridge_NtWriteFile(void)
+@@ -4036,6 +4429,20 @@ static void bridge_NtWriteFile(void)
      bridge_write_iostatus(iostatus, ios.Status, (uint32_t)ios.Information);
      bridge_complete_file_io(STACK_ARG(1), STACK_ARG(2), STACK_ARG(3),
                              iostatus);
@@ -2515,7 +3300,7 @@ index 965dd08..0b7eb76 100644
  }
  
  /* ── NtQueryInformationFile (ordinal 211, 5 args = 20 bytes) */
-@@ -8449,7 +8781,7 @@ static void bridge_PsCreateSystemThread(void)
+@@ -8449,7 +8856,7 @@ static void bridge_PsCreateSystemThread(void)
                      bridge_run_thread_inline(fn, start_context1, start_context2);
                  } else {
                      bridge_spawn_guest_thread(fn, start_context1, start_context2,
@@ -2524,7 +3309,7 @@ index 965dd08..0b7eb76 100644
                  }
              }
          } else {
-@@ -10041,6 +10373,91 @@ static void kernel_thunk_dispatch(void)
+@@ -10041,6 +10448,91 @@ static void kernel_thunk_dispatch(void)
      (void)held;
  }
  
@@ -2616,7 +3401,7 @@ index 965dd08..0b7eb76 100644
  static void kernel_thunk_dispatch_body(void)
  {
      int slot = g_kernel_dispatch_slot;
-@@ -10147,7 +10564,19 @@ static void kernel_thunk_dispatch_body(void)
+@@ -10147,7 +10639,19 @@ static void kernel_thunk_dispatch_body(void)
          }
      }
  
@@ -2637,11 +3422,43 @@ index 965dd08..0b7eb76 100644
          bridge();
      } else {
          /* No specific bridge - return 0. Warn once per ordinal rather than
+diff --git a/src/kernel/kernel_file.c b/src/kernel/kernel_file.c
+index eb33a61..a1ff925 100644
+--- a/src/kernel/kernel_file.c
++++ b/src/kernel/kernel_file.c
+@@ -381,6 +381,27 @@ NTSTATUS __stdcall xbox_NtReadFile(
+     }
+ 
+     if (result || GetLastError() == ERROR_HANDLE_EOF) {
++        /* RECOMP_READ_PAD_EOF=1: a read that starts inside the file and runs
++         * past its end comes back full length, zeros past the end. MechAssault
++         * 2 streams its archives in 16 KB blocks from 2 KB boundaries and
++         * treats any short read as "the disc is dirty"; Mission 5's cache file
++         * ends 4 KB into its last block (z:\238f4798.cache, 0x12F0000 bytes,
++         * last block at 0x12ED000). The console evidently hands over the whole
++         * block -- the game runs there -- and the bytes past the end are never
++         * used (its data stops before them). Opt in, and only for sector-style
++         * reads (an explicit offset, offset and length whole 512-byte
++         * sectors): a short read at the end of a file is what a title's small
++         * sequential reads expect -- MA2 reads its settings files that way. */
++        static int pad = -1;
++        if (pad < 0) {
++            const char *e = getenv("RECOMP_READ_PAD_EOF");
++            pad = e && *e && *e != '0';
++        }
++        if (pad && bytes_read > 0 && bytes_read < Length && ByteOffset
++                && !(ByteOffset->LowPart & 511) && !(Length & 511)) {
++            memset((uint8_t *)Buffer + bytes_read, 0, Length - bytes_read);
++            bytes_read = Length;
++        }
+         IoStatusBlock->Information = bytes_read;
+         if (bytes_read == 0 && Length > 0) {
+             IoStatusBlock->Status = STATUS_END_OF_FILE;
 diff --git a/src/kernel/kernel_hal.c b/src/kernel/kernel_hal.c
-index 3a09ca8..7c8547f 100644
+index 3a09ca8..805242c 100644
 --- a/src/kernel/kernel_hal.c
 +++ b/src/kernel/kernel_hal.c
-@@ -93,6 +93,82 @@ int xbox_IrqlRaisedCount(void)
+@@ -93,6 +93,104 @@ int xbox_IrqlRaisedCount(void)
      return (int)InterlockedCompareExchange(&g_irql_raised_count, 0, 0);
  }
  
@@ -2665,6 +3482,9 @@ index 3a09ca8..7c8547f 100644
 + * the routine is held back, or the raise waits for it to return. */
 +static volatile LONG g_irq_owner = 0;
 +static volatile LONG s_irq_waits = 0;
++/* Host threads waiting in xbox_IrqlClaimProcessorWait; raises step aside for
++ * them (irql_count_raise). */
++static volatile LONG g_irq_requests = 0;
 +extern RECOMP_TLS uint32_t g_esp;
 +
 +static void irql_wait_for_claim(void)
@@ -2721,12 +3541,96 @@ index 3a09ca8..7c8547f 100644
 +    return (int)InterlockedCompareExchange(&s_irq_waits, 0, 0);
 +}
 +
++/* Count a raise to DISPATCH_LEVEL, stepping aside for a host thread waiting
++ * to claim the processor (xbox_IrqlClaimProcessorWait): out of the count
++ * again until the claim is taken, then back in, and irql_wait_for_claim holds
++ * the raise until the routine returns. A raise that finds the claim already
++ * taken, or no one waiting, counts and goes on as before. */
++static LONG irql_count_raise(void)
++{
++    for (;;) {
++        LONG d = InterlockedIncrement(&g_irql_raised_count);
++        if (!InterlockedCompareExchange(&g_irq_requests, 0, 0)
++                || InterlockedCompareExchange(&g_irq_owner, 0, 0))
++            return d;
++        InterlockedDecrement(&g_irql_raised_count);
++        while (InterlockedCompareExchange(&g_irq_requests, 0, 0)
++               && !InterlockedCompareExchange(&g_irq_owner, 0, 0))
++            SwitchToThread();
++    }
++}
++
  static int  s_trace = -1;
  static volatile LONG s_traced = 0;
  
-@@ -179,6 +255,9 @@ static void irql_track(KIRQL old_level, KIRQL new_level, void *ra)
+@@ -110,6 +208,61 @@ int xbox_IrqlTransitions(void)
+     return (int)InterlockedCompareExchange(&s_transitions, 0, 0);
+ }
  
-     d = now ? InterlockedIncrement(&g_irql_raised_count)
++/* xbox_IrqlClaimProcessor, waiting for the threads already raised to lower.
++ *
++ * The plain claim succeeds only at a moment when no thread is raised, and a
++ * busy title leaves few. MechAssault 2's game thread crosses the boundary
++ * thousands of times a second and spends most of its time above it, so the
++ * APU's frame thread, trying once a frame, went 80 ms and more without one
++ * (and the OHCI and DPC claims here run out their hold-offs and go ahead
++ * anyway, beside the guest). On the console an interrupt is taken at the
++ * next instruction. The nearest thing here: while a caller waits, a thread
++ * about to raise steps aside (irql_count_raise), so the wait is only for the
++ * sections already running, which are microseconds.
++ *
++ * Returns 1 with the processor claimed, or 0 with nothing claimed after
++ * max_ms, or after 1 ms in which no thread crossed the boundary: a depth that
++ * does not move is a raise that leaked or a section that will not end soon,
++ * and holding every other raise back behind it would stall the title. The
++ * caller must hold no lock a raised thread could want. */
++int xbox_IrqlClaimProcessorWait(int max_ms)
++{
++    LARGE_INTEGER f, start, quiet, now;
++    LONG seen, tr;
++    int ok = 0, spins = 0;
++
++    if (xbox_IrqlClaimProcessor(0))
++        return 1;
++    QueryPerformanceFrequency(&f);
++    QueryPerformanceCounter(&start);
++    quiet = start;
++    seen = InterlockedCompareExchange(&s_transitions, 0, 0);
++    InterlockedIncrement(&g_irq_requests);
++    for (;;) {
++        if (xbox_IrqlClaimProcessor(0)) {
++            ok = 1;
++            break;
++        }
++        if (++spins < 64)
++            continue;
++        spins = 0;
++        QueryPerformanceCounter(&now);
++        tr = InterlockedCompareExchange(&s_transitions, 0, 0);
++        if (tr != seen) {
++            seen = tr;
++            quiet = now;
++        } else if ((now.QuadPart - quiet.QuadPart) * 1000 >= f.QuadPart) {
++            break;
++        }
++        if ((now.QuadPart - start.QuadPart) * 1000
++                >= (LONGLONG)max_ms * f.QuadPart)
++            break;
++        SwitchToThread();
++    }
++    InterlockedDecrement(&g_irq_requests);
++    return ok;
++}
++
+ /* Which threads are holding the boundary up, and where they raised.
+  *
+  * A depth that stops changing has to be attributed to code, and the raise
+@@ -177,8 +330,11 @@ static void irql_track(KIRQL old_level, KIRQL new_level, void *ra)
+     if (now == was)
+         return;
+ 
+-    d = now ? InterlockedIncrement(&g_irql_raised_count)
++    d = now ? irql_count_raise()
              : InterlockedDecrement(&g_irql_raised_count);
 +    /* After the increment, never before: see g_irq_owner. */
 +    if (now)
@@ -2734,7 +3638,7 @@ index 3a09ca8..7c8547f 100644
      InterlockedIncrement(&s_transitions);
      if (now)
          irql_holder_add(ra);
-@@ -733,10 +812,24 @@ VOID __stdcall xbox_AvSendTVEncoderOption(
+@@ -733,10 +889,24 @@ VOID __stdcall xbox_AvSendTVEncoderOption(
           *
           * HDTV pack keeps 480p/720p available to titles that offer them;
           * NTSC-M and 60Hz are the North American retail default, and match
@@ -2763,7 +3667,7 @@ index 3a09ca8..7c8547f 100644
          break;
  
      case AV_OPTION_QUERY_MODE:
-@@ -1060,6 +1153,70 @@ uint64_t xbox_ReadTimeStampCounter(void)
+@@ -1060,6 +1230,70 @@ uint64_t xbox_ReadTimeStampCounter(void)
      }
  }
  
@@ -2894,10 +3798,10 @@ index e66e3de..df01bde 100644
      return STATUS_SUCCESS;
  }
 diff --git a/src/kernel/kernel_xbox.c b/src/kernel/kernel_xbox.c
-index 4ebdfb9..4e2a872 100644
+index 4ebdfb9..3d5db09 100644
 --- a/src/kernel/kernel_xbox.c
 +++ b/src/kernel/kernel_xbox.c
-@@ -10,8 +10,20 @@
+@@ -10,8 +10,36 @@
   */
  
  #include "kernel.h"
@@ -2915,10 +3819,26 @@ index 4ebdfb9..4e2a872 100644
 +    return ws;
 +}
 +
++/* RECOMP_VIDEO_480P=0: widescreen without 480p -- a 16:9 TV on composite or
++ * SCART, as far as the title can tell -- for a title with a standard-
++ * definition widescreen mode (640x480 squeezed). MechAssault 2 has none: it
++ * offers widescreen at 480p only and draws 4:3 otherwise. Default 1 (480p
++ * allowed), as before. */
++int xbox_Video480p(void)
++{
++    static int p = -1;
++
++    if (p < 0) {
++        const char *e = getenv("RECOMP_VIDEO_480P");
++        p = !(e && *e == '0');
++    }
++    return p;
++}
++
  /* ============================================================================
   * Exported Data Objects
   *
-@@ -145,9 +157,15 @@ NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
+@@ -145,9 +173,16 @@ NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
          break;
  
      case XC_VIDEO:
@@ -2930,14 +3850,15 @@ index 4ebdfb9..4e2a872 100644
          if (ValueLength >= sizeof(ULONG)) {
 -            *(PULONG)Value = XC_VIDEO_FLAGS_WIDESCREEN | XC_VIDEO_FLAGS_HDTV;
 +            *(PULONG)Value = xbox_VideoWidescreen()
-+                ? (ULONG)(XC_VIDEO_FLAGS_WIDESCREEN | XC_VIDEO_FLAGS_HDTV_480p)
++                ? (ULONG)(XC_VIDEO_FLAGS_WIDESCREEN
++                          | (xbox_Video480p() ? XC_VIDEO_FLAGS_HDTV_480p : 0))
 +                      << XC_VIDEO_FLAGS_SHIFT
 +                : 0;
              if (Type) *Type = 4; /* REG_DWORD */
              if (ResultLength) *ResultLength = sizeof(ULONG);
          }
 diff --git a/src/kernel/nv2a_backend.h b/src/kernel/nv2a_backend.h
-index 327f01d..fe80235 100644
+index 327f01d..e2d5099 100644
 --- a/src/kernel/nv2a_backend.h
 +++ b/src/kernel/nv2a_backend.h
 @@ -20,6 +20,12 @@
@@ -2976,7 +3897,7 @@ index 327f01d..fe80235 100644
  } Nv2aSurface;
  
  /* A texture as the title programmed it. uv in Nv2aVertex are in texels. */
-@@ -51,6 +66,13 @@ typedef struct {
+@@ -51,6 +66,22 @@ typedef struct {
       * a linear texture) and the raw SET_TEXTURE_FILTER word (MIN in bits
       * 16-23). A back end that ignores them samples level 0. */
      uint32_t levels, filter;
@@ -2987,10 +3908,19 @@ index 327f01d..fe80235 100644
 +    /* Extended: slices of a volume texture (DIMENSIONALITY 3), 1 for 2D; a
 +     * volume has one level. 0 reads as 1. */
 +    uint32_t depth;
++    /* Extended: this stage's bump-environment matrix (SET_TEXTURE_SET_BUMP_
++     * ENV_MAT, m00 m01 m10 m11; D3D's u += m00 du + m10 dv,
++     * v += m01 du + m11 dv) and the luminance scale and offset,
++     * for a BUMPENVMAP / BUMPENVMAP_LUM texture shader stage. */
++    float bump_mat[4], bump_scale, bump_offset;
++    /* Extended: SET_TEXTURE_CONTROL0's ALPHA_KILL_ENABLE (bit 2): a pixel
++     * whose texel from this stage has alpha 0 is not drawn at all (the
++     * D3D11 back end; the CPU rasteriser ignores it). */
++    uint32_t alpha_kill;
  } Nv2aTexture;
  
  typedef struct {
-@@ -58,6 +80,12 @@ typedef struct {
+@@ -58,6 +89,12 @@ typedef struct {
      float    rhw;               /* 1/w, 1 for pre-transformed batches */
      uint32_t diffuse;           /* 0xAARRGGBB */
      float    u, v;              /* texels */
@@ -3003,7 +3933,7 @@ index 327f01d..fe80235 100644
  } Nv2aVertex;
  
  /* Render state as the title set it, in NV2A's own (OpenGL) enum values:
-@@ -80,6 +108,8 @@ typedef struct {
+@@ -80,6 +117,8 @@ typedef struct {
       * that ignores these draws that pass over the whole surface. */
      uint32_t stencil_enable, stencil_func, stencil_ref, stencil_func_mask;
      uint32_t stencil_write_mask, stencil_fail, stencil_zfail, stencil_zpass;
@@ -3012,7 +3942,7 @@ index 327f01d..fe80235 100644
  } Nv2aRenderState;
  
  typedef struct {
-@@ -87,15 +117,63 @@ typedef struct {
+@@ -87,15 +126,66 @@ typedef struct {
      uint32_t           count;
      const Nv2aTexture *texture;     /* NULL: untextured */
      const Nv2aRenderState *state;
@@ -3049,9 +3979,12 @@ index 327f01d..fe80235 100644
 +    /* INLINE_ARRAY / immediate batches: attribute offsets are into this. */
 +    const uint8_t *inline_data;
 +    uint32_t inline_bytes;
-+    /* Triangle list: count vertex indices, each minus index_min. */
++    /* Triangle list: count vertex indices, each minus index_min. With
++     * `lines` set, a line list instead (pairs: LINES, LINE_STRIP and
++     * LINE_LOOP, one pixel wide). */
 +    const uint32_t *indices;
 +    uint32_t count, index_min, index_max;
++    uint32_t lines;
 +    float aa_sx, aa_sy;                 /* the program's pixels -> surface pixels */
 +    /* The fixed-function fog unit, applied to oFog.x (SET_FOG_ENABLE/MODE/
 +     * PARAMS); the executor's fog_factor() is the reference. */
@@ -3076,7 +4009,7 @@ index 327f01d..fe80235 100644
  } Nv2aBackend;
  
  /* Register (or, with NULL, remove) the back end. Call before the title starts
-@@ -106,6 +184,15 @@ void nv2a_backend_register(const Nv2aBackend *backend);
+@@ -106,6 +196,28 @@ void nv2a_backend_register(const Nv2aBackend *backend);
   * Handles every format the executor can sample (swizzled, linear, DXT).
   * Returns 0 if the format is not supported. */
  int nv2a_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out);
@@ -3089,18 +4022,50 @@ index 327f01d..fe80235 100644
 +
 +/* Size in bytes of level 0 of one face, for hashing texture memory. */
 +uint32_t nv2a_backend_texture_bytes(const Nv2aTexture *tex);
++
++/* Texture replacement: a title's own pictures in place of the disc's (a
++ * PC port's keyboard prompts over the pad's button icons, say). The back end
++ * asks fn each time it decodes a texture, with a hash of its guest bytes
++ * (the D3D11 back end's; RECOMP_TEX_HASHES=<n> logs it, and saves a picture,
++ * for each new texture up to n texels wide and high). fn returns 1 with
++ * *argb (0xAARRGGBB, *w x *h, rows top-down, kept valid by the title) to draw
++ * that instead -- any size, the stages sample it in normalized coordinates
++ * -- or 0 to keep the texture. Not for cube maps or volumes. NULL removes it. */
++typedef int (*Nv2aTexReplaceFn)(uint64_t hash, const Nv2aTexture *tex,
++                                const uint32_t **argb, uint32_t *w, uint32_t *h);
++void nv2a_backend_set_tex_replace(Nv2aTexReplaceFn fn);
++Nv2aTexReplaceFn nv2a_backend_tex_replace(void);
  
  /* Where BACK_END_WRITE_SEMAPHORE_RELEASE (0x1D70) values land: the guest VA
   * of the semaphore the title reads GPU progress from (for XDK D3D, the
+diff --git a/src/kernel/nv2a_combiner.h b/src/kernel/nv2a_combiner.h
+index 8abfc5f..72fbcb8 100644
+--- a/src/kernel/nv2a_combiner.h
++++ b/src/kernel/nv2a_combiner.h
+@@ -27,6 +27,11 @@ typedef struct {
+     uint32_t final_c0, final_c1;            /* SET_SPECULAR_FOG_FACTOR */
+     uint32_t control;                       /* SET_COMBINER_CONTROL */
+     uint32_t stage_program;                 /* SET_SHADER_STAGE_PROGRAM */
++    /* What the dot-product texture stages read: SET_DOT_RGBMAPPING (3 bits
++     * per stage 1-3, 4 apart) maps the input texel to a vector, and
++     * SET_SHADER_OTHER_STAGE_INPUT (bits 16-19 stage 2, 20-23 stage 3)
++     * names the stage it comes from; stage 1 always reads stage 0. */
++    uint32_t dot_mapping, stage_input;
+ } Nv2aCombiner;
+ 
+ /* One pixel. Colours are r,g,b,a in [0,1]; `fog` is (fog colour, factor).
 diff --git a/src/kernel/nv2a_pb_exec.c b/src/kernel/nv2a_pb_exec.c
-index 1280565..27a0c4c 100644
+index 1280565..0bdec2f 100644
 --- a/src/kernel/nv2a_pb_exec.c
 +++ b/src/kernel/nv2a_pb_exec.c
-@@ -262,9 +262,13 @@ typedef struct {
+@@ -262,9 +262,16 @@ typedef struct {
      uint32_t levels;                    /* mip levels, from FORMAT       */
      uint32_t filter;                    /* SET_TEXTURE_FILTER            */
      int      cube;                      /* FORMAT: six faces, not one    */
 +    uint32_t depth;                     /* FORMAT: slices of a volume, 0/1: 2D */
++    float    bump_mat[4];               /* SET_TEXTURE_SET_BUMP_ENV_MAT     */
++    float    bump_scale, bump_offset;   /* ..._BUMP_ENV_SCALE / _OFFSET     */
++    uint32_t control0;                  /* SET_TEXTURE_CONTROL0             */
      int      valid;
  } Texture;
  
@@ -3110,10 +4075,14 @@ index 1280565..27a0c4c 100644
  static struct {
      VertexAttr attr[NV_VERTEX_ATTRS];
      uint32_t   prim;                    /* SET_BEGIN_END parameter, 0 = ended */
-@@ -767,6 +771,11 @@ void nv2a_backend_register(const Nv2aBackend *backend)
+@@ -767,6 +774,15 @@ void nv2a_backend_register(const Nv2aBackend *backend)
      s_backend = backend;
  }
  
++static Nv2aTexReplaceFn s_tex_replace;
++void nv2a_backend_set_tex_replace(Nv2aTexReplaceFn fn) { s_tex_replace = fn; }
++Nv2aTexReplaceFn nv2a_backend_tex_replace(void) { return s_tex_replace; }
++
 +/* Batches in the last finished frame, for RECOMP_PAD_AUTO (usb_gamepad.c),
 + * which tells gameplay from menus by it. */
 +static volatile uint32_t s_frame_draws;
@@ -3122,7 +4091,7 @@ index 1280565..27a0c4c 100644
  static int backend_draws(void)
  {
      return s_backend && s_backend->draw;
-@@ -781,6 +790,36 @@ static void current_surface(Nv2aSurface *out)
+@@ -781,6 +797,36 @@ static void current_surface(Nv2aSurface *out)
      out->bytes_per_pixel = surface_bpp();
      out->aa_sx           = s_gpu.aa_sx > 1.5f ? 2 : 1;
      out->aa_sy           = s_gpu.aa_sy > 1.5f ? 2 : 1;
@@ -3159,7 +4128,7 @@ index 1280565..27a0c4c 100644
  }
  
  /* Render state in the NV2A's own values, gathered from what the executor
-@@ -814,6 +853,8 @@ static void current_render_state(Nv2aRenderState *r)
+@@ -814,6 +860,8 @@ static void current_render_state(Nv2aRenderState *r)
      r->stencil_fail      = s_reg[0x0370 / 4];        /* SET_STENCIL_OP_FAIL */
      r->stencil_zfail     = s_reg[0x0374 / 4];        /* SET_STENCIL_OP_ZFAIL */
      r->stencil_zpass     = s_reg[0x0378 / 4];        /* SET_STENCIL_OP_ZPASS */
@@ -3168,7 +4137,7 @@ index 1280565..27a0c4c 100644
  }
  
  static int sample_texture(uint32_t u, uint32_t v, uint32_t *argb);
-@@ -831,10 +872,11 @@ int nv2a_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out)
+@@ -831,10 +879,11 @@ int nv2a_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out)
      s_gpu.texs[0].color  = tex->color;
      s_gpu.texs[0].addr_u = 3;
      s_gpu.texs[0].addr_v = 3;
@@ -3181,7 +4150,7 @@ index 1280565..27a0c4c 100644
      s_gpu.texs[0].valid  = 1;
      for (y = 0; y < tex->height && ok; y++)
          for (x = 0; x < tex->width; x++)
-@@ -846,6 +888,54 @@ int nv2a_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out)
+@@ -846,6 +895,54 @@ int nv2a_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out)
      return ok;
  }
  
@@ -3236,7 +4205,7 @@ index 1280565..27a0c4c 100644
  static void clear_surface(uint32_t param)
  {
      uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
-@@ -1064,6 +1154,8 @@ static uint32_t linear_twin(uint32_t fmt)
+@@ -1064,6 +1161,8 @@ static uint32_t linear_twin(uint32_t fmt)
      case 0x06: return 0x12;                /* A8R8G8B8  -> LIN_A8R8G8B8  */
      case 0x07: return 0x1E;                /* X8R8G8B8  -> LIN_X8R8G8B8  */
      case 0x19: return 0x1F;                /* A8        -> LIN_A8        */
@@ -3245,7 +4214,7 @@ index 1280565..27a0c4c 100644
      default:   return fmt;                 /* already linear, or unhandled */
      }
  }
-@@ -1094,17 +1186,30 @@ static int sample_tex(const Texture *t, uint32_t face_offset,
+@@ -1094,17 +1193,30 @@ static int sample_tex(const Texture *t, uint32_t face_offset,
                          uint32_t px[16]; } cache[4096];
          uint32_t bb = d3d8_format_dxt_block_bytes(fmt);
          uint32_t bx = u >> 2, by = v >> 2, bw = (t->width + 3) >> 2;
@@ -3280,7 +4249,7 @@ index 1280565..27a0c4c 100644
                                        &cache[slot].px[i]);
              cache[slot].key = key;
              cache[slot].fmt = fmt;
-@@ -1121,7 +1226,9 @@ static int sample_tex(const Texture *t, uint32_t face_offset,
+@@ -1121,7 +1233,9 @@ static int sample_tex(const Texture *t, uint32_t face_offset,
           * index for every one of them. */
          fmt = linear_twin(fmt);
          p = mem + base;
@@ -3291,7 +4260,7 @@ index 1280565..27a0c4c 100644
      } else {
          p = mem + base + (size_t)v * t->pitch;
      }
-@@ -1200,6 +1307,25 @@ static int sample_tex(const Texture *t, uint32_t face_offset,
+@@ -1200,6 +1314,25 @@ static int sample_tex(const Texture *t, uint32_t face_offset,
          return 1;
      }
  
@@ -3317,7 +4286,7 @@ index 1280565..27a0c4c 100644
      /* 8-bit. */
      case 0x13: {                                    /* LIN_L8 */
          uint32_t t = p[u];
-@@ -1920,37 +2046,85 @@ static void backend_from_xf(const Nv2aVshOutput *v, Nv2aVertex *o)
+@@ -1920,37 +2053,89 @@ static void backend_from_xf(const Nv2aVshOutput *v, Nv2aVertex *o)
      o->diffuse = pack_color(v->d0);
      o->u = v->tex[0][0] * su;
      o->v = v->tex[0][1] * sv;
@@ -3358,6 +4327,10 @@ index 1280565..27a0c4c 100644
 +    if (o->depth > 1)
 +        o->levels = 1;                  /* level 0 of a volume only */
 +    o->normalized = (uint32_t)tex_size_from_format(t->color);
++    memcpy(o->bump_mat, t->bump_mat, sizeof o->bump_mat);
++    o->bump_scale = t->bump_scale;
++    o->bump_offset = t->bump_offset;
++    o->alpha_kill = (t->control0 >> 2) & 1;
 +}
 +
 +/* The state half of a back-end batch: render state, the texture (if
@@ -3421,7 +4394,7 @@ index 1280565..27a0c4c 100644
      s_backend->draw(&surf, &batch);
      s_gpu.tris_drawn += s_bcount / 3;
      s_bcount = 0;
-@@ -1995,7 +2169,12 @@ static void raster_indexed(uint32_t i0, uint32_t i1, uint32_t i2, uint32_t argb)
+@@ -1995,7 +2180,12 @@ static void raster_indexed(uint32_t i0, uint32_t i1, uint32_t i2, uint32_t argb)
              o[k].diffuse = vertex_color(ix[k]);
              o[k].u = textured ? uv[k][0] : 0.0f;
              o[k].v = textured ? uv[k][1] : 0.0f;
@@ -3434,7 +4407,7 @@ index 1280565..27a0c4c 100644
          s_bcount += 3;
          return;
      }
-@@ -2106,7 +2285,7 @@ static uint32_t tex_texel_bytes(uint32_t fmt)
+@@ -2106,7 +2296,7 @@ static uint32_t tex_texel_bytes(uint32_t fmt)
      case 0x00: case 0x01: case 0x0B: case 0x13: case 0x19: case 0x1F:
          return 1;
      case 0x02: case 0x03: case 0x04: case 0x05: case 0x10: case 0x11:
@@ -3443,7 +4416,7 @@ index 1280565..27a0c4c 100644
          return 2;
      default:
          return 4;
-@@ -2388,12 +2567,65 @@ static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
+@@ -2388,12 +2578,65 @@ static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
  #define NV_RASTER_MAX_THREADS 16
  #define NV_RASTER_MT_MIN_PIXELS 8192
  
@@ -3509,7 +4482,7 @@ index 1280565..27a0c4c 100644
      XfCount cnt[NV_RASTER_MAX_THREADS];
  } s_pool;
  
-@@ -2403,7 +2635,12 @@ static DWORD WINAPI raster_worker(LPVOID arg)
+@@ -2403,7 +2646,12 @@ static DWORD WINAPI raster_worker(LPVOID arg)
      for (;;) {
          WaitForSingleObject(s_pool.start[k], INFINITE);
          memset(&s_pool.cnt[k], 0, sizeof s_pool.cnt[k]);
@@ -3523,7 +4496,7 @@ index 1280565..27a0c4c 100644
          if (InterlockedDecrement(&s_pool.pending) == 0)
              SetEvent(s_pool.done);
      }
-@@ -2462,11 +2699,83 @@ static void xf_rows_parallel(const XfTri *T, XfCount *total)
+@@ -2462,11 +2710,83 @@ static void xf_rows_parallel(const XfTri *T, XfCount *total)
          total->zpass += s_pool.cnt[k].zpass;
      }
  }
@@ -3607,7 +4580,7 @@ index 1280565..27a0c4c 100644
  #endif
  
  static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
-@@ -2564,6 +2873,20 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
+@@ -2564,6 +2884,20 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
      s_gpu.xf_drawn++;
      T.inv_area = 1.0f / area;
  
@@ -3628,7 +4601,7 @@ index 1280565..27a0c4c 100644
      xf_rows_parallel(&T, &cnt);
      s_gpu.xf_depth_fail += cnt.depth_fail;
      s_gpu.xf_pixels += cnt.pixels;
-@@ -2664,8 +2987,6 @@ static void raster_xf_clipped(const Nv2aVshOutput *a, const Nv2aVshOutput *b,
+@@ -2664,8 +2998,6 @@ static void raster_xf_clipped(const Nv2aVshOutput *a, const Nv2aVshOutput *b,
  
  /* About 7 MB, so allocated by the first batch that transforms rather than
   * carried in every build that never turns the executor on. */
@@ -3637,7 +4610,7 @@ index 1280565..27a0c4c 100644
  /* Does this batch run the title's vertex program? RECOMP_NO_VSH turns the
   * interpreter off (the batch then falls to the screen-space heuristics). */
  static int batch_uses_program(void)
-@@ -2721,15 +3042,172 @@ static void xf_set_viewport(void)
+@@ -2721,15 +3053,195 @@ static void xf_set_viewport(void)
      s_xf_o[2] = of[2];
  }
  
@@ -3678,7 +4651,13 @@ index 1280565..27a0c4c 100644
 +        for (i = 0; i + 2 < n; i += 3) TRI(i, i + 1, i + 2);
 +        break;
 +    case NV_PRIM_TRIANGLE_STRIP:
-+        for (i = 0; i + 2 < n; i++) TRI(i, i + 1, i + 2);
++        /* Every other triangle of a strip runs the other way round; its
++         * first two vertices swap so all keep the strip's winding, which
++         * the back end's culling reads. */
++        for (i = 0; i + 2 < n; i++) {
++            if (i & 1) TRI(i + 1, i, i + 2);
++            else       TRI(i, i + 1, i + 2);
++        }
 +        break;
 +    case NV_PRIM_TRIANGLE_FAN:
 +    case NV_PRIM_POLYGON:
@@ -3690,8 +4669,24 @@ index 1280565..27a0c4c 100644
 +    case NV_PRIM_QUAD_STRIP:
 +        for (i = 0; i + 3 < n; i += 2) { TRI(i, i + 1, i + 3); TRI(i, i + 3, i + 2); }
 +        break;
-+    default:
-+        break;                          /* points, lines: not drawn here either */
++    /* Lines go as pairs, drawn as lines (pb.lines). MechAssault 2 draws
++     * line strips every frame; they used to be dropped. */
++    case NV_PRIM_LINES:
++        for (i = 0; i + 1 < n; i += 2) { tri[k++] = ix[i] - lo; tri[k++] = ix[i + 1] - lo; }
++        break;
++    case NV_PRIM_LINE_STRIP:
++    case NV_PRIM_LINE_LOOP:
++        for (i = 0; i + 1 < n; i++) { tri[k++] = ix[i] - lo; tri[k++] = ix[i + 1] - lo; }
++        if (s_gpu.prim == NV_PRIM_LINE_LOOP && n > 2) { tri[k++] = ix[n - 1] - lo; tri[k++] = ix[0] - lo; }
++        break;
++    default:                            /* points: not drawn here either */
++        {
++            static uint32_t seen;
++            if (seen++ % 2000 == 0)
++                fprintf(stderr, "  [PB] points (%u vertices) not drawn (%u batches so far)\n",
++                        n, seen);
++        }
++        break;
 +    }
 +#undef TRI
 +    s_gpu.batches_program++;
@@ -3733,6 +4728,7 @@ index 1280565..27a0c4c 100644
 +    pb.cxt_write = nv2a_vsh_cxt_write();
 +    pb.indices = tri;
 +    pb.count = k;
++    pb.lines = s_gpu.prim >= NV_PRIM_LINES && s_gpu.prim <= NV_PRIM_LINE_STRIP;
 +    pb.index_min = lo;
 +    pb.index_max = hi;
 +    pb.aa_sx = s_gpu.aa_sx;
@@ -3813,7 +4809,7 @@ index 1280565..27a0c4c 100644
      xf_set_viewport();
      {
          const VertexAttr *tc = texcoord_attr();
-@@ -2815,6 +3293,51 @@ static void raster_batch_program(void)
+@@ -2815,6 +3327,51 @@ static void raster_batch_program(void)
                          s_xf[i].pos[3]);
          }
      }
@@ -3865,7 +4861,7 @@ index 1280565..27a0c4c 100644
      for (i = 0; i < NV2A_VSH_INPUTS; i++) {
          const VertexAttr *at = &s_gpu.attr[i];
          uint32_t f = at->type | (at->size << 4) | (i << 8), j;
-@@ -2828,6 +3351,19 @@ static void raster_batch_program(void)
+@@ -2828,14 +3385,27 @@ static void raster_batch_program(void)
      if (s_gpu.texs[0].valid)
          note_texture_use();
  
@@ -3885,7 +4881,17 @@ index 1280565..27a0c4c 100644
      switch (s_gpu.prim) {
      case NV_PRIM_TRIANGLES:
          for (i = 0; i + 2 < n; i += 3)
-@@ -2857,6 +3393,10 @@ static void raster_batch_program(void)
+             raster_xf_clipped(&s_xf[i], &s_xf[i+1], &s_xf[i+2]);
+         break;
+-    case NV_PRIM_TRIANGLE_STRIP:
++    case NV_PRIM_TRIANGLE_STRIP:           /* odd triangles swapped: winding */
+         for (i = 0; i + 2 < n; i++)
+-            raster_xf_clipped(&s_xf[i], &s_xf[i+1], &s_xf[i+2]);
++            raster_xf_clipped(&s_xf[i + (i & 1)], &s_xf[i + 1 - (i & 1)], &s_xf[i+2]);
+         break;
+     case NV_PRIM_TRIANGLE_FAN:
+     case NV_PRIM_POLYGON:
+@@ -2857,6 +3427,10 @@ static void raster_batch_program(void)
      default:
          break;
      }
@@ -3896,7 +4902,21 @@ index 1280565..27a0c4c 100644
      if (backend_draws())
          backend_flush(!s_xf_no_tex);
  }
-@@ -3186,22 +3726,54 @@ static void draw_inline_array(void)
+@@ -2899,10 +3473,10 @@ static void raster_batch(void)
+             raster_indexed(s_gpu.idx[i], s_gpu.idx[i+1], s_gpu.idx[i+2],
+                            vertex_color(s_gpu.idx[i]));
+         break;
+-    case NV_PRIM_TRIANGLE_STRIP:
++    case NV_PRIM_TRIANGLE_STRIP:           /* odd triangles swapped: winding */
+         for (i = 0; i + 2 < s_gpu.idx_count; i++)
+-            raster_indexed(s_gpu.idx[i], s_gpu.idx[i+1], s_gpu.idx[i+2],
+-                           vertex_color(s_gpu.idx[i]));
++            raster_indexed(s_gpu.idx[i + (i & 1)], s_gpu.idx[i + 1 - (i & 1)],
++                           s_gpu.idx[i+2], vertex_color(s_gpu.idx[i]));
+         break;
+     case NV_PRIM_TRIANGLE_FAN:
+     case NV_PRIM_POLYGON:
+@@ -3186,22 +3760,54 @@ static void draw_inline_array(void)
  
      memcpy(saved, s_gpu.attr, sizeof saved);
  
@@ -3955,7 +4975,7 @@ index 1280565..27a0c4c 100644
  
      count = (s_gpu.inline_count * 4) / vsize;
      if (count < 3 || count > NV_MAX_INDICES)
-@@ -3406,6 +3978,8 @@ static void tex_stage_method(uint32_t method, uint32_t param)
+@@ -3406,6 +4012,8 @@ static void tex_stage_method(uint32_t method, uint32_t param)
          t->color = (param >> 8) & 0xFF;
          t->cube = (param >> 2) & 1;
          t->levels = (param >> 16) & 0xF;
@@ -3964,7 +4984,50 @@ index 1280565..27a0c4c 100644
          /* A swizzled texture carries its own dimensions here, as log2 in
           * BASE_SIZE_U/V. It has to: IMAGE_RECT describes a linear image, and
           * a title that only uses swizzled textures never sends one. */
-@@ -3747,6 +4321,10 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -3424,6 +4032,9 @@ static void tex_stage_method(uint32_t method, uint32_t param)
+         t->addr_u =  param        & 0xF;
+         t->addr_v = (param >>  8) & 0xF;
+         break;
++    case 0x1B0C:                                  /* SET_TEXTURE_CONTROL0 */
++        t->control0 = param;
++        break;
+     case NV097_SET_TEXTURE_CONTROL1:
+         t->pitch = param >> 16;          /* linear formats only */
+         break;
+@@ -3434,6 +4045,23 @@ static void tex_stage_method(uint32_t method, uint32_t param)
+     case 0x1B14:                                  /* SET_TEXTURE_FILTER */
+         t->filter = param;
+         break;
++    /* SET_TEXTURE_SET_BUMP_ENV_MAT (four floats), _SCALE and _OFFSET: the
++     * matrix a BUMPENVMAP stage turns the previous stage's du/dv by, and
++     * the luminance scale and offset BUMPENVMAP_LUM applies (xemu's
++     * layout: the stage's own registers, 0x1B28 + 0x40*i). The method
++     * takes m00 m01 m11 m10 (xemu's pgraph swizzle); kept as m00 m01 m10
++     * m11. */
++    case 0x1B28: case 0x1B2C: case 0x1B30: case 0x1B34: {
++        static const int order[4] = { 0, 1, 3, 2 };
++        memcpy(&t->bump_mat[order[(reg - 0x1B28) / 4]], &param, sizeof(float));
++        break;
++    }
++    case 0x1B38:
++        memcpy(&t->bump_scale, &param, sizeof(float));
++        break;
++    case 0x1B3C:
++        memcpy(&t->bump_offset, &param, sizeof(float));
++        break;
+     default:
+         break;
+     }
+@@ -3602,6 +4230,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+         s_gpu.rc_seen = 1;
+         break;
+     case 0x1E70: s_gpu.rc.stage_program = param; break;
++    case 0x1E74: s_gpu.rc.dot_mapping = param; break;   /* SET_DOT_RGBMAPPING */
++    case 0x1E78: s_gpu.rc.stage_input = param; break;   /* SET_SHADER_OTHER_STAGE_INPUT */
+     case 0x17F8: s_gpu.clip_plane_mode = param; break;
+ 
+     /* Alpha test and fog. */
+@@ -3747,6 +4377,10 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
          /* The stall ends when the buffer being read is the one just finished.
           * There is no scanout here to wait for, so that is now. */
          s_gpu.flip_read = s_gpu.flip_write;
@@ -3975,7 +5038,7 @@ index 1280565..27a0c4c 100644
          /* And this is a completed swap, which is what a title's own swap
           * counter counts -- see xbox_Nv2aFrameCounterFlip. */
          xbox_Nv2aFrameCounterFlip();
-@@ -3762,6 +4340,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -3762,6 +4396,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
              extern void xbox_FramebufferWindowFrameStats(uint32_t);
              static uint32_t draws_at_flip;
              xbox_FramebufferWindowFrameStats(s_gpu.draws - draws_at_flip);
@@ -3983,7 +5046,7 @@ index 1280565..27a0c4c 100644
              draws_at_flip = s_gpu.draws;
          }
          if (s_gpu.pitch) {
-@@ -3798,8 +4377,6 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -3798,8 +4433,6 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
              }
          }
          s_gpu.drawn_stale = 1;
@@ -4749,10 +5812,10 @@ index 87b7ef7..e6c21cc 100644
  static void publish(uint32_t bpp)
 diff --git a/src/video/nv2a_d3d11.c b/src/video/nv2a_d3d11.c
 new file mode 100644
-index 0000000..28f7228
+index 0000000..b49e558
 --- /dev/null
 +++ b/src/video/nv2a_d3d11.c
-@@ -0,0 +1,3225 @@
+@@ -0,0 +1,4001 @@
 +/*
 + * nv2a_d3d11.c -- a Direct3D 11 render back end for the pushbuffer executor.
 + *
@@ -4836,7 +5899,10 @@ index 0000000..28f7228
 +"  float4 g_fc0; float4 g_fc1; float4 g_fogc;\n"
 +"  uint4  g_misc;\n"           /* alpha test enable, func, ref, clip plane mode */
 +"  float4 g_tsz[4];\n"         /* w, h, normalized, cube */
-+"  uint4  g_misc2;\n"          /* textured (modulate mode), G8B8 stages */
++"  uint4  g_misc2;\n"          /* textured (modulate mode), G8B8 stages, alpha-kill stages */
++"  float4 g_bm[4];\n"          /* per stage: bump-env matrix m00 m01 m10 m11 */
++"  float4 g_bl[4];\n"          /* per stage: BUMPENVMAP_LUM scale, offset */
++"  uint4  g_dot;\n"            /* DOT_RGBMAPPING, SHADER_OTHER_STAGE_INPUT */
 +"};\n"
 +"Texture2D T0 : register(t0); Texture2D T1 : register(t1);\n"
 +"Texture2D T2 : register(t2); Texture2D T3 : register(t3);\n"
@@ -5014,6 +6080,7 @@ index 0000000..28f7228
 +"#define K_TFC(st) ((K_TF[st] & 2u) != 0)\n"
 +"#define K_TF3(st) ((K_TF[st] & 8u) != 0)\n"
 +"#define K_TFG(st) ((K_TF[st] & 4u) != 0)\n"
++"#define K_TFK(st) ((K_TF[st] & 16u) != 0)\n"
 +"#define K_TEXTURED SPEC_TEXTURED\n"
 +"#define STAGE_LOOP [unroll]\n"
 +"#else\n"
@@ -5027,6 +6094,7 @@ index 0000000..28f7228
 +"#define K_TFC(st) (g_tsz[st].w == 1.0)\n"
 +"#define K_TF3(st) (g_tsz[st].w == 2.0)\n"
 +"#define K_TFG(st) (((g_misc2.y >> (st)) & 1u) != 0)\n"
++"#define K_TFK(st) (((g_misc2.z >> (st)) & 1u) != 0)\n"
 +"#define K_TEXTURED g_misc2.x\n"
 +"#define STAGE_LOOP [loop]\n"
 +"#endif\n"
@@ -5094,10 +6162,91 @@ index 0000000..28f7228
 +"  if (st == 2) return C2.SampleLevel(S2, d, 0);\n"
 +"  return C3.SampleLevel(S3, d, 0);\n"
 +"}\n"
-+"float4 stage_fetch(uint st, float4 c, inout bool keep) {\n"
++/* A signed byte stored in a unorm channel: two's complement, as D3D's
++ * signed formats (V8U8, X8L8V8U8) hold du and dv. */
++"float sgn8(float x) {\n"
++"  float b = round(saturate(x) * 255.0);\n"
++"  return max((b > 127.0 ? b - 256.0 : b) / 127.0, -1.0);\n"
++"}\n"
++/* The dot-product stages' input texel as a vector, by its DOT_RGBMAPPING
++ * (xemu psh.c's dotmap_*): 0..1 as it is, (b-128)/127 (D3D), (2b+1)/255-1
++ * (GL), or the bytes as two's complement. HILO_1 (4) reads two 16-bit
++ * halves, (a:r, g:b, 1); the hemisphere HILO mappings (5-7) take the colour
++ * as it is, as xemu does. */
++"float3 dotmap(float4 col, uint m) {\n"
++"  float3 b = round(saturate(col.rgb) * 255.0);\n"
++"  if (m == 1u) return (b - 128.0) / 127.0;\n"
++"  if (m == 2u) return (b * 2.0 + 1.0) / 255.0 - 1.0;\n"
++"  if (m == 3u) return max((b > 127.0 ? b - 256.0 : b) / 127.0, -1.0);\n"
++"  if (m == 4u) {\n"
++"    float a = round(saturate(col.a) * 255.0);\n"
++"    return float3((a * 256.0 + b.r) / 65535.0, (b.g * 256.0 + b.b) / 65535.0, 1.0);\n"
++"  }\n"
++"  return col.rgb;\n"
++"}\n"
++/* What earlier stages produced, for the dot-product stages: their texels
++ * (an input other than the stage just before), their dot products, and
++ * their texture coordinates (the eye vector rides in stages 1-3's q). */
++"static float4 TS[4]; static float DT[4]; static float4 TC[4];\n"
++"float4 stage_fetch(uint st, float4 c, float4 prev, inout bool keep) {\n"
 +"  uint mode = (K_FIN.w >> (st * 5)) & 0x1F;\n"
 +"  float4 sz = g_tsz[st];\n"
 +"  if (mode == 0) return float4(0, 0, 0, 1);\n"
++/* DEPENDENT_AR / _GB: the previous stage's texel, two of its channels, as
++ * this stage's (s, t). MechAssault 2's shadows look depth bytes up in a
++ * falloff table this way. The input is always stage st-1 here
++ * (SET_SHADER_OTHER_STAGE_INPUT can name another for stages 2 and 3; MA2
++ * sets the default). */
++"  if (mode == 15) return tex2d(st, prev.ar);\n"
++"  if (mode == 16) return tex2d(st, prev.gb);\n"
++/* BUMPENVMAP / _LUM (xemu psh.c): the previous stage's texel is a bump
++ * map, du in its blue channel and dv in green (D3D's V8U8: G8B8 reads
++ * (B,G,B,G), U the low byte), signed bytes the decoder handed over as
++ * unsigned. This stage's matrix turns them, and the result moves this
++ * stage's lookup -- a water surface's reflection rippling. _LUM then scales
++ * the texel by the bump map's luminance (red: X8L8V8U8's L) * scale +
++ * offset. Without these the stage read black: MechAssault 2's water. */
++"  if ((mode == 6 || mode == 7 || mode == 9 || (mode >= 12 && mode <= 14) || mode == 17)\n"
++"      && g_dot.z == 0u) return float4(0, 0, 0, 0);\n"   /* RECOMP_D3D11_DOT=0 */
++"  if ((mode == 6 || mode == 7 || mode == 9 || (mode >= 12 && mode <= 14))\n"
++"      && g_dot.z == 2u) return float4(1, 0, 1, 1);\n"   /* =2: show where */
++"  if (mode == 6 || mode == 7) {\n"
++"    float2 d = float2(sgn8(prev.b), sgn8(prev.g));\n"
++"    float4 m = g_bm[st];\n"
++/* The offset is in the stage's own coordinates, added before a linear
++ * texture's texel coordinates are scaled to 0..1 (xemu: texScale * (pT.xy +
++ * dsdt)). Added after, MechAssault 2's rippled water (a linear copy of the
++ * scene, matrix 8 0 0 8) moved by up to 8 copy widths instead of 8 texels. */
++"    float2 uv = c.xy + float2(m.x * d.x + m.z * d.y, m.y * d.x + m.w * d.y);\n"
++"    if (!K_TFN(st)) uv /= max(sz.xy, 1.0);\n"
++"    float4 v = tex2d(st, uv);\n"
++"    if (mode == 7) v *= saturate(prev.r * g_bl[st].x + g_bl[st].y);\n"
++"    return v;\n"
++"  }\n"
++/* The dot-product family (xemu psh.c), D3D's texm3x2 / texm3x3: each stage
++ * dots its texture coordinate with the input stage's texel, mapped to a
++ * vector. DOTPRODUCT (17) only keeps the dot; DOT_ST (9) looks this stage's
++ * 2D texture up at (previous dot, this dot); DOT_STR_3D (13) and _CUBE (14)
++ * look up at (dot1, dot2, dot3); DOT_RFLCT_SPEC (12) reflects the eye
++ * vector (stages 1-3's q) about that normal into a cube map -- per-pixel
++ * reflections on bumped water and shiny surfaces. All of them read black
++ * before. */
++"  if (mode == 17 || mode == 9 || mode == 12 || mode == 13 || mode == 14) {\n"
++"    uint sel = st <= 1u ? 0u : min((g_dot.y >> (st == 2u ? 16u : 20u)) & 0xFu, st - 1u);\n"
++"    uint dm = st >= 1u ? (g_dot.x >> ((st - 1u) * 4u)) & 7u : 0u;\n"
++"    DT[st] = dot(c.xyz, dotmap(TS[sel], dm));\n"
++"    if (mode == 17) return float4(0, 0, 0, 0);\n"
++"    if (mode == 9) {\n"
++"      float2 uv = float2(DT[st >= 1u ? st - 1u : 0u], DT[st]);\n"
++"      if (!K_TFN(st)) uv /= max(sz.xy, 1.0);\n"
++"      return tex2d(st, uv);\n"
++"    }\n"
++"    float3 n = float3(DT[1], DT[2], DT[3]);\n"
++"    if (mode == 13) return tex3d(st, n);\n"
++"    if (mode == 14) return texcube(st, n);\n"
++"    float3 e = float3(TC[1].w, TC[2].w, TC[3].w);\n"
++"    return texcube(st, 2.0 * n * dot(n, e) / max(dot(n, n), 1e-8) - e);\n"
++"  }\n"
 +"  if (mode == 2 && K_TF3(st)) {\n"
 +"    float q = (c.w != 0.0) ? c.w : 1.0;\n"
 +"    return tex3d(st, c.xyz / q);\n"
@@ -5143,14 +6292,28 @@ index 0000000..28f7228
 +"  float4 col = i.d0;\n"
 +"  if (K_MISC.z == 0) {\n"                         /* texel * diffuse */
 +"    float4 o = col;\n"
-+"    if (K_TEXTURED != 0) o = tex2d(0, i.uv / max(g_tsz[0].xy, 1.0)) * col;\n"
++"    if (K_TEXTURED != 0) {\n"
++"      float4 tx = tex2d(0, i.uv / max(g_tsz[0].xy, 1.0));\n"
++"      if (K_TFK(0) && tx.a == 0.0) discard;\n"
++"      o = tx * col;\n"
++"    }\n"
 +"    o = saturate(o);\n"
 +"    if (!alpha_pass(o.a)) discard;\n"
 +"    return o;\n"
 +"  }\n"
 +"  float4 t[4]; bool keep = true;\n"
-+"  t[0] = stage_fetch(0, i.t0, keep); t[1] = stage_fetch(1, i.t1, keep);\n"
-+"  t[2] = stage_fetch(2, i.t2, keep); t[3] = stage_fetch(3, i.t3, keep);\n"
++"  TC[0] = i.t0; TC[1] = i.t1; TC[2] = i.t2; TC[3] = i.t3;\n"
++"  DT[0] = DT[1] = DT[2] = DT[3] = 0.0;\n"
++"  t[0] = stage_fetch(0, i.t0, float4(0, 0, 0, 0), keep); TS[0] = t[0];\n"
++"  t[1] = stage_fetch(1, i.t1, t[0], keep); TS[1] = t[1];\n"
++"  t[2] = stage_fetch(2, i.t2, t[1], keep); TS[2] = t[2];\n"
++"  t[3] = stage_fetch(3, i.t3, t[2], keep); TS[3] = t[3];\n"
++/* ALPHA_KILL_ENABLE (xemu psh.c): a stage that sampled a texel with alpha
++ * 0 drops the pixel. MechAssault 2's jump-jet heat haze is opaque quads
++ * whose bump map (a puff with 1-bit alpha) kills everything outside the
++ * puff; without it each quad drew whole, a smeared square whose edges cut
++ * across the one before. */
++"  [unroll] for (uint q = 0; q < 4; q++) if (K_TFK(q) && t[q].a == 0.0) keep = false;\n"
 +"  if (!keep) discard;\n"
 +"  [unroll] for (uint k = 0; k < 16; k++) R[k] = float4(0, 0, 0, 0);\n"
 +"  R[3] = float4(g_fogc.rgb, saturate(i.fog)); R[4] = col; R[5] = i.d1;\n"
@@ -5222,6 +6385,8 @@ index 0000000..28f7228
 +    uint32_t misc[4];
 +    float    tsz[4][4];
 +    uint32_t misc2[4];
++    float    bm[4][4], bl[4][4];
++    uint32_t dot[4];
 +} CB;
 +
 +typedef struct {
@@ -5243,6 +6408,8 @@ index 0000000..28f7228
 +static UINT s_vb_size, s_vb_pos;
 +static ID3D11ShaderResourceView *s_white2d, *s_whitecube;
 +static ID3D11RasterizerState *s_rs;
++/* As s_rs, culling: [0 front, 1 back][front face is counter-clockwise]. */
++static ID3D11RasterizerState *s_rs_cull[2][2];
 +/* Depth is clamped per pixel (DepthClipEnable off clamps to the viewport's
 + * range), never per vertex: a floor triangle reaching behind the eye has
 + * vertices far outside [0, 1], and clamping those first bent the depth of
@@ -5486,12 +6653,22 @@ index 0000000..28f7228
 +
 +    memset(&rd, 0, sizeof rd);
 +    rd.FillMode = D3D11_FILL_SOLID;
-+    rd.CullMode = D3D11_CULL_NONE;      /* the CPU rasteriser draws both windings */
++    rd.CullMode = D3D11_CULL_NONE;      /* culling off; s_rs_cull when on */
 +    rd.DepthClipEnable = FALSE;         /* window z is clamped, not clipped */
 +    rd.ScissorEnable = TRUE;
 +    rd.MultisampleEnable = s_msaa > 1;
 +    hr = ID3D11Device_CreateRasterizerState(s_dev, &rd, &s_rs);
 +    if (FAILED(hr)) { d3d_log("CreateRasterizerState", hr); return 0; }
++    {
++        int c, f;
++        for (c = 0; c < 2; c++)
++            for (f = 0; f < 2; f++) {
++                rd.CullMode = c ? D3D11_CULL_BACK : D3D11_CULL_FRONT;
++                rd.FrontCounterClockwise = f;
++                hr = ID3D11Device_CreateRasterizerState(s_dev, &rd, &s_rs_cull[c][f]);
++                if (FAILED(hr)) { d3d_log("CreateRasterizerState (cull)", hr); return 0; }
++            }
++    }
 +
 +    {
 +        const char *e = getenv("RECOMP_RENDER_SCALE");
@@ -5924,18 +7101,29 @@ index 0000000..28f7228
 + * samples white for them; so does this, without hashing or writing anything
 + * back first. */
 +static int s_tex_rt;                /* the last tex_get was a render target */
++static int s_tex_z;                 /* ... the depth buffer (ds_alias): nearest */
++static uint32_t s_cur_zeta;         /* the depth surface bound for drawing */
++static ID3D11ShaderResourceView *ds_alias(const Nv2aTexture *t);
 +
 +static ID3D11ShaderResourceView *tex_get(const Nv2aTexture *t, float *w, float *h,
 +                                         int *g8b8)
 +{
 +    ID3D11ShaderResourceView *a;
 +    *g8b8 = 0;
-+    s_tex_rt = 0;
++    s_tex_rt = s_tex_z = 0;
 +    if (s_fmt_bad[t->color & 0xFF])
 +        return NULL;
 +    *w = (float)t->width;
 +    *h = (float)t->height;
-+    a = t->depth > 1 ? NULL : rt_alias(t, w, h, g8b8);
++    /* The bound depth surface first: its memory may also hold a colour
++     * target from before (menus drew there), stale since the depth moved
++     * in. */
++    if (t->offset == s_cur_zeta && (a = ds_alias(t)) != NULL)
++        s_tex_z = 1;
++    else
++        a = t->depth > 1 ? NULL : rt_alias(t, w, h, g8b8);
++    if (!a && (a = ds_alias(t)) != NULL)
++        s_tex_z = 1;
 +    s_tex_rt = a != NULL;
 +    if (a)
 +        return a;
@@ -5945,6 +7133,138 @@ index 0000000..28f7228
 +    rt_sync_overlap(t->offset, tex_span(t));
 +    s_sync_tex = NULL;
 +    return tex_get_decoded(t);
++}
++
++/* RECOMP_TEX_HASHES=<n>: each new 2D texture up to n texels on a side,
++ * once per hash, logged with the hash a replacement is keyed on and saved as
++ * texhash_<hash>.bmp (colour, then alpha beside it) in the working
++ * directory -- for finding the textures a title wants to replace. */
++static void tex_hash_note(const Nv2aTexture *t, uint64_t hash)
++{
++    static uint64_t seen[1024];
++    static int nseen;
++    uint32_t w = t->width, h = t->height, x, y, row = ((w * 2 * 3) + 3) & ~3u;
++    uint32_t *px;
++    char name[64];
++    FILE *f;
++    int i;
++
++    for (i = 0; i < nseen; i++)
++        if (seen[i] == hash)
++            return;
++    if (nseen < 1024)
++        seen[nseen++] = hash;
++    fprintf(stderr, "  [TEXHASH] %016llX %ux%u fmt 0x%02X at %08X\n",
++            (unsigned long long)hash, w, h, t->color, t->offset);
++    px = (uint32_t *)malloc((size_t)w * h * 4);
++    if (!px)
++        return;
++    snprintf(name, sizeof name, "texhash_%016llX.bmp", (unsigned long long)hash);
++    if (nv2a_backend_decode_texture(t, px) && (f = fopen(name, "wb")) != NULL) {
++        uint8_t hdr[54] = { 'B', 'M' }, *line = (uint8_t *)calloc(row, 1);
++        uint32_t sz = 54 + row * h, ww = w * 2;
++        int32_t hh = -(int32_t)h;
++        memcpy(hdr + 2, &sz, 4); hdr[10] = 54; hdr[14] = 40;
++        memcpy(hdr + 18, &ww, 4); memcpy(hdr + 22, &hh, 4);
++        hdr[26] = 1; hdr[28] = 24;
++        fwrite(hdr, 1, 54, f);
++        for (y = 0; line && y < h; y++) {
++            for (x = 0; x < w; x++) {
++                uint32_t c = px[y * w + x];
++                line[x * 3] = (uint8_t)c;
++                line[x * 3 + 1] = (uint8_t)(c >> 8);
++                line[x * 3 + 2] = (uint8_t)(c >> 16);
++                line[(w + x) * 3] = line[(w + x) * 3 + 1]
++                    = line[(w + x) * 3 + 2] = (uint8_t)(c >> 24);
++            }
++            fwrite(line, 1, row, f);
++        }
++        free(line);
++        fclose(f);
++    }
++    free(px);
++}
++
++/* The title's own picture for a texture (nv2a_backend_set_tex_replace), with
++ * mip levels box-filtered down to 1x1, or NULL to decode the guest's. */
++static ID3D11ShaderResourceView *tex_replaced(const Nv2aTexture *t, uint64_t hash)
++{
++    static int lim = -1;
++    Nv2aTexReplaceFn fn = nv2a_backend_tex_replace();
++    const uint32_t *src = NULL;
++    uint32_t w = 0, h = 0, levels = 1, l, x, y, lw, lh;
++    D3D11_TEXTURE2D_DESC td;
++    D3D11_SUBRESOURCE_DATA sd[16];
++    D3D11_SHADER_RESOURCE_VIEW_DESC vd;
++    ID3D11Texture2D *tx = NULL;
++    ID3D11ShaderResourceView *v = NULL;
++    uint32_t *mips[16] = { 0 };
++
++    if (lim < 0) {
++        const char *e = getenv("RECOMP_TEX_HASHES");
++        lim = e ? atoi(e) : 0;
++    }
++    if (t->cube || t->depth > 1)
++        return NULL;
++    if (lim > 0 && t->width <= (uint32_t)lim && t->height <= (uint32_t)lim)
++        tex_hash_note(t, hash);
++    if (!fn || !fn(hash, t, &src, &w, &h) || !src || !w || !h || w > 4096 || h > 4096)
++        return NULL;
++    while (levels < 16 && ((w >> levels) || (h >> levels)))
++        levels++;
++    for (l = 0; l < levels; l++) {
++        lw = w >> l ? w >> l : 1;
++        lh = h >> l ? h >> l : 1;
++        if (l == 0) {
++            sd[0].pSysMem = src;
++        } else {
++            uint32_t pw = w >> (l - 1) ? w >> (l - 1) : 1, ph = h >> (l - 1) ? h >> (l - 1) : 1;
++            const uint32_t *p = l == 1 ? src : mips[l - 1];
++            if ((mips[l] = (uint32_t *)malloc((size_t)lw * lh * 4)) == NULL)
++                break;
++            for (y = 0; y < lh; y++)
++                for (x = 0; x < lw; x++) {
++                    uint32_t x0 = x * 2 < pw ? x * 2 : pw - 1, x1 = x * 2 + 1 < pw ? x * 2 + 1 : x0;
++                    uint32_t y0 = y * 2 < ph ? y * 2 : ph - 1, y1 = y * 2 + 1 < ph ? y * 2 + 1 : y0;
++                    uint32_t c[4] = { p[y0 * pw + x0], p[y0 * pw + x1], p[y1 * pw + x0], p[y1 * pw + x1] };
++                    uint32_t out = 0, sh;
++                    for (sh = 0; sh < 32; sh += 8)
++                        out |= ((((c[0] >> sh) & 0xFF) + ((c[1] >> sh) & 0xFF) + ((c[2] >> sh) & 0xFF)
++                                 + ((c[3] >> sh) & 0xFF) + 2) / 4) << sh;
++                    mips[l][y * lw + x] = out;
++                }
++            sd[l].pSysMem = mips[l];
++        }
++        sd[l].SysMemPitch = lw * 4;
++        sd[l].SysMemSlicePitch = 0;
++    }
++    levels = l;
++    memset(&td, 0, sizeof td);
++    td.Width = w;
++    td.Height = h;
++    td.MipLevels = levels;
++    td.ArraySize = 1;
++    td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
++    td.SampleDesc.Count = 1;
++    td.Usage = D3D11_USAGE_IMMUTABLE;
++    td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
++    if (SUCCEEDED(ID3D11Device_CreateTexture2D(s_dev, &td, sd, &tx))) {
++        memset(&vd, 0, sizeof vd);
++        vd.Format = td.Format;
++        vd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
++        vd.Texture2D.MipLevels = levels;
++        ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)tx, &vd, &v);
++        ID3D11Texture2D_Release(tx);
++    }
++    for (l = 1; l < 16; l++)
++        free(mips[l]);
++    {
++        static int shown;
++        if (v && shown++ < 16)
++            fprintf(stderr, "  [D3D11] texture %08X %ux%u (hash %016llX) replaced by the title's %ux%u\n",
++                    t->offset, t->width, t->height, (unsigned long long)hash, w, h);
++    }
++    return v;
 +}
 +
 +/* Where a texture was found last, by address and format: a frame binds the
@@ -5996,7 +7316,9 @@ index 0000000..28f7228
 +        e->bytes = span ? span : 1;
 +        e->checked = s_frame;
 +        e->used = s_frame;
-+        e->srv = tex_create(t);
++        e->srv = tex_replaced(t, h);
++        if (!e->srv)
++            e->srv = tex_create(t);
 +        s_st.decodes++;
 +        s_st.decode_texels += (uint64_t)t->width * t->height * (t->cube ? 6 : 1);
 +        return e->srv;
@@ -6025,6 +7347,8 @@ index 0000000..28f7228
 +    int dirty;              /* the GPU holds pixels guest memory does not */
 +    int gpu_valid;          /* the render target holds the surface at all */
 +    uint64_t guest_hash;    /* guest bytes when the two last agreed */
++    uint32_t alias_frame;   /* rt_alias last checked guest_hash (s_frame) */
++    uint32_t drawn_frame;   /* s_frame when it was last made current */
 +    /* A 16-bit surface drawn as G8B8 (surface colour format 0xA) rather
 +     * than R5G6B5: its low byte is the blue channel and its high byte green,
 +     * so the BGRA target holds them in blue and green and a pixel's low
@@ -6048,6 +7372,12 @@ index 0000000..28f7228
 +    uint32_t va, width, height;
 +    ID3D11Texture2D *tex;
 +    ID3D11DepthStencilView *dsv;
++    /* ds_alias: depth and stencil views of tex, and the buffer packed into
++     * guest Z24S8 bytes (pk) for a texture that reads the zeta surface. */
++    ID3D11ShaderResourceView *srv_z, *srv_s;
++    ID3D11Texture2D *pk;
++    ID3D11UnorderedAccessView *pk_uav;
++    ID3D11ShaderResourceView *pk_srv;
 +} Depth;
 +
 +#define RT_MAX 16
@@ -6296,6 +7626,27 @@ index 0000000..28f7228
 +
 +    if (!t->dirty)
 +        return;
++    /* A target nothing has drawn into this frame or the last, over memory
++     * the CPU has rewritten since the two last agreed: the title has moved
++     * on and reused it, and the CPU's bytes are the newer ones. Writing the
++     * old pixels back would destroy them. MechAssault 2 loads the next
++     * level into memory the last level's targets held -- a 512x512 target
++     * at 0x80A71000 became a cube map the lighting reads -- and the first
++     * read of that cube map wrote the old level's image over it, so the
++     * level after a mission-complete transition was wrongly lit throughout.
++     * A target in use is written back as before. */
++    if (s_frame - t->drawn_frame > 1
++            && hash_bytes(mem, (size_t)t->pitch * t->height) != t->guest_hash) {
++        static int shown;
++        if (shown++ < 16)
++            fprintf(stderr, "  [D3D11] render target %08X %ux%u: not drawn for %u frames and"
++                    " its memory rewritten by the CPU; its pixels are dropped, not"
++                    " written back\n", t->va, t->width, t->height, s_frame - t->drawn_frame);
++        t->dirty = 0;
++        t->ms_dirty = 0;
++        t->gpu_valid = 0;
++        return;
++    }
 +    t->dirty = 0;
 +    s_st.writebacks++;
 +    rt_resolve(t);
@@ -6385,6 +7736,12 @@ index 0000000..28f7228
 +        rt_writeback(t);
 +        rt_release(t);
 +    }
++    {
++        static int shown;
++        if (shown++ < 32)
++            fprintf(stderr, "  [D3D11] render target %08X: %ux%u (pitch %u, %u bpp), clip %ux%u+%u+%u\n",
++                    s->color_va, w, h, s->pitch, bpp * 8, s->width, s->height, s->clip_x, s->clip_y);
++    }
 +    memset(&td, 0, sizeof td);
 +    td.Width = scaled(w);
 +    td.Height = scaled(h);
@@ -6454,25 +7811,186 @@ index 0000000..28f7228
 +    d = &s_ds[next++ & 7];
 +    if (d->dsv) ID3D11DepthStencilView_Release(d->dsv);
 +    if (d->tex) ID3D11Texture2D_Release(d->tex);
++    if (d->srv_z) ID3D11ShaderResourceView_Release(d->srv_z);
++    if (d->srv_s) ID3D11ShaderResourceView_Release(d->srv_s);
++    if (d->pk_uav) ID3D11UnorderedAccessView_Release(d->pk_uav);
++    if (d->pk_srv) ID3D11ShaderResourceView_Release(d->pk_srv);
++    if (d->pk) ID3D11Texture2D_Release(d->pk);
 +    memset(d, 0, sizeof *d);
 +    memset(&td, 0, sizeof td);
 +    td.Width = w;
 +    td.Height = h;
 +    td.MipLevels = 1;
 +    td.ArraySize = 1;
-+    td.Format = DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
++    /* Typeless, so ds_alias can read it as well (D32 depth, S8 stencil). */
++    td.Format = DXGI_FORMAT_R32G8X24_TYPELESS;
 +    td.SampleDesc.Count = s_msaa;           /* as the colour targets */
 +    td.Usage = D3D11_USAGE_DEFAULT;
-+    td.BindFlags = D3D11_BIND_DEPTH_STENCIL;
++    td.BindFlags = D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_SHADER_RESOURCE;
 +    if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &d->tex)))
 +        return NULL;
-+    ID3D11Device_CreateDepthStencilView(s_dev, (ID3D11Resource *)d->tex, NULL, &d->dsv);
++    {
++        D3D11_DEPTH_STENCIL_VIEW_DESC dv;
++        memset(&dv, 0, sizeof dv);
++        dv.Format = DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
++        dv.ViewDimension = s_msaa > 1 ? D3D11_DSV_DIMENSION_TEXTURE2DMS
++                                      : D3D11_DSV_DIMENSION_TEXTURE2D;
++        ID3D11Device_CreateDepthStencilView(s_dev, (ID3D11Resource *)d->tex, &dv, &d->dsv);
++    }
 +    ID3D11DeviceContext_ClearDepthStencilView(s_ctx, d->dsv,
 +            D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, 0);
 +    d->va = va;
 +    d->width = w;
 +    d->height = h;
 +    return d->dsv;
++}
++
++/* A texture over the depth buffer. MechAssault 2's shadow pass samples its
++ * Z24S8 zeta surface as a linear A8R8G8B8 texture -- the dword's depth bytes
++ * land in A, R, G and the stencil in B -- and looks A and R up in a depth
++ * falloff table (a DEPENDENT_AR stage). Depth lives in a D3D11 depth buffer
++ * here and never reaches guest memory, so the texture read whatever that
++ * memory last held, and every shadow came out at full falloff: invisible.
++ * Instead the depth buffer is packed into the guest's byte layout on the
++ * GPU, at render scale, each time a draw samples it. Z24S8 only: a linear
++ * 32-bit texture at the depth surface's address; depth = D3D11 depth *
++ * 16777215, as the vertex shader divided it. MSAA: sample 0. */
++static const char s_hlsl_zpack[] =
++"#ifdef MS\n"
++"Texture2DMS<float> Z : register(t0); Texture2DMS<uint2> S : register(t1);\n"
++"#define LD(T, c) T.Load(c, 0)\n"
++"#else\n"
++"Texture2D<float> Z : register(t0); Texture2D<uint2> S : register(t1);\n"
++"#define LD(T, c) T.Load(int3(c, 0))\n"
++"#endif\n"
++"RWTexture2D<unorm float4> O : register(u0);\n"
++"cbuffer ZC : register(b0) { uint4 g_size; };\n"
++"[numthreads(8, 8, 1)]\n"
++"void cs_zpack(uint3 id : SV_DispatchThreadID) {\n"
++"  if (id.x >= g_size.x || id.y >= g_size.y) return;\n"
++"  uint d = (uint)(saturate(LD(Z, id.xy)) * 16777215.0 + 0.5);\n"
++"  uint s = LD(S, id.xy).y;\n"
++"  O[id.xy] = float4((d >> 8) & 0xFF, d & 0xFF, s & 0xFF, d >> 16) / 255.0;\n"
++"}\n";
++
++static ID3D11ComputeShader *s_cs_zpack;
++static ID3D11Buffer *s_cb_zpack;
++
++static int zpack_init(void)
++{
++    static int done;
++    static const D3D_SHADER_MACRO ms[] = { { "MS", "1" }, { NULL, NULL } };
++    ID3DBlob *b = NULL, *err = NULL;
++    D3D11_BUFFER_DESC bd;
++
++    if (done)
++        return done > 0;
++    done = -1;
++    if (FAILED(D3DCompile(s_hlsl_zpack, sizeof s_hlsl_zpack - 1, "zpack",
++                          s_msaa > 1 ? ms : NULL, NULL, "cs_zpack", "cs_5_0",
++                          D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &b, &err))) {
++        fprintf(stderr, "  [D3D11] depth pack shader: %s\n",
++                err ? (const char *)ID3D10Blob_GetBufferPointer(err) : "?");
++        if (err) ID3D10Blob_Release(err);
++        return 0;
++    }
++    ID3D11Device_CreateComputeShader(s_dev, ID3D10Blob_GetBufferPointer(b),
++                                     ID3D10Blob_GetBufferSize(b), NULL, &s_cs_zpack);
++    ID3D10Blob_Release(b);
++    memset(&bd, 0, sizeof bd);
++    bd.ByteWidth = 16;
++    bd.Usage = D3D11_USAGE_DYNAMIC;
++    bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
++    bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
++    ID3D11Device_CreateBuffer(s_dev, &bd, NULL, &s_cb_zpack);
++    done = s_cs_zpack && s_cb_zpack ? 1 : -1;
++    return done > 0;
++}
++
++static ID3D11ShaderResourceView *ds_alias(const Nv2aTexture *t)
++{
++    Depth *d = NULL;
++    int i;
++
++    for (i = 0; i < 8; i++)
++        if (s_ds[i].tex && s_ds[i].va == t->offset) { d = &s_ds[i]; break; }
++    if (!d)
++        return NULL;
++    /* Pitch: the surface's, which pads past width * 4 (MA2: 720 wide, 3072). */
++    if (t->cube || t->normalized || t->depth > 1 || (t->color != 0x12 && t->color != 0x1E)
++        || t->pitch < t->width * 4)
++        return NULL;
++    if (!zpack_init())
++        return NULL;
++    if (!d->srv_z) {
++        D3D11_SHADER_RESOURCE_VIEW_DESC vd;
++        memset(&vd, 0, sizeof vd);
++        vd.ViewDimension = s_msaa > 1 ? D3D11_SRV_DIMENSION_TEXTURE2DMS
++                                      : D3D11_SRV_DIMENSION_TEXTURE2D;
++        vd.Texture2D.MipLevels = 1;
++        vd.Format = DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
++        ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)d->tex, &vd, &d->srv_z);
++        vd.Format = DXGI_FORMAT_X32_TYPELESS_G8X24_UINT;
++        ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)d->tex, &vd, &d->srv_s);
++    }
++    if (!d->pk) {
++        D3D11_TEXTURE2D_DESC td;
++        memset(&td, 0, sizeof td);
++        td.Width = d->width;
++        td.Height = d->height;
++        td.MipLevels = 1;
++        td.ArraySize = 1;
++        td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
++        td.SampleDesc.Count = 1;
++        td.Usage = D3D11_USAGE_DEFAULT;
++        td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
++        if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &d->pk)))
++            return NULL;
++        ID3D11Device_CreateUnorderedAccessView(s_dev, (ID3D11Resource *)d->pk, NULL, &d->pk_uav);
++        ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)d->pk, NULL, &d->pk_srv);
++    }
++    if (!d->srv_z || !d->srv_s || !d->pk_uav || !d->pk_srv)
++        return NULL;
++    {
++        ID3D11RenderTargetView *rtv = NULL;
++        ID3D11DepthStencilView *dsv = NULL;
++        ID3D11ShaderResourceView *srv[2] = { d->srv_z, d->srv_s }, *nosrv[2] = { NULL, NULL };
++        ID3D11UnorderedAccessView *nouav = NULL;
++        D3D11_MAPPED_SUBRESOURCE m;
++
++        /* Not readable while bound for writing: off the output merger for
++         * the pack, back on after. */
++        ID3D11DeviceContext_OMGetRenderTargets(s_ctx, 1, &rtv, &dsv);
++        if (dsv == d->dsv)
++            ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &rtv, NULL);
++        if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_cb_zpack, 0,
++                                              D3D11_MAP_WRITE_DISCARD, 0, &m))) {
++            uint32_t g[4] = { d->width, d->height, 0, 0 };
++            memcpy(m.pData, g, sizeof g);
++            ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_cb_zpack, 0);
++        }
++        ID3D11DeviceContext_CSSetShader(s_ctx, s_cs_zpack, NULL, 0);
++        ID3D11DeviceContext_CSSetConstantBuffers(s_ctx, 0, 1, &s_cb_zpack);
++        ID3D11DeviceContext_CSSetShaderResources(s_ctx, 0, 2, srv);
++        ID3D11DeviceContext_CSSetUnorderedAccessViews(s_ctx, 0, 1, &d->pk_uav, NULL);
++        ID3D11DeviceContext_Dispatch(s_ctx, (d->width + 7) / 8, (d->height + 7) / 8, 1);
++        ID3D11DeviceContext_CSSetShaderResources(s_ctx, 0, 2, nosrv);
++        ID3D11DeviceContext_CSSetUnorderedAccessViews(s_ctx, 0, 1, &nouav, NULL);
++        if (dsv == d->dsv)
++            ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &rtv, dsv);
++        if (rtv) ID3D11RenderTargetView_Release(rtv);
++        if (dsv) ID3D11DepthStencilView_Release(dsv);
++    }
++    {
++        static int shown;
++        if (shown < 2) {
++            shown++;
++            fprintf(stderr, "  [D3D11] texture %08X %ux%u reads the depth buffer:"
++                    " packed as Z24S8 on the GPU (%ux%u)\n",
++                    t->offset, t->width, t->height, d->width, d->height);
++        }
++    }
++    return d->pk_srv;
 +}
 +
 +/* Make `s` the surface being drawn: write the previous one back, upload this
@@ -6484,6 +8002,7 @@ index 0000000..28f7228
 +
 +    if (!t)
 +        return NULL;
++    t->drawn_frame = s_frame;           /* see rt_writeback */
 +    /* The same 16-bit memory drawn in the other layout (G8B8 / R5G6B5):
 +     * guest memory catches up in the old one, the target reloads in the new. */
 +    if (t->g8b8 != (t->bpp == 2 && s->color_format == 0xA)) {
@@ -6513,6 +8032,7 @@ index 0000000..28f7228
 +        s_cur = t;
 +    }
 +    dsv = rs ? ds_get(rs->zeta_va, t->sw, t->sh) : NULL;
++    s_cur_zeta = dsv ? rs->zeta_va : 0;
 +    {
 +        ID3D11RenderTargetView *v = rt_view(t);
 +        ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &v, dsv);
@@ -6556,6 +8076,29 @@ index 0000000..28f7228
 +                   || r->pitch != t->width * 4)
 +                : r->pitch != t->pitch)
 +            continue;
++        /* Still the target's pixels? Once a frame, while guest memory is
++         * meant to hold what the target holds (not dirty), check it does:
++         * memory a title stops drawing into gets reused. MechAssault 2
++         * loads the next level's textures where the last level's render
++         * targets were, and sampling the old image for them lit the new
++         * level with the old one's lightmaps -- only after a mission-
++         * complete transition, since a fresh boot had no old targets.
++         * rt_get already re-checks this way before drawing into a target;
++         * reading one as a texture did not. A target found replaced stops
++         * being a target until it is drawn into again (rt_upload). */
++        if (!r->dirty && r->alias_frame != s_frame) {
++            const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset() + r->va;
++            r->alias_frame = s_frame;
++            if (hash_bytes(mem, (size_t)r->pitch * r->height) != r->guest_hash) {
++                static int shown;
++                if (shown++ < 16)
++                    fprintf(stderr, "  [D3D11] render target %08X %ux%u: guest memory"
++                            " replaced; texture fmt 0x%X there is decoded, not the"
++                            " target\n", r->va, r->width, r->height, t->color);
++                r->gpu_valid = 0;
++                continue;
++            }
++        }
 +        rt_resolve(r);
 +        if (r == s_cur) {
 +            /* Sampling the surface being drawn (a screen effect): sample a
@@ -6730,10 +8273,15 @@ index 0000000..28f7228
 +    int i;
 +
 +    memset(&d, 0, sizeof d);
-+    /* The CPU path writes depth whenever the mask is on, test or not; D3D
-+     * only writes with the test enabled, so "no test" is ALWAYS. */
-+    d.DepthEnable = (r->depth_test_enable || r->depth_write) && r->zeta_va;
-+    d.DepthFunc = r->depth_test_enable ? cmp_of(r->depth_func) : D3D11_COMPARISON_ALWAYS;
++    /* No depth test, no depth write: the hardware (as OpenGL and D3D) only
++     * writes depth through the test. This used to follow the CPU path, which
++     * writes whenever the mask is on, as an ALWAYS test. MechAssault 2's
++     * full-screen shadow pass draws with the test off and the mask on, and
++     * stamped its own depth into every shadowed pixel: the explosions and
++     * sparks drawn after it failed the depth test there, leaving the
++     * shadows as black holes in them. */
++    d.DepthEnable = r->depth_test_enable && r->zeta_va;
++    d.DepthFunc = cmp_of(r->depth_func);
 +    d.DepthWriteMask = r->depth_write ? D3D11_DEPTH_WRITE_MASK_ALL : D3D11_DEPTH_WRITE_MASK_ZERO;
 +    d.StencilEnable = r->stencil_enable && r->zeta_va ? TRUE : FALSE;
 +    d.StencilReadMask = (UINT8)r->stencil_func_mask;
@@ -7084,9 +8632,12 @@ index 0000000..28f7228
 +            k.tf[st] = (cb->tsz[st][2] != 0.0f ? 1u : 0u) | (cb->tsz[st][3] == 1.0f ? 2u : 0u)
 +                     | (cb->tsz[st][3] == 2.0f ? 8u : 0u);
 +    }
-+    for (st = 0; st < 4; st++)
++    for (st = 0; st < 4; st++) {
 +        if ((cb->misc2[1] >> st) & 1)
 +            k.tf[st] |= 4u;
++        if ((cb->misc2[2] >> st) & 1)
++            k.tf[st] |= 16u;
++    }
 +    h = fnv64(&k, sizeof k, 0xCBF29CE484222325ull);
 +    if (!h)
 +        h = 1;
@@ -7117,6 +8668,45 @@ index 0000000..28f7228
 +static void gp_mark(uint32_t kind, uint32_t count, const Target *t);
 +static void gp_pre(void);
 +static uint32_t gp_kind(const Nv2aBatch *b, int program);
++
++/* NV2A culling: SET_CULL_FACE_ENABLE, SET_CULL_FACE (GL_FRONT 0x404, GL_BACK
++ * 0x405, GL_FRONT_AND_BACK 0x408) and SET_FRONT_FACE (GL_CW 0x900, GL_CCW
++ * 0x901). XDK D3D writes its D3DRS_FRONTFACE / D3DCULL_* values (the same
++ * numbers) straight into these, and D3D's clockwise is as seen on screen,
++ * y down -- the render target's own orientation here -- so GL_CCW is
++ * FrontCounterClockwise. Unset (0) reads as D3D's default, CW.
++ *
++ * Every draw used to rasterise both windings. A closed mesh looks the same
++ * either way; a stencil shadow volume does not. MechAssault 2 draws each
++ * volume twice, back faces incrementing and front faces decrementing, and
++ * with both windings in both passes the counts cancelled: no shadows at
++ * all. RECOMP_D3D11_CULL=0 draws both windings again. */
++static int cull_on(void)
++{
++    static int on = -1;
++    if (on < 0) {
++        const char *e = getenv("RECOMP_D3D11_CULL");
++        on = !(e && *e == '0');
++    }
++    return on;
++}
++
++static ID3D11RasterizerState *cull_state(const Nv2aRenderState *r)
++{
++    if (!cull_on() || !r->cull_enable)
++        return s_rs;
++    switch (r->cull_face) {
++    case 0x404: return s_rs_cull[0][r->front_face == 0x901];
++    case 0x405: return s_rs_cull[1][r->front_face == 0x901];
++    default:    return s_rs;
++    }
++}
++
++/* GL_FRONT_AND_BACK culls every triangle: the batch draws nothing. */
++static int cull_all(const Nv2aRenderState *r)
++{
++    return cull_on() && r->cull_enable && r->cull_face == 0x408;
++}
 +
 +/* Everything a batch needs but its vertices: the target, viewport, the
 + * pixel-side constants, textures and samplers, and the output-merger state. */
@@ -7166,12 +8756,57 @@ index 0000000..28f7228
 +        for (st = 0; st < 4; st++) {
 +            const Nv2aTexture *tx = b->stages[st];
 +            uint32_t sm = (rc->stage_program >> (st * 5)) & 0x1F;
-+            /* Only stages whose program samples (2D, 3D, cube) bind their
-+             * texture. A title leaves stale textures on unused stages --
-+             * MechAssault 2 leaves the back buffer on one, which cost a
-+             * full-surface copy per draw to sample nothing. */
-+            if (!tx || sm < 1 || sm > 3)
++            /* Only stages whose program samples (2D, 3D, cube, dependent
++             * AR/GB) bind their texture. A title leaves stale textures on
++             * unused stages -- MechAssault 2 leaves the back buffer on one,
++             * which cost a full-surface copy per draw to sample nothing. */
++            /* Modes the shader does not implement (BRDF, DOT_ZW,
++             * DOT_RFLCT_DIFF, DOT_RFLCT_SPEC_CONST) still read black: say
++             * which, once each. The dot-product modes it does say so too,
++             * once, with the mapping and inputs they read. */
++            {
++                static uint32_t shown[4];
++                int done = sm <= 7 || sm == 9 || (sm >= 12 && sm <= 17);
++                if ((sm > 7 && sm != 15 && sm != 16) && !(shown[st] & (1u << (sm & 31)))) {
++                    shown[st] |= 1u << (sm & 31);
++                    fprintf(stderr, "  [D3D11] texture shader stage %u mode %u in use: %s"
++                            " (dot mapping 0x%X, stage input 0x%X)\n", st, sm,
++                            done ? "dot product" : "not implemented, reads black",
++                            rc->dot_mapping, rc->stage_input);
++                }
++            }
++            cb.dot[0] = rc->dot_mapping;
++            cb.dot[1] = rc->stage_input;
++            {
++                /* RECOMP_D3D11_DOT=0: the bump-env and dot-product stages
++                 * read black again, as before they were implemented. */
++                static int on = -1;
++                if (on < 0) {
++                    const char *e = getenv("RECOMP_D3D11_DOT");
++                    on = !(e && *e == '0');
++                    if (e && *e == '2')
++                        on = 2;             /* paint those stages magenta */
++                }
++                cb.dot[2] = (uint32_t)on;
++            }
++            /* 2D/3D/cube, bump-env, DOT_ST, DOT_RFLCT_SPEC, DOT_STR_3D/CUBE
++             * and the dependent reads sample their stage's texture;
++             * PASSTHRU, CLIPPLANE and DOTPRODUCT do not. */
++            if (!tx || ((sm < 1 || sm > 3) && sm != 6 && sm != 7 && sm != 9
++                        && sm != 12 && sm != 13 && sm != 14 && sm != 15 && sm != 16))
 +                continue;
++            if (sm == 6 || sm == 7) {
++                static uint32_t shown;
++                memcpy(cb.bm[st], tx->bump_mat, sizeof cb.bm[st]);
++                cb.bl[st][0] = tx->bump_scale;
++                cb.bl[st][1] = tx->bump_offset;
++                if (shown++ < 4)
++                    fprintf(stderr, "  [D3D11] texture shader stage %u mode %u (BUMPENVMAP%s):"
++                            " texture %08X fmt 0x%X, matrix %g %g %g %g, lum %g %+g\n",
++                            st, sm, sm == 7 ? "_LUM" : "", tx->offset, tx->color,
++                            tx->bump_mat[0], tx->bump_mat[1], tx->bump_mat[2],
++                            tx->bump_mat[3], tx->bump_scale, tx->bump_offset);
++            }
 +            cb.tsz[st][2] = tx->normalized ? 1.0f : 0.0f;
 +            cb.tsz[st][3] = tx->cube ? 1.0f : tx->depth > 1 ? 2.0f : 0.0f;
 +            {
@@ -7179,8 +8814,50 @@ index 0000000..28f7228
 +                ID3D11ShaderResourceView *v = tex_get(tx, &cb.tsz[st][0], &cb.tsz[st][1], &g8);
 +                if (v) srv[tx->cube ? 4 + st : tx->depth > 1 ? 9 + st : st] = v;
 +                if (g8) cb.misc2[1] |= 1u << st;
++                if (tx->alpha_kill) {           /* the first 8 textures, once each */
++                    static uint32_t seen[8];
++                    int q;
++                    cb.misc2[2] |= 1u << st;
++                    for (q = 0; q < 8 && seen[q] && seen[q] != tx->offset; q++)
++                        ;
++                    if (q < 8 && !seen[q]) {
++                        seen[q] = tx->offset;
++                        fprintf(stderr, "  [D3D11] alpha kill on stage %u mode %u: texture %08X"
++                                " fmt 0x%X %ux%u\n", st, sm, tx->offset, tx->color,
++                                tx->width, tx->height);
++                    }
++                }
++                {   /* RECOMP_D3D11_CONST_DUMP=<hex>: how a stage binds that texture */
++                    static int init, shown;
++                    static uint32_t want;
++                    if (!init) {
++                        const char *e = getenv("RECOMP_D3D11_CONST_DUMP");
++                        want = e ? (uint32_t)strtoul(e, NULL, 16) & 0x0FFFFFFFu : 0;
++                        init = 1;
++                    }
++                    static uint32_t seen[64];
++                    uint32_t key = (tx->width << 20) ^ (tx->height << 8) ^ (sm << 4) ^ st
++                                 ^ (s->color_va * 2654435761u);
++                    int q, dup = 0;
++                    for (q = 0; q < shown && q < 64; q++)
++                        dup |= seen[q] == key;
++                    if (want && (tx->offset & 0x0FFFFFFFu) == want && !dup && shown < 64) {
++                        seen[shown++] = key;
++                        fprintf(stderr, "  [D3D11] stage %u mode %u binds %08X %ux%u fmt 0x%X %s, sampled as %gx%g%s; drawing to %08X %ux%u\n",
++                                st, sm, tx->offset, tx->width, tx->height, tx->color,
++                                tx->normalized ? "normalized" : "texel coords",
++                                cb.tsz[st][0], cb.tsz[st][1], s_tex_rt ? " (render target)" : "",
++                                s->color_va, s->width, s->height);
++                    }
++                }
 +            }
-+            smp[st] = sampler(tx, s_tex_rt);
++            if (s_tex_z) {                  /* packed depth bytes: never blend */
++                Nv2aTexture pt = *tx;
++                pt.filter = 0;
++                smp[st] = sampler(&pt, 1);
++            } else {
++                smp[st] = sampler(tx, s_tex_rt);
++            }
 +        }
 +    } else if (b->texture) {
 +        cb.misc2[0] = 1;
@@ -7190,6 +8867,7 @@ index 0000000..28f7228
 +            ID3D11ShaderResourceView *v = tex_get(b->texture, &cb.tsz[0][0], &cb.tsz[0][1], &g8);
 +            if (v) srv[0] = v;
 +            if (g8) cb.misc2[1] = 1;
++            if (b->texture->alpha_kill) cb.misc2[2] = 1;
 +        }
 +        /* The CPU's screen-space path samples the nearest texel. */
 +        {
@@ -7213,7 +8891,7 @@ index 0000000..28f7228
 +    ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 0, 1, &s_cb);
 +    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 13, srv);
 +    ID3D11DeviceContext_PSSetSamplers(s_ctx, 0, 4, smp);
-+    ID3D11DeviceContext_RSSetState(s_ctx, s_rs);
++    ID3D11DeviceContext_RSSetState(s_ctx, cull_state(r));
 +    unpack(r->blend_color, bf);
 +    {
 +        float f[4] = { bf[0], bf[1], bf[2], bf[3] };
@@ -7234,8 +8912,34 @@ index 0000000..28f7228
 +    D3D11_MAPPED_SUBRESOURCE m;
 +    UINT stride = sizeof(GV), offset, bytes, i;
 +
-+    if (!b->count || !(t = bind_pipeline(s, b)))
++    if (!b->count || cull_all(b->state) || !(t = bind_pipeline(s, b)))
 +        return;
++    /* RECOMP_D3D11_CONST_DUMP=<hex address>, fixed-function draws: the first
++     * 3 that bind that texture log their vertices' screen position and
++     * texture coordinates, to see how the two relate. */
++    {
++        static int init, shown;
++        static uint32_t want;
++        int k;
++        if (!init) {
++            const char *e = getenv("RECOMP_D3D11_CONST_DUMP");
++            want = e ? (uint32_t)strtoul(e, NULL, 16) & 0x0FFFFFFFu : 0;
++            init = 1;
++        }
++        for (k = 0; want && shown < 3 && k < 4; k++)
++            if (b->stages[k] && (b->stages[k]->offset & 0x0FFFFFFFu) == want) {
++                uint32_t n;
++                shown++;
++                fprintf(stderr, "  [D3D11] fixed-function draw with texture %08X on stage %d (surface %08X %ux%u, %u verts):\n",
++                        want, k, s->color_va, s->width, s->height, b->count);
++                for (n = 0; n < b->count && n < 6; n++) {
++                    const Nv2aVertex *v = &b->vertices[n];
++                    fprintf(stderr, "    x %8.2f y %8.2f rhw %8.4f | t%d %9.3f %9.3f %9.3f %9.3f\n",
++                            v->x, v->y, v->rhw, k, v->tex[k][0], v->tex[k][1], v->tex[k][2], v->tex[k][3]);
++                }
++                break;
++            }
++    }
 +
 +    /* Vertices. */
 +    if (s_gv_cap < b->count) {
@@ -7524,6 +9228,33 @@ index 0000000..28f7228
 +                    return 1;
 +        }
 +    }
++    /* RECOMP_D3D11_CONST_DUMP=<hex address>: the first 3 draws that bind
++     * that texture on any stage log every non-zero vertex constant -- for
++     * finding which constant a title's texture-coordinate maths uses. */
++    {
++        static int init, shown;
++        static uint32_t want;
++        int k;
++        if (!init) {
++            const char *e = getenv("RECOMP_D3D11_CONST_DUMP");
++            want = e ? (uint32_t)strtoul(e, NULL, 16) & 0x0FFFFFFFu : 0;
++            init = 1;
++        }
++        for (k = 0; want && shown < 3 && k < 4; k++)
++            if (b->stages[k] && (b->stages[k]->offset & 0x0FFFFFFFu) == want
++                && b->stages[k]->width >= 640) {
++                int c;
++                shown++;
++                fprintf(stderr, "  [D3D11] draw with texture %08X on stage %d (surface %08X %ux%u):\n",
++                        want, k, s->color_va, s->width, s->height);
++                for (c = 0; c < 192; c++) {
++                    const float *v = p->constants[c];
++                    if (v[0] != 0.0f || v[1] != 0.0f || v[2] != 0.0f || v[3] != 0.0f)
++                        fprintf(stderr, "    c%-3d %12.6g %12.6g %12.6g %12.6g\n", c - 96, v[0], v[1], v[2], v[3]);
++                }
++                break;
++            }
++    }
 +    /* RECOMP_D3D11_VSH=split: odd frames transform on the CPU, so frame
 +     * dumps alternate the two paths and any difference shows as flicker. */
 +    {
@@ -7577,6 +9308,8 @@ index 0000000..28f7228
 +            return 0;
 +    }
 +
++    if (cull_all(b->state))
++        return 1;                               /* drawn: nothing survives */
 +    if (!(t = bind_pipeline(s, b)))
 +        return 0;
 +
@@ -7647,7 +9380,42 @@ index 0000000..28f7228
 +    ID3D11DeviceContext_VSSetConstantBuffers(s_ctx, 0, 4, cbs);
 +    ID3D11DeviceContext_VSSetShaderResources(s_ctx, 8, 1, &s_raw_srv);
 +    gp_pre();
-+    ID3D11DeviceContext_DrawIndexed(s_ctx, p->count, 0, 0);
++    if (p->lines) {
++        /* RECOMP_D3D11_LINES=0 drops them as before; =2 paints them magenta,
++         * to see where a title draws lines. */
++        static int mode = -1;
++        static ID3D11PixelShader *magenta;
++        ID3D11PixelShader *was = NULL;
++        if (mode < 0) {
++            const char *e = getenv("RECOMP_D3D11_LINES");
++            static const char src[] =
++                "float4 ps(float4 p : SV_Position) : SV_Target { return float4(1, 0, 1, 1); }";
++            ID3D10Blob *blob = NULL;
++            mode = e ? atoi(e) : 1;
++            if (mode == 2 && SUCCEEDED(D3DCompile(src, sizeof src - 1, "magenta", NULL, NULL,
++                                                  "ps", "ps_5_0", 0, 0, &blob, NULL))) {
++                ID3D11Device_CreatePixelShader(s_dev, ID3D10Blob_GetBufferPointer(blob),
++                                               ID3D10Blob_GetBufferSize(blob), NULL, &magenta);
++                ID3D10Blob_Release(blob);
++            }
++        }
++        if (mode == 0)
++            return 1;
++        if (magenta) {
++            ID3D11DeviceContext_PSGetShader(s_ctx, &was, NULL, NULL);
++            ID3D11DeviceContext_PSSetShader(s_ctx, magenta, NULL, 0);
++        }
++        ID3D11DeviceContext_IASetPrimitiveTopology(s_ctx, D3D11_PRIMITIVE_TOPOLOGY_LINELIST);
++        ID3D11DeviceContext_DrawIndexed(s_ctx, p->count, 0, 0);
++        ID3D11DeviceContext_IASetPrimitiveTopology(s_ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
++        if (magenta) {
++            ID3D11DeviceContext_PSSetShader(s_ctx, was, NULL, 0);
++            if (was)
++                ID3D11PixelShader_Release(was);
++        }
++    } else {
++        ID3D11DeviceContext_DrawIndexed(s_ctx, p->count, 0, 0);
++    }
 +    gp_mark(gp_kind(b, 1), p->count, t);
 +    maybe_flush();
 +    t->dirty = 1;
@@ -7859,6 +9627,33 @@ index 0000000..28f7228
 +        return;
 +    if (dumping < 0)
 +        dumping = getenv("RECOMP_FB_DUMP") != NULL;
++    /* RECOMP_FPS_CAP=<fps>: hold each flip to that rate. The executor stalls
++     * here, the title's next fence wait stalls on it, and the title runs at
++     * the rate its console did (a fixed 30 or 60). For telling timing bugs
++     * from others: uncapped, MA2 runs 100-160 fps. */
++    {
++        static double cap = -1.0, period;
++        static LARGE_INTEGER qf, next;
++        LARGE_INTEGER now;
++        if (cap < 0.0) {
++            const char *c = getenv("RECOMP_FPS_CAP");
++            cap = c && *c ? atof(c) : 0.0;
++            QueryPerformanceFrequency(&qf);
++            period = cap > 0.0 ? (double)qf.QuadPart / cap : 0.0;
++        }
++        if (cap > 0.0) {
++            QueryPerformanceCounter(&now);
++            if (next.QuadPart && now.QuadPart < next.QuadPart) {
++                LONGLONG ms = (next.QuadPart - now.QuadPart) * 1000 / qf.QuadPart;
++                if (ms > 1)
++                    Sleep((DWORD)(ms - 1));
++                do QueryPerformanceCounter(&now); while (now.QuadPart < next.QuadPart);
++                next.QuadPart += (LONGLONG)period;
++            } else {
++                next.QuadPart = now.QuadPart + (LONGLONG)period;
++            }
++        }
++    }
 +    presented = present_to_window(nv2a_backend_present_va());
 +    /* Write back every target drawn this frame: the window and the dumps
 +     * read the finished frame from guest memory, and the one being shown is
@@ -7929,6 +9724,50 @@ index 0000000..28f7228
 +    }
 +    s_frame++;
 +    gp_begin_frame();
++    /* RECOMP_D3D11_RT_DUMP=<hex address>: every 120 frames, write that 32-bit
++     * render target back to guest memory and save it as
++     * d3d11_rt_<address>_<frame>.bmp in the working directory (debugging a
++     * title's off-screen passes). */
++    {
++        static int init;
++        static uint32_t want;
++        int i;
++        if (!init) {
++            const char *e = getenv("RECOMP_D3D11_RT_DUMP");
++            want = e ? (uint32_t)strtoul(e, NULL, 16) & 0x0FFFFFFFu : 0;
++            init = 1;
++        }
++        for (i = 0; want && s_frame % 120 == 0 && i < RT_MAX; i++) {
++            Target *t = &s_rt[i];
++            const uint8_t *mem;
++            char name[64];
++            FILE *f;
++            uint32_t x, y, row;
++            if (!t->tex || (t->va & 0x0FFFFFFFu) != want || t->bpp != 4)
++                continue;
++            t->dirty = 1;                   /* the GPU's pixels, now */
++            rt_writeback(t);
++            mem = (const uint8_t *)xbox_GetMemoryOffset() + t->va;
++            row = (t->width * 3 + 3) & ~3u;
++            snprintf(name, sizeof name, "d3d11_rt_%08X_%u.bmp", want, s_frame);
++            if ((f = fopen(name, "wb")) != NULL) {
++                uint8_t hdr[54] = { 'B', 'M' }, *line = (uint8_t *)calloc(row, 1);
++                uint32_t sz = 54 + row * t->height;
++                int32_t ww = (int32_t)t->width, hh = -(int32_t)t->height;
++                memcpy(hdr + 2, &sz, 4); hdr[10] = 54; hdr[14] = 40;
++                memcpy(hdr + 18, &ww, 4); memcpy(hdr + 22, &hh, 4);
++                hdr[26] = 1; hdr[28] = 24;
++                fwrite(hdr, 1, 54, f);
++                for (y = 0; line && y < t->height; y++) {
++                    for (x = 0; x < t->width; x++)
++                        memcpy(line + x * 3, mem + (size_t)y * t->pitch + x * 4, 3);
++                    fwrite(line, 1, row, f);
++                }
++                free(line);
++                fclose(f);
++            }
++        }
++    }
 +    if (s_frame % 300 == 0) {
 +        static int quiet = -1;
 +        if (quiet < 0) {
@@ -8043,10 +9882,38 @@ index a8de77d..f43c33d 100644
      fflush(stderr);
  }
 diff --git a/tools/recomp/lifter.py b/tools/recomp/lifter.py
-index baf1834..b13ffe0 100644
+index baf1834..11f6623 100644
 --- a/tools/recomp/lifter.py
 +++ b/tools/recomp/lifter.py
-@@ -1724,6 +1724,26 @@ class Lifter:
+@@ -528,12 +528,24 @@ def _make_condition(jcc, flag_setter, flag_ops):
+     # Only ZF is answerable from it. dec does not write CF, so a jb after the
+     # same join would be reading a flag one predecessor never set; returning
+     # None there leaves the existing fallback in place.
++    #
++    # It reads the result snapshot, not the register. Every setter in
++    # ZF_FROM_DEST publishes its result into _fa, masked to the destination's
++    # width, where it computes it -- and an instruction that leaves EFLAGS
++    # alone can still rewrite the register between the join and the jcc.
++    # MSVC's signed `x % 2` is exactly that: `and edx, 80000001h`, a
++    # dec/or/inc fix-up on the negative edge (hence the join), then `cdq` for
++    # the division by 2 that follows, then the jne. Re-reading edx after the
++    # cdq asked about the sign of eax instead of the remainder, so the branch
++    # never went the odd way. MechAssault 2's ray-vs-box test picks the face
++    # normal that way: every +axis face came back as -axis, the roofs' normals
++    # pointed down, the ground probe discarded them as back faces, and the
++    # mechs could not stand on a building.
+     if flag_setter == "__zf_from_dest" and flag_ops:
+-        dest = _fmt_operand_read(flag_ops[0])
+         if jcc in ("je", "jz"):
+-            return f"({dest} == 0)", desc
++            return "(_fa == 0)", desc
+         if jcc in ("jne", "jnz"):
+-            return f"({dest} != 0)", desc
++            return "(_fa != 0)", desc
+         return None
+ 
+     # A cmp/test that is not fused with its jcc snapshots its operands into
+@@ -1724,6 +1736,26 @@ class Lifter:
                  "  /* rdtsc */",
              ]
  
@@ -8073,7 +9940,7 @@ index baf1834..b13ffe0 100644
          # ── Port I/O ──
          #
          # `in`/`out` reach the MCPX's I/O space: the ACPI block at 0x8000,
-@@ -1898,7 +1918,13 @@ class Lifter:
+@@ -1898,7 +1930,13 @@ class Lifter:
              r = ops[1].reg
              if r in ("al", "bl", "cl", "dl", "ah", "bh", "ch", "dh"):
                  src = f"SX8({src})"
@@ -8088,6 +9955,45 @@ index baf1834..b13ffe0 100644
                  src = f"SX16({src})"
          return [_fmt_operand_write(ops[0], src)]
  
+diff --git a/tools/recomp/test_flag_join_backedge.py b/tools/recomp/test_flag_join_backedge.py
+index faca92f..de458e8 100644
+--- a/tools/recomp/test_flag_join_backedge.py
++++ b/tools/recomp/test_flag_join_backedge.py
+@@ -89,7 +89,34 @@ def test_disagreeing_predecessors_keep_the_fallback():
+     assert code.count("_jf_00010005 = ((_fa == 0)) ? 1 : 0;") == 2, code
+ 
+ 
++def test_a_zero_flag_join_survives_a_write_to_its_register():
++    # MSVC's signed `x % 2`, then the division by 2 that follows it
++    # (MechAssault 2's ray-vs-box face normal, 0x00255AFD):
++    #   +0  and edx, 80000001h ; ZF from edx
++    #   +6  jns +5             -> the cdq
++    #   +8  dec edx            ; negative fix-up, ZF from edx again
++    #   +9  or  edx, -2
++    #   +C  inc edx
++    #   +D L: cdq              ; rewrites edx, leaves EFLAGS alone
++    #   +E  jne +1             ; asks about the remainder, not about cdq
++    #   +10 nop
++    #   +11 ret
++    image = (b"\x81\xE2\x01\x00\x00\x80"  # and edx, 80000001h
++             b"\x79\x05"                  # jns +5 -> +0xD
++             b"\x4A"                      # dec edx
++             b"\x83\xCA\xFE"              # or edx, -2
++             b"\x42"                      # inc edx
++             b"\x99"                      # cdq
++             b"\x75\x01"                  # jne +1 -> +0x11
++             b"\x90"                      # nop
++             b"\xC3")                     # ret
++    code = _translate(image)
++    assert "if ((_fa != 0)) goto loc_00010011;" in code, code
++    assert "(edx != 0)" not in code, code
++
++
+ if __name__ == "__main__":
+     test_loop_head_inherits_flags_from_both_predecessors()
+     test_disagreeing_predecessors_keep_the_fallback()
++    test_a_zero_flag_join_survives_a_write_to_its_register()
+     print("ok")
 diff --git a/tools/recomp/test_lifter_movsx.py b/tools/recomp/test_lifter_movsx.py
 new file mode 100644
 index 0000000..2054a93

@@ -79,7 +79,19 @@ static int is_base(const char *dir)
     if (file_exists(p))
         return 1;
     snprintf(p, sizeof p, "%s\\mkb.ini", dir);
+    if (file_exists(p))
+        return 1;
+    snprintf(p, sizeof p, "%s\\mkb.default.ini", dir);
     return file_exists(p);
+}
+
+/* A release ships the key layout as mkb.default.ini: an update unpacks over
+ * the old files, so a shipped mkb.ini would undo the player's own bindings.
+ * The first run copies it to mkb.ini, which is the player's from then on. */
+static void first_mkb(void)
+{
+    if (!file_exists("mkb.ini") && file_exists("mkb.default.ini"))
+        CopyFileA("mkb.default.ini", "mkb.ini", TRUE);
 }
 
 static void resolve_base(void)
@@ -708,7 +720,9 @@ static int run_window(const char *game, const char *saves)
     wc.hInstance = GetModuleHandleA(NULL);
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
     wc.lpszClassName = "MA2Setup";
-    wc.hIcon = LoadIcon(NULL, IDI_APPLICATION);
+    wc.hIcon = LoadIconA(wc.hInstance, MAKEINTRESOURCEA(1));   /* ma2.rc */
+    if (!wc.hIcon)
+        wc.hIcon = LoadIcon(NULL, IDI_APPLICATION);
     RegisterClassA(&wc);
     s_bg = CreateSolidBrush(C_BG);
     s_edit_bg = CreateSolidBrush(C_EDIT);
@@ -751,6 +765,7 @@ static int run_window(const char *game, const char *saves)
 void ma2_EarlyInit(void)
 {
     resolve_base();
+    first_mkb();
     default_env();
     redirect_log();
 }
