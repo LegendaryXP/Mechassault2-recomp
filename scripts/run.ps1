@@ -41,9 +41,11 @@ $env:RECOMP_KEYBOARD = $(if ($NoKeyboard) { $null } else { '1' })
 # As play.bat: DirectSound's APU restarts off (audio).
 $env:RECOMP_APU_SSL_IRQ = '0'; $env:RECOMP_APU_EP_MARK = '1'
 $env:RECOMP_MUTE = '1'          # test runs are silent; play.bat is not
-# Saves: test runs share the player's (%LOCALAPPDATA%\xboxrecomp UDATA and
-# TDATA), so a test can start where the player is. Each run first copies
-# them to %LOCALAPPDATA%\xboxrecomp\backup-before-test (replaced every run).
+# Saves: test runs use %LOCALAPPDATA%\xboxrecomp UDATA and TDATA, where the
+# player's saves were before they moved to Documents\MechAssault2 (which the
+# test runs must never touch: ma2.exe would default to it). Each run first
+# copies them to %LOCALAPPDATA%\xboxrecomp\backup-before-test (replaced every
+# run).
 # -SeparateSave runs from a fresh copy of analysis\testsave_seed instead (a
 # profile, no progress: what the scripted boot timings were tuned against).
 $xr = "$env:LOCALAPPDATA\xboxrecomp"
@@ -56,7 +58,7 @@ if ($SeparateSave) {
         Copy-Item "$root\analysis\$SaveSeed" "$root\analysis\testsave" -Recurse
     }
 } else {
-    $env:RECOMP_SAVE_DIR = $null
+    $env:RECOMP_SAVE_DIR = $xr
     if (Test-Path "$xr\UDATA") {
         Remove-Item "$xr\backup-before-test" -Recurse -Force -ErrorAction SilentlyContinue
         New-Item -ItemType Directory -Force "$xr\backup-before-test" | Out-Null

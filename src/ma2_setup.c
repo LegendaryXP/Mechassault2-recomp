@@ -15,9 +15,11 @@
  *   - The game files: <base>\game if it holds ma2.xbe, else the folder named
  *     in ma2_settings.ini, else the Game Path Setup window asks for it. That
  *     takes a folder holding ma2.xbe (an extracted disc), or the disc image
- *     itself (.iso / .xiso), which it extracts to <base>\game once. An
- *     optional second folder holds saves and the game's disk cache (default:
- *     %LOCALAPPDATA%\xboxrecomp, where they have always been).
+ *     itself (.iso / .xiso), which it extracts to <base>\game once.
+ *   - The saves (the title's UDATA and TDATA): Documents\MechAssault2 unless
+ *     the window was given another folder. Saves from where earlier builds
+ *     kept them (%LOCALAPPDATA%\xboxrecomp) are copied in the first time.
+ *     The disk cache stays in %LOCALAPPDATA%\xboxrecomp.
  *
  * ma2.exe --setup (or MA2_SETUP=1, or Shift held at launch) opens the window
  * again to change the paths. MA2_SETUP_ISO=<image> extracts an image without
@@ -26,6 +28,7 @@
 #define COBJMACROS
 #include <windows.h>
 #include <shobjidl.h>
+#include <shlobj.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -150,6 +153,43 @@ static void redirect_log(void)
     freopen(p, "w", stderr);
     snprintf(p, sizeof p, "logs\\%s_stdout.txt", name && *name ? name : "last");
     freopen(p, "w", stdout);
+}
+
+/* ---- saves ------------------------------------------------------------------ */
+
+/* Documents\MechAssault2 (Documents wherever Windows has it, OneDrive too). */
+static void default_saves(char *out)
+{
+    char docs[MAX_PATH];
+    if (FAILED(SHGetFolderPathA(NULL, CSIDL_PERSONAL, NULL, 0, docs)))
+        snprintf(docs, sizeof docs, "%s", s_base);
+    snprintf(out, MAX_PATH, "%s\\MechAssault2", docs);
+}
+
+/* Copy a folder and everything in it; existing files are kept. 1 when all
+ * of it copied. */
+static int copy_tree(const char *from, const char *to)
+{
+    WIN32_FIND_DATAA fd;
+    char pat[MAX_PATH], a[MAX_PATH], b[MAX_PATH];
+    HANDLE h;
+    int ok = 1;
+    SHCreateDirectoryExA(NULL, to, NULL);
+    snprintf(pat, sizeof pat, "%s\\*", from);
+    if ((h = FindFirstFileA(pat, &fd)) == INVALID_HANDLE_VALUE)
+        return 0;
+    do {
+        if (!strcmp(fd.cFileName, ".") || !strcmp(fd.cFileName, ".."))
+            continue;
+        snprintf(a, sizeof a, "%s\\%s", from, fd.cFileName);
+        snprintf(b, sizeof b, "%s\\%s", to, fd.cFileName);
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+            ok &= copy_tree(a, b);
+        else if (!CopyFileA(a, b, TRUE) && GetLastError() != ERROR_FILE_EXISTS)
+            ok = 0;
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+    return ok;
 }
 
 /* ---- settings --------------------------------------------------------------- */
@@ -547,9 +587,9 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM wp, LPARAM lp)
         text_at(dc, 36, 62, "Set where your game files are before the game starts.");
         SetTextColor(dc, C_TEXT);
         text_at(dc, 36, 98, "Game files");
-        text_at(dc, 36, 152, "Saves (optional)");
+        text_at(dc, 36, 152, "Saves");
         SetTextColor(dc, C_DIM);
-        text_at(dc, 190, 176, "Empty: %LOCALAPPDATA%\\xboxrecomp, as before.");
+        text_at(dc, 190, 176, "Saves from %LOCALAPPDATA%\\xboxrecomp are copied here once.");
         SetTextColor(dc, s_err ? C_BAD : (s_valid || s_busy) ? C_OK : s_hint ? C_DIM : C_BAD);
         {
             RECT t = { 36, 206, 664, 244 };
@@ -715,18 +755,54 @@ void ma2_EarlyInit(void)
     redirect_log();
 }
 
-/* Where the game files and the saves are; 0 when the player quit the setup
- * window. saves is "" for the default location. */
-int ma2_SetupPaths(char *game, char *saves, const char *cmdline)
+/* The saves go where the player keeps them: RECOMP_SAVE_DIR, the toolkit's
+ * root for the title's UDATA and TDATA, so the disk cache and partition
+ * images stay in %LOCALAPPDATA%\xboxrecomp. A RECOMP_SAVE_DIR already set
+ * (test scripts, a player's override) wins. The first time a folder is used,
+ * saves from where earlier builds kept them are copied in; those stay. */
+static void use_saves(const char *saves, const char *game)
 {
-    char cfg_game[MAX_PATH], cfg_saves[MAX_PATH], def[MAX_PATH];
+    const char *ov = getenv("RECOMP_SAVE_DIR");
+    char kv[MAX_PATH + 32], from[MAX_PATH], to[MAX_PATH];
+    if (ov && *ov) {
+        fprintf(stderr, "[SETUP] saves %s (RECOMP_SAVE_DIR)\n", ov);
+        return;
+    }
+    snprintf(to, sizeof to, "%s\\UDATA", saves);
+    if (!dir_exists(to)) {
+        char appdata[MAX_PATH], old[MAX_PATH] = "";
+        if (SUCCEEDED(SHGetFolderPathA(NULL, CSIDL_LOCAL_APPDATA, NULL, 0, appdata))
+            && (snprintf(from, sizeof from, "%s\\xboxrecomp\\UDATA", appdata), dir_exists(from)))
+            snprintf(old, sizeof old, "%s\\xboxrecomp", appdata);
+        else if (snprintf(from, sizeof from, "%s\\UDATA", game), dir_exists(from))
+            snprintf(old, sizeof old, "%s", game);      /* builds before 2026-10 */
+        SHCreateDirectoryExA(NULL, saves, NULL);
+        if (old[0]) {
+            int ok = copy_tree(from, to);
+            snprintf(from, sizeof from, "%s\\TDATA", old);
+            snprintf(to, sizeof to, "%s\\TDATA", saves);
+            if (dir_exists(from))
+                ok &= copy_tree(from, to);
+            fprintf(stderr, "[SETUP] copied the saves in %s to %s%s\n", old, saves,
+                    ok ? "" : " (some files failed)");
+        }
+    }
+    snprintf(kv, sizeof kv, "RECOMP_SAVE_DIR=%s", saves);
+    _putenv(kv);
+    fprintf(stderr, "[SETUP] saves %s\n", saves);
+}
+
+/* Where the game files are, and the saves set up; 0 when the player quit the
+ * setup window. */
+int ma2_SetupPaths(char *game, const char *cmdline)
+{
+    char cfg_game[MAX_PATH], cfg_saves[MAX_PATH], def[MAX_PATH], saves[MAX_PATH];
     const char *force = getenv("MA2_SETUP");
     const char *iso = getenv("MA2_SETUP_ISO");
     int ask = (force && *force == '1') || (cmdline && strstr(cmdline, "--setup"))
             || (GetAsyncKeyState(VK_SHIFT) & 0x8000);
 
     settings_load(cfg_game, cfg_saves);
-    snprintf(saves, MAX_PATH, "%s", cfg_saves);
     if (iso && *iso) {              /* tests: extract without the window */
         char err[512];
         int ok = xiso_extract(iso, NULL, err, sizeof err);
@@ -742,14 +818,20 @@ int ma2_SetupPaths(char *game, char *saves, const char *cmdline)
     } else if (!ask && !cfg_game[0] && has_game(def)) {
         snprintf(game, MAX_PATH, "%s", def);
     } else {
+        if (!cfg_saves[0])
+            default_saves(cfg_saves);
         if (!run_window(cfg_game[0] ? cfg_game : (has_game(def) ? def : ""), cfg_saves))
             return 0;
         settings_load(cfg_game, cfg_saves);
         if (!has_game(cfg_game))
             return 0;
         snprintf(game, MAX_PATH, "%s", cfg_game);
-        snprintf(saves, MAX_PATH, "%s", cfg_saves);
     }
-    fprintf(stderr, "[SETUP] game files %s; saves %s\n", game, saves[0] ? saves : "(default)");
+    fprintf(stderr, "[SETUP] game files %s\n", game);
+    if (cfg_saves[0])
+        snprintf(saves, sizeof saves, "%s", cfg_saves);
+    else
+        default_saves(saves);
+    use_saves(saves, game);
     return 1;
 }

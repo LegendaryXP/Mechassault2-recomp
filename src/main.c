@@ -296,9 +296,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     void *xbe_data = NULL;
     size_t xbe_size = 0;
 
-    char game_dir[MAX_PATH], save_dir[MAX_PATH], xbe_path[MAX_PATH];
+    char game_dir[MAX_PATH], xbe_path[MAX_PATH];
     extern void ma2_EarlyInit(void);
-    extern int ma2_SetupPaths(char *game, char *saves, const char *cmdline);
+    extern int ma2_SetupPaths(char *game, const char *cmdline);
 
     (void)hInstance;
     (void)hPrevInstance;
@@ -332,7 +332,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     AddVectoredExceptionHandler(1, veh_handler);
 
     /* Step 1: Find the game files (asking the first time) and load the XBE */
-    if (!ma2_SetupPaths(game_dir, save_dir, lpCmdLine))
+    if (!ma2_SetupPaths(game_dir, lpCmdLine))
         return 0;
     snprintf(xbe_path, sizeof xbe_path, "%s\\ma2.xbe", game_dir);
     if (!load_xbe(xbe_path, &xbe_data, &xbe_size)) {
@@ -419,7 +419,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     /* Step 4: Set game directory for file I/O path translation */
     {
         extern void xbox_path_init(const char *game_dir, const char *save_dir);
-        xbox_path_init(game_dir, save_dir[0] ? save_dir : NULL);
+        xbox_path_init(game_dir, NULL);     /* saves: RECOMP_SAVE_DIR (ma2_setup.c) */
     }
 
     /* Step 5: Initialize kernel bridge (thunk table in Xbox memory) */
