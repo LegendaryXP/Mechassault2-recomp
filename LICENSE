@@ -19,17 +19,3 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
-
--------------------------------------------------------------------------------
-
-Scope. This license covers the source code written for this project (src/,
-scripts/, config/, patches/, CMakeLists.txt, mkb.ini and the documentation).
-It does not cover, and grants nothing in:
-
-  - MechAssault 2: Lone Wolf itself -- its program, data, art, audio and
-    names, which belong to Microsoft and its licensors. Nothing of the game
-    is in this repository; you need your own copy.
-  - Code generated from the game's program by the recompiler
-    (src/recomp/gen/, not in this repository).
-  - The xboxrecomp toolkit and its third-party parts, which keep their own
-    licenses (MIT and LGPL-2.1-or-later; see THIRD_PARTY_NOTICES.txt).

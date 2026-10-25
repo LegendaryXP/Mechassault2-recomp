@@ -102,7 +102,18 @@ against it.
 
 ## License
 
-This project's own code is MIT ([LICENSE](LICENSE)). The toolkit is MIT with
-LGPL-2.1-or-later parts from [xemu](https://github.com/xemu-project/xemu);
-see [release/THIRD_PARTY_NOTICES.txt](release/THIRD_PARTY_NOTICES.txt).
-MechAssault 2 and everything in it belong to Microsoft and its licensors.
+This project's own code is MIT ([LICENSE](LICENSE)): `src/`, `scripts/`,
+`config/`, `release/`, `CMakeLists.txt`, `mkb.ini` and the documentation.
+The license does not cover, and grants nothing in:
+
+- **MechAssault 2: Lone Wolf** itself: its program, data, art, audio and
+  names, which belong to Microsoft and its licensors. Nothing of the game is
+  in this repository; you need your own copy.
+- **Code generated from the game's program** by the recompiler
+  (`src/recomp/gen/`, not in this repository), or the icon made from the
+  game at build time (`assets/`, not in this repository).
+- **The xboxrecomp toolkit** and its third-party parts, which keep their own
+  licenses: MIT, with LGPL-2.1-or-later parts from
+  [xemu](https://github.com/xemu-project/xemu). The changes to them in
+  `patches/` are under the license of the file each one changes. See
+  [release/THIRD_PARTY_NOTICES.txt](release/THIRD_PARTY_NOTICES.txt).
